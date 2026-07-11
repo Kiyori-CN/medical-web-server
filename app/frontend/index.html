@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="description" content="医学搜题系统 - 66,096题医学题库智能检索，支持语义搜索">
+    <title>医学搜题系统</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏥</text></svg>">
+    <link href="https://fonts.loli.net/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="bg-decoration" aria-hidden="true">
+        <div class="bg-blob bg-blob-1"></div>
+        <div class="bg-blob bg-blob-2"></div>
+        <div class="bg-blob bg-blob-3"></div>
+    </div>
+
+    <div class="container">
+        <header>
+            <div class="logo">
+                <span class="logo-icon">🏥</span>
+                <div>
+                    <h1>医学搜题系统</h1>
+                    <p class="subtitle">66,096 题 · 毫秒级检索 · 多学科覆盖</p>
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <!-- 搜索区域 -->
+            <div class="search-box">
+                <div class="search-input-wrapper">
+                    <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+                    </svg>
+                    <input type="text" id="searchInput" placeholder="输入关键词搜索题目，如：高血压、肺炎、骨折..." autocomplete="off">
+                    <button id="clearBtn" class="clear-btn" title="清除" style="display:none;">✕</button>
+                </div>
+                <div class="search-actions">
+                    <button id="searchBtn" class="btn btn-primary">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+                        </svg>
+                        搜索
+                    </button>
+                    <button id="randomBtn" class="btn btn-secondary">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                            <rect x="2" y="2" width="20" height="20" rx="2"/><path d="M8 8h.01M16 8h.01M8 16h.01M16 16h.01M12 12h.01"/>
+                        </svg>
+                        随机练习
+                    </button>
+                </div>
+            </div>
+
+            <!-- 控制栏 -->
+            <div class="controls">
+                <div class="control-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="showAnswer" checked>
+                        <span class="toggle-switch"></span>
+                        <span>显示答案</span>
+                    </label>
+                    <label class="toggle-label">
+                        <input type="checkbox" id="showAnalysis" checked>
+                        <span class="toggle-switch"></span>
+                        <span>显示解析</span>
+                    </label>
+                </div>
+                <div class="control-group">
+                    <select id="searchMode" title="搜索方式">
+                        <option value="semantic">🧠 语义搜索</option>
+                        <option value="keyword">🔍 关键词搜索</option>
+                        <option value="hybrid">⚡ 混合搜索</option>
+                    </select>
+                    <select id="questionType" title="题型筛选">
+                        <option value="">全部题型</option>
+                        <option value="单选题">单选题</option>
+                        <option value="多选题">多选题</option>
+                        <option value="判断题">判断题</option>
+                        <option value="填空题">填空题</option>
+                        <option value="简答题">简答题</option>
+                        <option value="名词解释">名词解释</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- 搜索模式提示 -->
+            <div id="searchModeHint" class="search-mode-hint">
+                <span class="hint-icon">💡</span>
+                <span id="hintText">语义搜索：理解语义进行匹配，适合描述性查询</span>
+            </div>
+
+            <div id="stats" class="stats"></div>
+
+            <div id="loading" class="loading" style="display:none;">
+                <div class="spinner"></div>
+                <p>搜索中，请稍候...</p>
+            </div>
+
+            <div id="results" class="results"></div>
+        </main>
+
+        <footer>
+            <p>基于 ikbs_pysearch 极速搜索引擎 · 涵盖人体解剖学、生理学、病理学等多个学科</p>
+        </footer>
+    </div>
+
+    <!-- AI 助手悬浮球 -->
+    <div id="aiBubble" class="ai-bubble" title="医学 AI 解析助手">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="26" height="26">
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+            <circle cx="12" cy="12" r="3"/>
+        </svg>
+    </div>
+
+    <!-- AI 对话框 -->
+    <div id="aiChat" class="ai-chat" style="display:none;">
+        <div class="ai-chat-header">
+            <div class="ai-chat-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                    <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+                    <circle cx="12" cy="12" r="3"/>
+                </svg>
+                <div>
+                    <span>医学 AI 解析助手</span>
+                    <small>题干分析 · 选项辨析 · 考点总结</small>
+                </div>
+            </div>
+            <div class="ai-chat-actions">
+                <button id="aiNewChat" class="ai-action-btn" title="新对话">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                        <path d="M12 5v14M5 12h14"/>
+                    </svg>
+                </button>
+                <button id="aiClose" class="ai-action-btn" title="收起">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                        <path d="m6 9 6 6 6-6"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <div class="ai-chat-options">
+            <label class="ai-toggle">
+                <input type="checkbox" id="aiIncludeQuestions" checked>
+                <span class="ai-toggle-slider"></span>
+                <span>附带当前页面题目</span>
+            </label>
+            <div class="ai-model-badge" id="aiModelBadge">GPT-5.5</div>
+        </div>
+        <div id="aiMessages" class="ai-chat-messages">
+            <div class="ai-welcome-msg">
+                <div class="ai-welcome-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="36" height="36">
+                        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+                        <circle cx="12" cy="12" r="3"/>
+                    </svg>
+                </div>
+                <p class="ai-welcome-title">医学 AI 解析助手</p>
+                <p class="ai-welcome-hint">基于 GPT-5.5 大模型，专注医学执业资格考试题目解析</p>
+                <div class="ai-quick-actions" id="aiQuickActions">
+                    <button class="ai-quick-btn" data-action="analyze">📋 分析当���题目</button>
+                    <button class="ai-quick-btn" data-action="keypoint">🎯 提炼核心考点</button>
+                    <button class="ai-quick-btn" data-action="compare">🔍 对比易混选项</button>
+                </div>
+            </div>
+        </div>
+        <div id="aiPreload" class="ai-preload" style="display:none;">
+            <span class="ai-preload-label">📋 已预加载页面题目</span>
+            <button id="aiPreloadClear" class="ai-preload-clear" title="清除预加载">✕</button>
+        </div>
+        <div class="ai-chat-input-area">
+            <textarea id="aiInput" class="ai-chat-textarea" placeholder="描述你的疑问，如：为什么选 A 不选 C？" rows="1" maxlength="2000"></textarea>
+            <button id="aiSend" class="ai-send-btn" title="发送 (Enter)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20">
+                    <path d="m22 2-7 20-4-9-9-4z"/><path d="m22 2-11 11"/>
+                </svg>
+            </button>
+        </div>
+        <div class="ai-chat-footer">
+            <span id="aiCharCount">0/2000</span>
+            <span class="ai-footer-hint">Enter 发送 · Shift+Enter 换行</span>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
