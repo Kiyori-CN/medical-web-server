@@ -39,7 +39,9 @@ CREATE TABLE source_files (
 
 CREATE TABLE collections (
     collection_id TEXT PRIMARY KEY,
+    source_file_id INTEGER NOT NULL UNIQUE REFERENCES source_files(source_file_id),
     relative_path TEXT NOT NULL UNIQUE,
+    extension TEXT NOT NULL,
     exam TEXT NOT NULL DEFAULT '',
     collection_kind TEXT NOT NULL DEFAULT '',
     subject TEXT NOT NULL DEFAULT '',
@@ -139,6 +141,7 @@ CREATE INDEX idx_group_members_position ON question_group_members(group_id, posi
 CREATE INDEX idx_occurrences_question ON question_occurrences(question_id);
 CREATE INDEX idx_occurrences_source ON question_occurrences(source_file_id, position);
 CREATE INDEX idx_collection_questions_question ON collection_questions(question_id);
+CREATE INDEX idx_collections_relative_path ON collections(relative_path);
 
 CREATE VIRTUAL TABLE question_fts USING fts5(
     question_id UNINDEXED,

@@ -47,10 +47,21 @@ def test_catalog_search_filters_and_solution_boundary(sample_source_tree: Path, 
 def test_catalog_collections_and_blueprint(sample_source_tree: Path, tmp_path: Path):
     catalog = _catalog(sample_source_tree, tmp_path)
     collections = catalog.list_collections(exam="执业医师")
-    assert len(collections) == 2
+    assert len(collections) == 3
+    assert {collection["extension"] for collection in collections} == {".xlsx", ".docx"}
+    first_chapter_files = [
+        collection for collection in collections if "第一章." in collection["relative_path"]
+    ]
+    assert len(first_chapter_files) == 2
+    assert first_chapter_files[0]["collection_id"] != first_chapter_files[1]["collection_id"]
     collection_questions = catalog.list_collection_questions(collections[0]["collection_id"])
     assert collection_questions
     assert "answer" not in collection_questions[0]
+
+    root = catalog.browse_library()
+    assert root["directories"][0]["name"] == "执业医师"
+    leaf = catalog.browse_library("执业医师/学科刷题/生理学")
+    assert {item["name"] for item in leaf["collections"]} == {"第一章.xlsx", "第一章.docx"}
 
     app = Flask(__name__)
     app.register_blueprint(create_catalog_blueprint(catalog.database_path))

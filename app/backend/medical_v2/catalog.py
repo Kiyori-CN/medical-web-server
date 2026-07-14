@@ -5,7 +5,7 @@ import json
 import re
 import sqlite3
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 from urllib.parse import quote
 
@@ -39,6 +39,7 @@ def resolve_catalog_path(
 class Catalog:
     def __init__(self, database_path: str | Path):
         self.database_path = Path(database_path).resolve()
+        self._library_cache: list[dict[str, Any]] | None = None
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -66,6 +67,24 @@ class Catalog:
             "schema_version": int(schema_version[0]) if schema_version else None,
             "total_questions": total_questions,
             "integrity_validation": "build-time",
+        }
+
+    def identity(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot_id, schema_version
+                FROM import_runs
+                WHERE status = 'complete'
+                ORDER BY completed_at DESC LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            raise CatalogUnavailable("Catalog does not contain a completed import run")
+        return {
+            "catalog_build_id": self.database_path.parent.name,
+            "snapshot_id": row["snapshot_id"],
+            "catalog_schema_version": row["schema_version"],
         }
 
     def stats(self) -> dict[str, Any]:
@@ -194,6 +213,122 @@ class Catalog:
                 connection, candidates, include_solution=include_solution
             )
 
+    def get_occurrence_questions(
+        self, occurrence_ids: list[int], *, include_solution: bool = False
+    ) -> list[dict[str, Any]]:
+        """Load the exact source version for each occurrence in caller order."""
+        normalized_ids = [int(value) for value in occurrence_ids]
+        if not normalized_ids:
+            return []
+        by_occurrence: dict[int, dict[str, Any]] = {}
+        with self.connect() as connection:
+            for start in range(0, len(normalized_ids), 500):
+                chunk = normalized_ids[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"""
+                    SELECT qo.occurrence_id, qo.question_id, qo.version_id,
+                           qo.sheet_name, qo.row_number, qo.position AS source_position,
+                           q.canonical_type AS question_type,
+                           qv.raw_type, qv.source_code, qv.stem, qv.options_json,
+                           qv.answer, qv.point, qv.explanation,
+                           sf.relative_path, sf.exam, sf.collection_kind,
+                           sf.subject, sf.title, sf.year,
+                           cq.collection_id, cq.position AS collection_position,
+                           (SELECT COUNT(*) FROM question_occurrences all_qo
+                            WHERE all_qo.question_id = qo.question_id) AS source_count
+                    FROM question_occurrences qo
+                    JOIN questions q ON q.question_id = qo.question_id
+                    JOIN question_versions qv ON qv.version_id = qo.version_id
+                    JOIN source_files sf ON sf.source_file_id = qo.source_file_id
+                    LEFT JOIN collection_questions cq ON cq.occurrence_id = qo.occurrence_id
+                    WHERE qo.occurrence_id IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                question_ids = list(dict.fromkeys(row["question_id"] for row in rows))
+                groups: dict[str, list[dict[str, Any]]] = {
+                    question_id: [] for question_id in question_ids
+                }
+                for question_start in range(0, len(question_ids), 500):
+                    question_chunk = question_ids[question_start : question_start + 500]
+                    question_placeholders = ",".join("?" for _ in question_chunk)
+                    for group_row in connection.execute(
+                        f"""
+                        SELECT qgm.question_id, qgm.group_id, qgm.position,
+                               qg.shared_stem, qgm.sub_stem
+                        FROM question_group_members qgm
+                        JOIN question_groups qg ON qg.group_id = qgm.group_id
+                        WHERE qgm.question_id IN ({question_placeholders})
+                        ORDER BY qgm.question_id, qgm.group_id, qgm.position
+                        """,
+                        question_chunk,
+                    ):
+                        groups[group_row["question_id"]].append(
+                            {
+                                "group_id": group_row["group_id"],
+                                "position": group_row["position"],
+                                "shared_stem": group_row["shared_stem"],
+                                "sub_stem": group_row["sub_stem"],
+                            }
+                        )
+                for row in rows:
+                    try:
+                        option_values = json.loads(row["options_json"])
+                    except (TypeError, json.JSONDecodeError) as error:
+                        raise CatalogUnavailable(
+                            f"Invalid options for occurrence {row['occurrence_id']}"
+                        ) from error
+                    if not isinstance(option_values, list):
+                        raise CatalogUnavailable(
+                            f"Invalid options for occurrence {row['occurrence_id']}"
+                        )
+                    item = {
+                        "question_id": row["question_id"],
+                        "occurrence_id": row["occurrence_id"],
+                        "version_id": row["version_id"],
+                        "question_type": row["question_type"],
+                        "raw_type": row["raw_type"],
+                        "source_code": row["source_code"],
+                        "stem": row["stem"],
+                        "options": [
+                            {
+                                "position": position,
+                                "label": chr(64 + position),
+                                "text": str(text),
+                            }
+                            for position, text in enumerate(option_values, start=1)
+                        ],
+                        "source_count": row["source_count"],
+                        "sources": [
+                            {
+                                "relative_path": row["relative_path"],
+                                "exam": row["exam"],
+                                "collection_kind": row["collection_kind"],
+                                "subject": row["subject"],
+                                "title": row["title"],
+                                "year": row["year"],
+                                "sheet_name": row["sheet_name"],
+                                "row_number": row["row_number"],
+                                "position": row["source_position"],
+                                "collection_id": row["collection_id"],
+                            }
+                        ],
+                        "groups": groups.get(row["question_id"], []),
+                        "score": 1.0,
+                        "match_kind": "occurrence",
+                    }
+                    if include_solution:
+                        item["answer"] = row["answer"]
+                        item["point"] = row["point"]
+                        item["explanation"] = row["explanation"]
+                    by_occurrence[row["occurrence_id"]] = item
+        return [
+            by_occurrence[occurrence_id]
+            for occurrence_id in normalized_ids
+            if occurrence_id in by_occurrence
+        ]
+
     def sample_questions(
         self,
         *,
@@ -258,8 +393,8 @@ class Catalog:
                 dict(row)
                 for row in connection.execute(
                     f"""
-                    SELECT c.collection_id, c.relative_path, c.exam, c.collection_kind,
-                           c.subject, c.title, c.year,
+                    SELECT c.collection_id, c.relative_path, c.extension,
+                           c.exam, c.collection_kind, c.subject, c.title, c.year,
                            COUNT(cq.occurrence_id) AS question_count,
                            COUNT(DISTINCT cq.question_id) AS unique_question_count
                     FROM collections c
@@ -273,6 +408,200 @@ class Catalog:
                 )
             ]
 
+    def get_collection(self, collection_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT c.collection_id, c.relative_path, c.extension,
+                       c.exam, c.collection_kind, c.subject, c.title, c.year,
+                       COUNT(cq.occurrence_id) AS question_count,
+                       COUNT(DISTINCT cq.question_id) AS unique_question_count
+                FROM collections c
+                LEFT JOIN collection_questions cq ON cq.collection_id = c.collection_id
+                WHERE c.collection_id = ?
+                GROUP BY c.collection_id
+                """,
+                (display_text(collection_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def browse_library(self, parent: str = "") -> dict[str, Any]:
+        parent_path = _safe_library_path(parent)
+        prefix = f"{parent_path}/" if parent_path else ""
+        directories: dict[str, dict[str, Any]] = {}
+        collections: list[dict[str, Any]] = []
+        for row in self._library_rows():
+            relative_path = row["relative_path"]
+            if not relative_path.startswith(prefix):
+                continue
+            remainder = relative_path[len(prefix) :]
+            if "/" in remainder:
+                directory_name = remainder.split("/", 1)[0]
+                directory_path = f"{prefix}{directory_name}".strip("/")
+                entry = directories.setdefault(
+                    directory_name,
+                    {
+                        "kind": "directory",
+                        "name": directory_name,
+                        "path": directory_path,
+                        "collection_count": 0,
+                        "question_count": 0,
+                    },
+                )
+                entry["collection_count"] += 1
+                entry["question_count"] += row["question_count"]
+                continue
+            collections.append(
+                {
+                    "kind": "collection",
+                    "name": PurePosixPath(relative_path).name,
+                    **row,
+                }
+            )
+        breadcrumbs = [{"name": "全部题库", "path": ""}]
+        current = ""
+        for part in PurePosixPath(parent_path).parts if parent_path else ():
+            current = f"{current}/{part}".strip("/")
+            breadcrumbs.append({"name": part, "path": current})
+        return {
+            "parent": parent_path,
+            "breadcrumbs": breadcrumbs,
+            "directories": sorted(directories.values(), key=lambda item: item["name"].casefold()),
+            "collections": sorted(collections, key=lambda item: item["name"].casefold()),
+        }
+
+    def collection_outline(self, collection_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT cq.occurrence_id, cq.position AS collection_position,
+                        q.question_id, q.canonical_type AS question_type,
+                        qv.raw_type, qv.source_code, qv.stem
+                FROM collection_questions cq
+                JOIN question_occurrences qo ON qo.occurrence_id = cq.occurrence_id
+                JOIN questions q ON q.question_id = cq.question_id
+                JOIN question_versions qv ON qv.version_id = qo.version_id
+                WHERE cq.collection_id = ?
+                ORDER BY cq.position, cq.occurrence_id
+                """,
+                (display_text(collection_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def select_practice_items(
+        self,
+        *,
+        collection_id: str,
+        count: int | None = None,
+        start_position: int = 1,
+        order_mode: str = "sequential",
+        canonical_type: str = "",
+    ) -> list[dict[str, Any]]:
+        collection_id = display_text(collection_id)
+        if not collection_id:
+            raise ValueError("collection_id is required")
+        start_position = max(1, int(start_position))
+        order_mode = display_text(order_mode) or "sequential"
+        if order_mode not in {"sequential", "random"}:
+            raise ValueError("order_mode must be sequential or random")
+        limit = 5000 if count in (None, 0, "") else max(1, min(int(count), 5000))
+        type_clause = " AND q.canonical_type = ?" if display_text(canonical_type) else ""
+        params: list[Any] = [collection_id, start_position]
+        if type_clause:
+            params.append(display_text(canonical_type))
+        params.append(limit)
+        ordering = "random()" if order_mode == "random" else "cq.position, cq.occurrence_id"
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT cq.occurrence_id, cq.position AS collection_position, cq.question_id
+                FROM collection_questions cq
+                JOIN questions q ON q.question_id = cq.question_id
+                WHERE cq.collection_id = ? AND cq.position >= ? {type_clause}
+                ORDER BY {ordering}
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_ranked_questions(
+        self,
+        candidates: list[tuple[str, float, str]],
+        *,
+        include_solution: bool = True,
+        canonical_type: str = "",
+        exam: str = "",
+        collection_kind: str = "",
+        subject: str = "",
+        year: int | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        filters = {
+            "canonical_type": display_text(canonical_type),
+            "exam": display_text(exam),
+            "collection_kind": display_text(collection_kind),
+            "subject": display_text(subject),
+            "year": year,
+        }
+        with self.connect() as connection:
+            filtered = self._filter_candidates(connection, candidates, filters, limit)
+            return self._load_questions(connection, filtered, include_solution=include_solution)
+
+    def _filter_candidates(
+        self,
+        connection: sqlite3.Connection,
+        candidates: list[tuple[str, float, str]],
+        filters: dict[str, Any],
+        limit: int,
+    ) -> list[tuple[str, float, str]]:
+        question_ids = list(dict.fromkeys(candidate[0] for candidate in candidates))
+        if not question_ids:
+            return []
+        filter_sql, params = _question_filters(filters)
+        allowed: set[str] = set()
+        for start in range(0, len(question_ids), 500):
+            chunk = question_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            allowed.update(
+                row["question_id"]
+                for row in connection.execute(
+                    f"SELECT q.question_id FROM questions q "
+                    f"WHERE q.question_id IN ({placeholders}) {filter_sql}",
+                    [*chunk, *params],
+                )
+            )
+        result = []
+        for candidate in candidates:
+            if candidate[0] in allowed:
+                result.append(candidate)
+                if len(result) >= max(1, min(int(limit), 50)):
+                    break
+        return result
+
+    def _library_rows(self) -> list[dict[str, Any]]:
+        if self._library_cache is not None:
+            return self._library_cache
+        with self.connect() as connection:
+            self._library_cache = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT c.collection_id, c.relative_path, c.extension,
+                           c.exam, c.collection_kind, c.subject, c.title, c.year,
+                           COUNT(cq.occurrence_id) AS question_count,
+                           COUNT(DISTINCT cq.question_id) AS unique_question_count
+                    FROM collections c
+                    LEFT JOIN collection_questions cq ON cq.collection_id = c.collection_id
+                    GROUP BY c.collection_id
+                    ORDER BY c.relative_path
+                    """
+                )
+            ]
+        return self._library_cache
+
     def list_collection_questions(
         self,
         collection_id: str,
@@ -281,28 +610,27 @@ class Catalog:
         offset: int = 0,
         include_solution: bool = False,
     ) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 100))
+        limit = max(1, min(int(limit), 2000))
         offset = max(0, int(offset))
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT cq.question_id, MIN(cq.position) AS position
+                SELECT cq.occurrence_id, cq.question_id, cq.position
                 FROM collection_questions cq
                 WHERE cq.collection_id = ?
-                GROUP BY cq.question_id
-                ORDER BY position, cq.question_id
+                ORDER BY cq.position, cq.occurrence_id
                 LIMIT ? OFFSET ?
                 """,
                 (display_text(collection_id), limit, offset),
             ).fetchall()
-            candidates = [(row["question_id"], 1.0, "collection") for row in rows]
-            questions = self._load_questions(
-                connection, candidates, include_solution=include_solution
-            )
-            positions = {row["question_id"]: row["position"] for row in rows}
-            for question in questions:
-                question["position"] = positions[question["question_id"]]
-            return questions
+        questions = self.get_occurrence_questions(
+            [row["occurrence_id"] for row in rows],
+            include_solution=include_solution,
+        )
+        for row, question in zip(rows, questions, strict=True):
+            question["position"] = row["position"]
+            question["match_kind"] = "collection"
+        return questions
 
     def _find_exact(self, connection, normalized_query: str, filters: dict, limit: int) -> list[str]:
         if not normalized_query:
@@ -555,3 +883,13 @@ def _collection_filters(
         clauses.append("c.year = ?")
         params.append(int(year))
     return ("WHERE " + " AND ".join(clauses) if clauses else "", params)
+
+
+def _safe_library_path(value: str) -> str:
+    path = str(value or "").replace("\\", "/").strip("/")
+    if not path:
+        return ""
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("invalid library path")
+    return "/".join(parts)

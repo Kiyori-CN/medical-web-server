@@ -13,7 +13,7 @@ from .readers import discover_sources, read_questions
 from .schema import connect_build_database, create_schema, rebuild_fts, validate_database
 
 
-BUILD_SCHEMA_VERSION = 3
+BUILD_SCHEMA_VERSION = 4
 
 
 def _utc_now() -> str:
@@ -38,7 +38,7 @@ def _snapshot_id(sources: list[SourceFile]) -> str:
 
 
 def _collection_id(source: SourceFile) -> str:
-    return _stable_id("col", source.relative_path.rsplit(".", 1)[0], length=24)
+    return _stable_id("col", source.relative_path, length=24)
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -95,13 +95,16 @@ def _insert_source(connection, run_id: str, source: SourceFile) -> tuple[int, st
     collection_id = _collection_id(source)
     connection.execute(
         """
-        INSERT OR IGNORE INTO collections(
-            collection_id, relative_path, exam, collection_kind, subject, title, year
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO collections(
+            collection_id, source_file_id, relative_path, extension,
+            exam, collection_kind, subject, title, year
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             collection_id,
-            source.relative_path.rsplit(".", 1)[0],
+            int(cursor.lastrowid),
+            source.relative_path,
+            source.extension,
             source.exam,
             source.collection_kind,
             source.subject,

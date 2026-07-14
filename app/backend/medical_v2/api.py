@@ -3,9 +3,12 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from .catalog import Catalog, CatalogUnavailable
+from .semantic import SemanticSearchService, SemanticSearchUnavailable
 
 
-def create_catalog_blueprint(database_path) -> Blueprint:
+def create_catalog_blueprint(
+    database_path, semantic_service: SemanticSearchService | None = None
+) -> Blueprint:
     blueprint = Blueprint("medical_v2", __name__, url_prefix="/api/v2")
     catalog = Catalog(database_path)
 
@@ -16,6 +19,10 @@ def create_catalog_blueprint(database_path) -> Blueprint:
     @blueprint.errorhandler(ValueError)
     def handle_value_error(error):
         return jsonify({"error": str(error)}), 400
+
+    @blueprint.errorhandler(SemanticSearchUnavailable)
+    def handle_semantic_unavailable(error):
+        return jsonify({"error": str(error), "status": "semantic_unavailable"}), 503
 
     @blueprint.get("/health")
     def health():
@@ -33,17 +40,43 @@ def create_catalog_blueprint(database_path) -> Blueprint:
         if not query:
             return jsonify({"error": "query is required"}), 400
         filters = data.get("filters") if isinstance(data.get("filters"), dict) else {}
-        results = catalog.search(
-            query,
-            limit=data.get("limit", data.get("top_k", 10)),
-            canonical_type=filters.get("question_type", data.get("question_type", "")),
-            exam=filters.get("exam", data.get("exam", "")),
-            collection_kind=filters.get("collection_kind", data.get("collection_kind", "")),
-            subject=filters.get("subject", data.get("subject", "")),
-            year=filters.get("year", data.get("year")),
-            include_solution=_json_bool(data.get("include_solution"), default=True),
+        merged_filters = {
+            "question_type": filters.get("question_type", data.get("question_type", "")),
+            "exam": filters.get("exam", data.get("exam", "")),
+            "collection_kind": filters.get(
+                "collection_kind", data.get("collection_kind", "")
+            ),
+            "subject": filters.get("subject", data.get("subject", "")),
+            "year": filters.get("year", data.get("year")),
+        }
+        limit = data.get("limit", data.get("top_k", 10))
+        mode = str(data.get("mode", data.get("search_mode", "keyword"))).strip().lower()
+        include_solution = _json_bool(data.get("include_solution"), default=True)
+        if semantic_service is None:
+            if mode != "keyword":
+                raise SemanticSearchUnavailable("Semantic search service is not configured")
+            results = catalog.search(
+                query,
+                limit=limit,
+                include_solution=include_solution,
+                canonical_type=merged_filters["question_type"],
+                exam=merged_filters["exam"],
+                collection_kind=merged_filters["collection_kind"],
+                subject=merged_filters["subject"],
+                year=merged_filters["year"],
+            )
+            metadata = {"mode": "keyword"}
+        else:
+            results, metadata = semantic_service.search(
+                query,
+                mode=mode,
+                limit=limit,
+                include_solution=include_solution,
+                filters=merged_filters,
+            )
+        return jsonify(
+            {"query": query, "count": len(results), "results": results, **metadata}
         )
-        return jsonify({"query": query, "count": len(results), "results": results})
 
     @blueprint.get("/questions/<question_id>")
     def question_detail(question_id: str):
@@ -67,6 +100,17 @@ def create_catalog_blueprint(database_path) -> Blueprint:
             offset=request.args.get("offset", 0),
         )
         return jsonify({"count": len(rows), "collections": rows})
+
+    @blueprint.get("/collections/<collection_id>")
+    def collection_detail(collection_id: str):
+        collection = catalog.get_collection(collection_id)
+        if collection is None:
+            return jsonify({"error": "collection not found"}), 404
+        return jsonify(collection)
+
+    @blueprint.get("/library")
+    def library():
+        return jsonify(catalog.browse_library(request.args.get("parent", "")))
 
     @blueprint.get("/collections/<collection_id>/questions")
     def collection_questions(collection_id: str):

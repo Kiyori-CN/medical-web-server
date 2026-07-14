@@ -42,12 +42,18 @@ def create_practice_blueprint(catalog_path, practice_path) -> Blueprint:
         data = _json_object()
         filters = data.get("filters") if isinstance(data.get("filters"), dict) else {}
         session = store.create_session(
-            count=data.get("count", 10),
+            count=data.get("count", None if data.get("collection_id") else 10),
             collection_id=data.get("collection_id", ""),
             filters=filters,
             mode=data.get("mode", "practice"),
+            order_mode=data.get("order_mode", "sequential"),
+            start_position=data.get("start_position", 1),
         )
         return jsonify(session), 201
+
+    @blueprint.get("/collections/<collection_id>/outline")
+    def collection_outline(collection_id: str):
+        return jsonify(store.collection_outline(collection_id))
 
     @blueprint.get("/sessions/<session_id>")
     def session_detail(session_id: str):

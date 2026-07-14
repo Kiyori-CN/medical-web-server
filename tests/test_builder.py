@@ -38,7 +38,7 @@ def test_build_catalog_is_structured_idempotent_and_read_only(sample_source_tree
     assert resolve_catalog_path("", builds_root.parent) == database_path.resolve()
 
     assert report["stats"] == {
-        "collections": 2,
+        "collections": 3,
         "conflicts": 1,
         "question_groups": 1,
         "question_occurrences": 6,

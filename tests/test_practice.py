@@ -1,5 +1,6 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 
 import pytest
 from flask import Flask
@@ -100,3 +101,200 @@ def test_practice_blueprint_round_trip(sample_source_tree: Path, tmp_path: Path)
     assert submitted.get_json()["is_correct"] is False
     assert client.get("/api/v2/practice/wrong").get_json()["count"] == 1
     assert client.post("/api/v2/practice/sessions", json=[]).status_code == 400
+
+
+def test_collection_practice_preserves_file_order_and_outline_progress(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, store = _services(sample_source_tree, tmp_path)
+    collection = next(
+        item
+        for item in catalog.list_collections()
+        if item["relative_path"].endswith("第一章.xlsx")
+    )
+    outline = store.collection_outline(collection["collection_id"])
+    assert [item["collection_position"] for item in outline["items"]] == [1, 2, 3, 4]
+    assert outline["summary"] == {
+        "total": 4,
+        "answered": 0,
+        "correct": 0,
+        "wrong": 0,
+        "ungraded": 0,
+    }
+
+    session = store.create_session(
+        collection_id=collection["collection_id"],
+        count=None,
+        start_position=2,
+        order_mode="sequential",
+    )
+    assert [item["collection_position"] for item in session["items"]] == [2, 3, 4]
+    assert all("answer" not in item["question"] for item in session["items"])
+
+    first = session["items"][0]
+    result = store.submit_answer(session["session_id"], position=1, answer="任意文本")
+    assert result["is_correct"] is False
+    refreshed = store.get_session(session["session_id"])
+    assert refreshed["items"][0]["submission"]["correct_answer"]
+    assert "answer" not in refreshed["items"][1]["question"]
+    updated_outline = store.collection_outline(collection["collection_id"])
+    assert updated_outline["items"][1]["status"] == "wrong"
+
+
+def test_practice_schema_v1_migrates_without_losing_state(
+    sample_source_tree: Path, tmp_path: Path
+):
+    manifest = build_catalog(sample_source_tree, tmp_path / "builds")
+    catalog_path = tmp_path / "builds" / manifest["build_id"] / "catalog.sqlite3"
+    catalog = Catalog(catalog_path)
+    question_id = catalog.sample_questions(count=1)[0]["question_id"]
+    database_path = tmp_path / "state" / "practice.sqlite3"
+    database_path.parent.mkdir(parents=True)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE practice_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE practice_sessions (
+                session_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                collection_id TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'practice',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                total_questions INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE TABLE practice_session_questions (
+                session_id TEXT NOT NULL REFERENCES practice_sessions(session_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                question_id TEXT NOT NULL,
+                submitted_answer TEXT,
+                normalized_submitted_answer TEXT,
+                is_correct INTEGER,
+                answered_at TEXT,
+                elapsed_ms INTEGER,
+                PRIMARY KEY (session_id, position),
+                UNIQUE (session_id, question_id)
+            );
+            CREATE TABLE question_progress (
+                profile_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                correct_count INTEGER NOT NULL DEFAULT 0,
+                wrong_count INTEGER NOT NULL DEFAULT 0,
+                ungraded_count INTEGER NOT NULL DEFAULT 0,
+                streak INTEGER NOT NULL DEFAULT 0,
+                last_answer TEXT NOT NULL DEFAULT '',
+                last_result INTEGER,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (profile_id, question_id)
+            );
+            CREATE INDEX idx_session_questions_question
+            ON practice_session_questions(question_id);
+            CREATE INDEX idx_progress_wrong
+            ON question_progress(profile_id, wrong_count, last_seen_at);
+            """
+        )
+        connection.execute(
+            "INSERT INTO practice_meta(key, value) VALUES ('schema_version', '1')"
+        )
+        connection.execute(
+            """
+            INSERT INTO practice_sessions(
+                session_id, profile_id, total_questions, created_at
+            ) VALUES ('legacy-session', 'local', 1, '2026-01-01T00:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO practice_session_questions(
+                session_id, position, question_id, submitted_answer,
+                normalized_submitted_answer, is_correct, answered_at, elapsed_ms
+            ) VALUES (
+                'legacy-session', 1, ?, 'A', 'A', 1,
+                '2026-01-01T00:01:00+00:00', 900
+            )
+            """,
+            (question_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = PracticeStore(database_path, catalog)
+    health = store.initialize()
+    assert health["schema_version"] == 2
+
+    connection = sqlite3.connect(database_path)
+    try:
+        columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(practice_session_questions)"
+            )
+        }
+        assert {"occurrence_id", "collection_position"} <= columns
+        row = connection.execute(
+            """
+            SELECT submitted_answer, is_correct, elapsed_ms
+            FROM practice_session_questions
+            WHERE session_id = 'legacy-session' AND position = 1
+            """
+        ).fetchone()
+        assert row == ("A", 1, 900)
+        assert connection.execute(
+            "SELECT value FROM practice_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "2"
+
+        # Schema v2 intentionally permits the same canonical question to occur
+        # more than once in one source file/session.
+        connection.execute(
+            """
+            INSERT INTO practice_session_questions(
+                session_id, position, question_id
+            ) VALUES ('legacy-session', 2, ?)
+            """,
+            (question_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_file_practice_uses_occurrence_version_and_scoped_progress(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, store = _services(sample_source_tree, tmp_path)
+    collections = catalog.list_collections()
+    conflict_collection = next(
+        item for item in collections if item["relative_path"].endswith("重复题.xlsx")
+    )
+    canonical_collection = next(
+        item for item in collections if item["relative_path"].endswith("第一章.xlsx")
+    )
+
+    session = store.create_session(
+        collection_id=conflict_collection["collection_id"],
+        count=None,
+        order_mode="sequential",
+    )
+    question = session["items"][0]["question"]
+    assert question["sources"][0]["relative_path"].endswith("重复题.xlsx")
+    assert "answer" not in question
+
+    # The exact source occurrence intentionally says B while the canonical
+    # version says A. File practice must grade against the source occurrence.
+    result = store.submit_answer(session["session_id"], position=1, answer="B")
+    assert result["is_correct"] is True
+    assert result["correct_answer"] == "B"
+    assert store.collection_outline(conflict_collection["collection_id"])["items"][0][
+        "status"
+    ] == "correct"
+
+    # The same canonical question in another file remains untouched.
+    canonical_outline = store.collection_outline(canonical_collection["collection_id"])
+    assert canonical_outline["items"][0]["source_code"] == "2020N1A"
+    assert canonical_outline["items"][0]["status"] == "unanswered"

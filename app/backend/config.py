@@ -21,7 +21,17 @@ class Config:
         'PRACTICE_DB',
         '/srv/projects/medical-web-server/state/practice.sqlite3',
     )
-    LEGACY_SEARCH_ENABLED = os.getenv('LEGACY_SEARCH_ENABLED', 'true').lower() in (
+    SETTINGS_DB = os.getenv(
+        'SETTINGS_DB',
+        '/srv/projects/medical-web-server/state/settings.sqlite3',
+    )
+    SETTINGS_KEY_PATH = os.getenv(
+        'SETTINGS_KEY_PATH',
+        '/srv/projects/medical-web-server/state/settings.key',
+    )
+    ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', '')
+    PROVIDER_TIMEOUT = int(os.getenv('PROVIDER_TIMEOUT', '60'))
+    LEGACY_SEARCH_ENABLED = os.getenv('LEGACY_SEARCH_ENABLED', 'false').lower() in (
         'true', '1', 'yes'
     )
 
@@ -90,6 +100,15 @@ class DevelopmentConfig(Config):
         'PRACTICE_DB',
         str(_REPO_ROOT / 'state' / 'practice.sqlite3'),
     )
+    SETTINGS_DB = os.getenv(
+        'SETTINGS_DB',
+        str(_REPO_ROOT / 'state' / 'settings.sqlite3'),
+    )
+    SETTINGS_KEY_PATH = os.getenv(
+        'SETTINGS_KEY_PATH',
+        str(_REPO_ROOT / 'state' / 'settings.key'),
+    )
+    ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'local-admin')
     LEGACY_SEARCH_ENABLED = os.getenv('LEGACY_SEARCH_ENABLED', 'false').lower() in (
         'true', '1', 'yes'
     )

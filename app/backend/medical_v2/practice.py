@@ -11,7 +11,7 @@ from .catalog import Catalog
 from .normalize import display_text, normalize_answer
 
 
-PRACTICE_SCHEMA_VERSION = 1
+PRACTICE_SCHEMA_VERSION = 2
 
 
 class PracticeUnavailable(RuntimeError):
@@ -50,13 +50,14 @@ CREATE TABLE IF NOT EXISTS practice_session_questions (
     session_id TEXT NOT NULL REFERENCES practice_sessions(session_id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     question_id TEXT NOT NULL,
+    occurrence_id INTEGER,
+    collection_position INTEGER,
     submitted_answer TEXT,
     normalized_submitted_answer TEXT,
     is_correct INTEGER,
     answered_at TEXT,
     elapsed_ms INTEGER,
-    PRIMARY KEY (session_id, position),
-    UNIQUE (session_id, question_id)
+    PRIMARY KEY (session_id, position)
 );
 
 CREATE TABLE IF NOT EXISTS question_progress (
@@ -98,6 +99,7 @@ class PracticeStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript(PRACTICE_SCHEMA_SQL)
+            self._migrate_session_questions(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO practice_meta(key, value) VALUES ('schema_version', ?)",
                 (str(PRACTICE_SCHEMA_VERSION),),
@@ -106,6 +108,47 @@ class PracticeStore:
         finally:
             connection.close()
         return self.health()
+
+    @staticmethod
+    def _migrate_session_questions(connection: sqlite3.Connection) -> None:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(practice_session_questions)")
+        }
+        if "occurrence_id" in columns and "collection_position" in columns:
+            return
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            DROP INDEX IF EXISTS idx_session_questions_question;
+            ALTER TABLE practice_session_questions RENAME TO practice_session_questions_v1;
+            CREATE TABLE practice_session_questions (
+                session_id TEXT NOT NULL REFERENCES practice_sessions(session_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                question_id TEXT NOT NULL,
+                occurrence_id INTEGER,
+                collection_position INTEGER,
+                submitted_answer TEXT,
+                normalized_submitted_answer TEXT,
+                is_correct INTEGER,
+                answered_at TEXT,
+                elapsed_ms INTEGER,
+                PRIMARY KEY (session_id, position)
+            );
+            INSERT INTO practice_session_questions(
+                session_id, position, question_id, submitted_answer,
+                normalized_submitted_answer, is_correct, answered_at, elapsed_ms
+            )
+            SELECT session_id, position, question_id, submitted_answer,
+                   normalized_submitted_answer, is_correct, answered_at, elapsed_ms
+            FROM practice_session_questions_v1;
+            DROP TABLE practice_session_questions_v1;
+            CREATE INDEX idx_session_questions_question
+            ON practice_session_questions(question_id);
+            COMMIT;
+            """
+        )
+        connection.execute("PRAGMA foreign_keys = ON")
 
     def connect(self) -> sqlite3.Connection:
         if not self.database_path.is_file():
@@ -141,23 +184,48 @@ class PracticeStore:
     def create_session(
         self,
         *,
-        count: int = 10,
+        count: int | None = 10,
         collection_id: str = "",
         filters: dict[str, Any] | None = None,
         mode: str = "practice",
+        order_mode: str = "sequential",
+        start_position: int = 1,
     ) -> dict[str, Any]:
         filters = filters or {}
-        questions = self.catalog.sample_questions(
-            count=count,
-            collection_id=display_text(collection_id),
-            canonical_type=filters.get("question_type", ""),
-            exam=filters.get("exam", ""),
-            collection_kind=filters.get("collection_kind", ""),
-            subject=filters.get("subject", ""),
-            year=filters.get("year"),
-        )
-        if not questions:
+        collection_id = display_text(collection_id)
+        if collection_id:
+            selected_items = self.catalog.select_practice_items(
+                collection_id=collection_id,
+                count=count,
+                start_position=start_position,
+                order_mode=order_mode,
+                canonical_type=filters.get("question_type", ""),
+            )
+        else:
+            question_count = 10 if count in (None, 0, "") else int(count)
+            questions = self.catalog.sample_questions(
+                count=question_count,
+                canonical_type=filters.get("question_type", ""),
+                exam=filters.get("exam", ""),
+                collection_kind=filters.get("collection_kind", ""),
+                subject=filters.get("subject", ""),
+                year=filters.get("year"),
+            )
+            selected_items = [
+                {
+                    "question_id": question["question_id"],
+                    "occurrence_id": None,
+                    "collection_position": None,
+                }
+                for question in questions
+            ]
+        if not selected_items:
             raise PracticeNotFound("No questions matched the requested practice scope")
+        session_filters = {
+            **filters,
+            "order_mode": order_mode,
+            "start_position": max(1, int(start_position)),
+        }
         session_id = f"sess_{secrets.token_hex(16)}"
         connection = self.connect()
         try:
@@ -172,21 +240,28 @@ class PracticeStore:
                     (
                         session_id,
                         self.profile_id,
-                        display_text(collection_id),
+                        collection_id,
                         display_text(mode) or "practice",
-                        json.dumps(filters, ensure_ascii=False, sort_keys=True),
-                        len(questions),
+                        json.dumps(session_filters, ensure_ascii=False, sort_keys=True),
+                        len(selected_items),
                         _utc_now(),
                     ),
                 )
                 connection.executemany(
                     """
-                    INSERT INTO practice_session_questions(session_id, position, question_id)
-                    VALUES (?, ?, ?)
+                    INSERT INTO practice_session_questions(
+                        session_id, position, question_id, occurrence_id, collection_position
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     [
-                        (session_id, position, question["question_id"])
-                        for position, question in enumerate(questions, start=1)
+                        (
+                            session_id,
+                            position,
+                            item["question_id"],
+                            item.get("occurrence_id"),
+                            item.get("collection_position"),
+                        )
+                        for position, item in enumerate(selected_items, start=1)
                     ],
                 )
         finally:
@@ -204,7 +279,8 @@ class PracticeStore:
                 raise PracticeNotFound("Practice session not found")
             rows = connection.execute(
                 """
-                SELECT position, question_id, submitted_answer, is_correct, answered_at, elapsed_ms
+                SELECT position, question_id, occurrence_id, collection_position,
+                       submitted_answer, is_correct, answered_at, elapsed_ms
                 FROM practice_session_questions
                 WHERE session_id = ? ORDER BY position
                 """,
@@ -213,30 +289,80 @@ class PracticeStore:
         finally:
             connection.close()
 
-        questions = self.catalog.get_questions(
-            [row["question_id"] for row in rows], include_solution=False
+        occurrence_ids = [row["occurrence_id"] for row in rows if row["occurrence_id"] is not None]
+        occurrence_questions = self.catalog.get_occurrence_questions(
+            occurrence_ids, include_solution=False
         )
-        by_id = {question["question_id"]: question for question in questions}
+        by_occurrence = {
+            question["occurrence_id"]: question for question in occurrence_questions
+        }
+        canonical_ids = list(
+            dict.fromkeys(row["question_id"] for row in rows if row["occurrence_id"] is None)
+        )
+        by_id = {
+            question["question_id"]: question
+            for question in self.catalog.get_questions(canonical_ids, include_solution=False)
+        }
+        answered_occurrence_ids = [
+            row["occurrence_id"]
+            for row in rows
+            if row["answered_at"] and row["occurrence_id"] is not None
+        ]
+        solved_by_occurrence = {
+            question["occurrence_id"]: question
+            for question in self.catalog.get_occurrence_questions(
+                answered_occurrence_ids, include_solution=True
+            )
+        }
+        answered_ids = list(
+            dict.fromkeys(
+                row["question_id"]
+                for row in rows
+                if row["answered_at"] and row["occurrence_id"] is None
+            )
+        )
+        solved_by_id = {
+            question["question_id"]: question
+            for question in self.catalog.get_questions(answered_ids, include_solution=True)
+        }
         items = []
         answered = 0
         correct = 0
         wrong = 0
         for row in rows:
-            question = by_id.get(row["question_id"])
+            question = (
+                by_occurrence.get(row["occurrence_id"])
+                if row["occurrence_id"] is not None
+                else by_id.get(row["question_id"])
+            )
             if question is None:
                 continue
-            item = {"position": row["position"], "question": question, "submission": None}
+            item = {
+                "position": row["position"],
+                "occurrence_id": row["occurrence_id"],
+                "collection_position": row["collection_position"],
+                "question": question,
+                "submission": None,
+            }
             if row["answered_at"]:
                 answered += 1
                 if row["is_correct"] == 1:
                     correct += 1
                 elif row["is_correct"] == 0:
                     wrong += 1
+                solved = (
+                    solved_by_occurrence.get(row["occurrence_id"], {})
+                    if row["occurrence_id"] is not None
+                    else solved_by_id.get(row["question_id"], {})
+                )
                 item["submission"] = {
                     "answer": row["submitted_answer"],
                     "is_correct": _nullable_bool(row["is_correct"]),
                     "answered_at": row["answered_at"],
                     "elapsed_ms": row["elapsed_ms"],
+                    "correct_answer": solved.get("answer", ""),
+                    "point": solved.get("point", ""),
+                    "explanation": solved.get("explanation", ""),
                 }
             items.append(item)
         return {
@@ -254,6 +380,97 @@ class PracticeStore:
                 "wrong": wrong,
                 "ungraded": answered - correct - wrong,
             },
+            "items": items,
+        }
+
+    def collection_outline(self, collection_id: str) -> dict[str, Any]:
+        collection_id = display_text(collection_id)
+        collection = self.catalog.get_collection(collection_id)
+        if collection is None:
+            raise PracticeNotFound("Collection not found")
+        outline = self.catalog.collection_outline(collection_id)
+        progress_by_occurrence: dict[int, dict[str, Any]] = {}
+        connection = self.connect()
+        try:
+            for row in connection.execute(
+                """
+                SELECT psq.occurrence_id, psq.submitted_answer, psq.is_correct,
+                       psq.answered_at, psq.rowid AS attempt_rowid
+                FROM practice_session_questions psq
+                JOIN practice_sessions ps ON ps.session_id = psq.session_id
+                WHERE ps.profile_id = ? AND ps.collection_id = ?
+                  AND psq.occurrence_id IS NOT NULL AND psq.answered_at IS NOT NULL
+                ORDER BY psq.answered_at, attempt_rowid
+                """,
+                (self.profile_id, collection_id),
+            ):
+                progress = progress_by_occurrence.setdefault(
+                    row["occurrence_id"],
+                    {
+                        "attempts": 0,
+                        "correct_count": 0,
+                        "wrong_count": 0,
+                        "ungraded_count": 0,
+                        "streak": 0,
+                    },
+                )
+                progress["attempts"] += 1
+                if row["is_correct"] == 1:
+                    progress["correct_count"] += 1
+                    progress["streak"] += 1
+                elif row["is_correct"] == 0:
+                    progress["wrong_count"] += 1
+                    progress["streak"] = 0
+                else:
+                    progress["ungraded_count"] += 1
+                progress["last_answer"] = row["submitted_answer"]
+                progress["last_result"] = row["is_correct"]
+                progress["last_seen_at"] = row["answered_at"]
+            active_session = connection.execute(
+                """
+                SELECT session_id, mode, total_questions, created_at
+                FROM practice_sessions
+                WHERE profile_id = ? AND collection_id = ? AND status = 'active'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (self.profile_id, collection_id),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        summary = {"total": len(outline), "answered": 0, "correct": 0, "wrong": 0, "ungraded": 0}
+        items = []
+        for item in outline:
+            progress = progress_by_occurrence.get(item["occurrence_id"])
+            if progress is None:
+                status = "unanswered"
+                progress_payload = None
+            else:
+                summary["answered"] += 1
+                if progress["last_result"] == 1:
+                    status = "correct"
+                    summary["correct"] += 1
+                elif progress["last_result"] == 0:
+                    status = "wrong"
+                    summary["wrong"] += 1
+                else:
+                    status = "ungraded"
+                    summary["ungraded"] += 1
+                progress_payload = {
+                    "attempts": progress["attempts"],
+                    "correct_count": progress["correct_count"],
+                    "wrong_count": progress["wrong_count"],
+                    "ungraded_count": progress["ungraded_count"],
+                    "streak": progress["streak"],
+                    "last_answer": progress["last_answer"],
+                    "last_result": _nullable_bool(progress["last_result"]),
+                    "last_seen_at": progress["last_seen_at"],
+                }
+            items.append({**item, "status": status, "progress": progress_payload})
+        return {
+            "collection": collection,
+            "summary": summary,
+            "active_session": dict(active_session) if active_session else None,
             "items": items,
         }
 
@@ -275,7 +492,7 @@ class PracticeStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT ps.status, psq.question_id, psq.answered_at
+                SELECT ps.status, psq.question_id, psq.occurrence_id, psq.answered_at
                 FROM practice_sessions ps
                 JOIN practice_session_questions psq ON psq.session_id = ps.session_id
                 WHERE ps.session_id = ? AND ps.profile_id = ? AND psq.position = ?
@@ -289,7 +506,13 @@ class PracticeStore:
             if row["status"] != "active":
                 raise PracticeConflict("Practice session is not active")
 
-            question = self.catalog.get_question(row["question_id"], include_solution=True)
+            if row["occurrence_id"] is not None:
+                occurrence_questions = self.catalog.get_occurrence_questions(
+                    [row["occurrence_id"]], include_solution=True
+                )
+                question = occurrence_questions[0] if occurrence_questions else None
+            else:
+                question = self.catalog.get_question(row["question_id"], include_solution=True)
             if question is None:
                 raise PracticeNotFound("Catalog question not found")
             question_type = question["question_type"]
@@ -396,6 +619,7 @@ class PracticeStore:
             "session_id": session_id,
             "position": position,
             "question_id": question["question_id"],
+            "occurrence_id": row["occurrence_id"],
             "submitted_answer": submitted_answer,
             "is_correct": is_correct,
             "correct_answer": question.get("answer", ""),

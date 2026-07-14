@@ -28,6 +28,9 @@ from config import get_config
 from medical_v2.api import create_catalog_blueprint
 from medical_v2.catalog import Catalog, CatalogUnavailable, resolve_catalog_path
 from medical_v2.practice_api import create_practice_blueprint
+from medical_v2.semantic import SemanticSearchService
+from medical_v2.settings import SettingsStore
+from medical_v2.settings_api import create_settings_blueprint
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 config = get_config()
@@ -39,8 +42,25 @@ frontend_dir = Path(
     os.getenv("FRONTEND_DIR", str(Path(__file__).resolve().parents[2] / "public"))
 ).resolve()
 v2_catalog_path = resolve_catalog_path(config.CATALOG_DB, config.KNOWLEDGE_BASE_ROOT)
-app.register_blueprint(create_catalog_blueprint(v2_catalog_path))
+v2_catalog = Catalog(v2_catalog_path)
+settings_store = SettingsStore(config.SETTINGS_DB, config.SETTINGS_KEY_PATH)
+settings_store.initialize()
+semantic_service = SemanticSearchService(
+    v2_catalog,
+    settings_store,
+    config.KNOWLEDGE_BASE_ROOT,
+    provider_timeout=config.PROVIDER_TIMEOUT,
+)
+app.register_blueprint(create_catalog_blueprint(v2_catalog_path, semantic_service))
 app.register_blueprint(create_practice_blueprint(v2_catalog_path, config.PRACTICE_DB))
+app.register_blueprint(
+    create_settings_blueprint(
+        settings_store,
+        admin_token=config.ADMIN_TOKEN,
+        vector_status=semantic_service.status,
+        provider_timeout=config.PROVIDER_TIMEOUT,
+    )
+)
 
 # CORS 配置
 if config.CORS_ORIGINS == '*':
@@ -404,9 +424,23 @@ def ai_chat():
     if not isinstance(max_tokens, int) or max_tokens < 1 or max_tokens > 8192:
         max_tokens = 4096
 
+    # Prefer the encrypted website setting. Keep the legacy environment values
+    # only as a migration fallback for an existing deployment.
+    llm_config = settings_store.provider_config("llm", include_secret=True)
+    if llm_config.get("api_key"):
+        ai_api_url = llm_config["api_url"]
+        ai_api_key = llm_config["api_key"]
+        ai_model = llm_config["model"]
+    else:
+        ai_api_url = AI_API_URL
+        ai_api_key = AI_API_KEY
+        ai_model = AI_MODEL
+    if not ai_api_key:
+        return jsonify({'error': '大模型 API 尚未配置'}), 503
+
     # 构建转发请求
     payload = {
-        "model": AI_MODEL,
+        "model": ai_model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -415,13 +449,13 @@ def ai_chat():
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {AI_API_KEY}",
+        "Authorization": f"Bearer {ai_api_key}",
     }
 
     def generate():
         try:
             resp = http_requests.post(
-                AI_API_URL,
+                ai_api_url,
                 json=payload,
                 headers=headers,
                 stream=True,
@@ -429,8 +463,7 @@ def ai_chat():
             )
 
             if resp.status_code != 200:
-                error_text = resp.text[:500]
-                yield f"data: {json.dumps({'error': f'AI 服务返回错误 ({resp.status_code}): {error_text}'})}\n\n"
+                yield f"data: {json.dumps({'error': f'AI 服务返回错误 ({resp.status_code})'})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
@@ -448,8 +481,8 @@ def ai_chat():
         except http_requests.exceptions.ConnectionError:
             yield f"data: {json.dumps({'error': '无法连接 AI 服务，请检查网络'})}\n\n"
             yield "data: [DONE]\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': f'AI 服务异常: {str(e)}'})}\n\n"
+        except Exception:
+            yield f"data: {json.dumps({'error': 'AI 服务发生未预期异常'})}\n\n"
             yield "data: [DONE]\n\n"
 
     return Response(
@@ -467,7 +500,7 @@ def ai_chat():
 def health():
     """Core v2 health with optional v1 compatibility status."""
     try:
-        v2_status = Catalog(v2_catalog_path).health()
+        v2_status = v2_catalog.health()
     except (CatalogUnavailable, OSError, ValueError) as error:
         return jsonify({
             'status': 'unhealthy',
@@ -492,7 +525,7 @@ def health():
             except Exception as error:
                 legacy['message'] = str(error)
 
-    return jsonify({**v2_status, 'legacy': legacy})
+    return jsonify({**v2_status, 'legacy': legacy, 'vector_index': semantic_service.status()})
 
 
 @app.route('/api/stats', methods=['GET'])

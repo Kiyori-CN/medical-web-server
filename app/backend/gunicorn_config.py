@@ -13,6 +13,10 @@ os.environ.setdefault('EMBED_API_URL', 'https://api.siliconflow.cn/v1/embeddings
 os.environ.setdefault('EMBED_MODEL', 'BAAI/bge-m3')
 os.environ.setdefault('LLM_API_KEY', '')
 os.environ.setdefault('LLM_API_URL', 'https://api.siliconflow.cn/v1/chat/completions')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 
 # ── 服务器绑定 ───────────────────────────────────────────
 bind = '0.0.0.0:8080'
