@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+.env.local
 .venv/
 venv/
 __pycache__/
@@ -8,18 +9,29 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 server.log
 *.log
 logs/
+# Local source datasets and generated runtime state are never committed.
+data/
 knowledge-base/
+state/
+artifacts/
+dist/
+build/
 public/.well-known/
 *.db
 *.sqlite
 *.sqlite3
 *.idx
 *.bin
+*.npy
+*.npz
 *.pem
 *.key
 *.crt
 *.pfx
 .DS_Store
+Thumbs.db
