@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["app/backend"]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["app/backend/medical_v2"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

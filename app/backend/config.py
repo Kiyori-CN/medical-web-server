@@ -12,6 +12,18 @@ class Config:
     """基础配置（所有环境共享的默认值）"""
     # ── 知识库路径 ──
     KB_PATH = os.getenv('KB_PATH', '/srv/projects/medical-web-server/knowledge-base/西医题库')
+    KNOWLEDGE_BASE_ROOT = os.getenv(
+        'KNOWLEDGE_BASE_ROOT',
+        '/srv/projects/medical-web-server/knowledge-base/v2',
+    )
+    CATALOG_DB = os.getenv('CATALOG_DB', '')
+    PRACTICE_DB = os.getenv(
+        'PRACTICE_DB',
+        '/srv/projects/medical-web-server/state/practice.sqlite3',
+    )
+    LEGACY_SEARCH_ENABLED = os.getenv('LEGACY_SEARCH_ENABLED', 'true').lower() in (
+        'true', '1', 'yes'
+    )
 
     # ── Flask 服务 ──
     HOST = os.getenv('FLASK_HOST', '0.0.0.0')
@@ -68,6 +80,19 @@ class DevelopmentConfig(Config):
     DEBUG = True
     PORT = 5001
     KB_PATH = os.getenv('KB_PATH', '/storage/emulated/0/Project/ikbs/西医题库')
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+    KNOWLEDGE_BASE_ROOT = os.getenv(
+        'KNOWLEDGE_BASE_ROOT',
+        str(_REPO_ROOT / 'knowledge-base' / 'v2'),
+    )
+    CATALOG_DB = os.getenv('CATALOG_DB', '')
+    PRACTICE_DB = os.getenv(
+        'PRACTICE_DB',
+        str(_REPO_ROOT / 'state' / 'practice.sqlite3'),
+    )
+    LEGACY_SEARCH_ENABLED = os.getenv('LEGACY_SEARCH_ENABLED', 'false').lower() in (
+        'true', '1', 'yes'
+    )
 
 
 class ProductionConfig(Config):

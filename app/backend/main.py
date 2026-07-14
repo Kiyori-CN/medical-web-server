@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-医学搜题系统后端服务器 v1.0
-基于 Flask + ikbs_pysearch 极速搜索引擎
-支持关键词搜索、语义搜索、混合搜索三种模式 + AI 辅助对话
+医学题库后端服务器
+v2 使用 SQLite/FTS5 提供结构化搜题与刷题，v1 搜索仅作为迁移兼容层。
 """
 
 import os
+from pathlib import Path
 os.environ.setdefault("FLASK_ENV", "production")
 os.environ.setdefault("KB_PATH", "/srv/projects/medical-web-server/knowledge-base/西医题库")
 os.environ.setdefault("EMBED_API_KEY", "")
@@ -25,6 +25,9 @@ import requests as http_requests
 from collections import OrderedDict
 from ikbs_pysearch import get_engine
 from config import get_config
+from medical_v2.api import create_catalog_blueprint
+from medical_v2.catalog import Catalog, CatalogUnavailable, resolve_catalog_path
+from medical_v2.practice_api import create_practice_blueprint
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 config = get_config()
@@ -32,6 +35,12 @@ AI_API_URL = config.AI_API_URL
 AI_API_KEY = config.AI_API_KEY
 AI_MODEL = config.AI_MODEL
 app = Flask(__name__)
+frontend_dir = Path(
+    os.getenv("FRONTEND_DIR", str(Path(__file__).resolve().parents[2] / "public"))
+).resolve()
+v2_catalog_path = resolve_catalog_path(config.CATALOG_DB, config.KNOWLEDGE_BASE_ROOT)
+app.register_blueprint(create_catalog_blueprint(v2_catalog_path))
+app.register_blueprint(create_practice_blueprint(v2_catalog_path, config.PRACTICE_DB))
 
 # CORS 配置
 if config.CORS_ORIGINS == '*':
@@ -85,8 +94,11 @@ def init_engine():
         search_engine = None
 
 
-# 模块加载时自动初始化（Gunicorn preload_app 时执行）
-init_engine()
+# 模块加载时自动初始化（Gunicorn preload_app 时执行）。本地 v2 开发默认关闭 v1。
+if config.LEGACY_SEARCH_ENABLED:
+    init_engine()
+else:
+    print("ℹ️  v1 旧搜索已禁用，v2 SQLite/FTS5 接口仍可用", flush=True)
 
 
 # ── 搜索缓存（线程安全的 LRU） ───────────────────────────────────────────────
@@ -453,20 +465,34 @@ def ai_chat():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    """健康检查"""
-    if not search_engine:
-        return jsonify({'status': 'unhealthy', 'message': '搜索引擎未初始化'}), 503
-
+    """Core v2 health with optional v1 compatibility status."""
     try:
-        status = search_engine.status()
+        v2_status = Catalog(v2_catalog_path).health()
+    except (CatalogUnavailable, OSError, ValueError) as error:
         return jsonify({
-            'status': 'healthy',
-            'engine': 'ikbs_pysearch',
-            'optimized': status.get('optimized', False),
-            'chunks': status.get('total_chunks', 0),
-        })
-    except Exception as e:
-        return jsonify({'status': 'unhealthy', 'message': str(e)}), 503
+            'status': 'unhealthy',
+            'engine': 'sqlite-fts5',
+            'message': str(error),
+        }), 503
+    if v2_status['status'] != 'healthy':
+        return jsonify(v2_status), 503
+
+    legacy = {'enabled': config.LEGACY_SEARCH_ENABLED, 'status': 'disabled'}
+    if config.LEGACY_SEARCH_ENABLED:
+        legacy['status'] = 'unavailable'
+        if search_engine:
+            try:
+                legacy_engine_status = search_engine.status()
+                legacy = {
+                    'enabled': True,
+                    'status': 'healthy',
+                    'optimized': legacy_engine_status.get('optimized', False),
+                    'chunks': legacy_engine_status.get('total_chunks', 0),
+                }
+            except Exception as error:
+                legacy['message'] = str(error)
+
+    return jsonify({**v2_status, 'legacy': legacy})
 
 
 @app.route('/api/stats', methods=['GET'])
@@ -510,23 +536,25 @@ def clear_cache():
 # ── 前端静态文件服务 ──────────────────────────────────────────
 @app.route("/")
 def index():
-    return send_from_directory("/srv/projects/medical-web-server/app/frontend", "index.html")
+    return send_from_directory(str(frontend_dir), "index.html")
 
 @app.route("/<path:path>")
 def static_files(path):
-    return send_from_directory("/srv/projects/medical-web-server/app/frontend", path)
+    return send_from_directory(str(frontend_dir), path)
 
 # ── 启动入口 ──────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     print("=" * 60, flush=True)
-    print("🏥 医学搜题系统后端服务器 v1.0", flush=True)
+    print("🏥 医学题库后端服务器 v2", flush=True)
     print("=" * 60, flush=True)
     print(f"🌍 环境: {os.getenv('FLASK_ENV', 'production')}", flush=True)
     print(f"🔧 调试模式: {config.DEBUG}", flush=True)
     print(f"🚀 服务器启动: http://{config.HOST}:{config.PORT}", flush=True)
     print(f"📡 API 端点:", flush=True)
     print(f"   GET  /api/health       - 健康检查", flush=True)
+    print(f"   POST /api/v2/search    - v2 结构化搜题", flush=True)
+    print(f"   POST /api/v2/practice/sessions - v2 创建练习", flush=True)
     print(f"   POST /api/search       - 搜索题目", flush=True)
     print(f"   GET  /api/random       - 随机练习", flush=True)
     print(f"   POST /api/ai/chat      - AI 辅助对话", flush=True)
