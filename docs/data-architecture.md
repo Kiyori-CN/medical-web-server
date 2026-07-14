@@ -6,11 +6,12 @@
 
 - 2126 个 Excel 和 1 个 Word；
 - 123,564 条题目来源记录；
-- schema v2 规范化后为 64,078 道题、67,650 个内容版本；
+- schema v4 规范化后为 64,078 道题、67,650 个内容版本；
 - 约 48.1% 的来源记录是不同题集组织方式造成的重复；
 - 识别出 1,443 个 A3/A4 病例题组和 3,732 个题组成员；
 - A3/A4 版本涉及的 3,792 个规范题 ID 中，高置信成组覆盖 98.42%，显式结构覆盖 100%；
 - 4 个真实答案冲突已记录，未静默覆盖；
+- 2,127 个源文件分别对应 2,127 个精确文件题集；同名 `.xlsx` 与 `.docx` 不合并；
 - 文件结构覆盖三基考试、306 专硕、699 学硕和执业医师；
 - 题型包含选择、判断、填空、名词解释、简答和论述；字段允许合理缺失。
 
@@ -49,12 +50,14 @@
 | `question_group_members` | 子题、组内顺序和子题题干 |
 | `source_files` | 原始文件、工作表、哈希和目录元数据 |
 | `question_occurrences` | 题目在源文件中的行号、题号和原始版本 |
-| `collections` | 历年真题、考点顺序/乱序、系统/学科/年份刷题等题集 |
-| `collection_questions` | 题目与题集的多对多关系、顺序和显示元数据 |
+| `collections` | 一个具体源文件一个题集，保留完整相对路径、扩展名和目录元数据 |
+| `collection_questions` | occurrence 与精确文件题集的关系、原文件顺序和显示元数据 |
 | `import_runs` | 导入参数、版本、统计和结果 |
 | `data_conflicts` | 同题不同答案、解析、题型或选项的冲突 |
 
 用户、练习会话、答题、收藏、错题和复习计划放入独立 `practice.sqlite3`，不能写入只读题库。
+
+刷题以 `question_occurrences` 为出题和判分单位：同一规范题在不同源文件中可以有不同题号、文本版本或冲突答案，必须展示并按当前 occurrence 对应的 `question_versions` 判分。跨文件错题统计仍按规范 `question_id` 聚合，但文件题号目录的正确/错误/未做状态必须按 occurrence 隔离。
 
 ### A3/A4 题组
 
@@ -63,7 +66,7 @@
 - 显式 `共用题干: ... 问题: ...` 结构直接拆为共享题干和子题；
 - 旧文件中连续 A3/A4 行只有在共享至少 40 个规范字符、且公共前缀以标点结束时才自动成组；
 - 每道子题仍保留完整原始题干、独立选项、答案、解析和来源；
-- 一个题组按来源顺序保存成员，搜索与未来向量索引仍以子题 question ID 为基本单位；
+- 一个题组按来源顺序保存成员，搜索与向量索引仍以子题 question ID 为基本单位；
 - 无法高置信成组的题保持独立，不做模糊强合并。
 
 ## 规范化与去重
@@ -96,9 +99,9 @@ FTS5 是默认搜索入口，索引规范题干、选项、考点和解析，并
 
 ### 题目向量
 
-一道规范题目对应一个向量。嵌入文本包含题干和选项；不包含答案和完整长解析。A3/A4 子题在自己的题干前加入共享病例题干，但仍保持一子题一个向量。
+一道规范题目对应一个向量。嵌入文本包含题型、题干和有序选项；不包含答案、考点和完整长解析。A3/A4 子题保留完整病例题干，但仍保持一子题一个向量。
 
-向量索引是可选语义召回层：关闭后精确搜索和刷题必须仍可运行。当前规模优先使用版本化 NumPy mmap 索引，不引入独立向量数据库服务。
+向量索引是可选语义召回层：关闭后精确搜索和刷题必须仍可运行。当前规模使用版本化 NumPy mmap 索引，不引入独立向量数据库服务。默认 `Qwen/Qwen3-Embedding-0.6B`、1024 维；64,078 条 `float32` 向量约 250 MiB。矩阵行预归一化，查询执行精确余弦扫描，Gunicorn worker 共享操作系统页缓存并各限 1 个 BLAS 线程。
 
 ### 知识向量
 
@@ -127,10 +130,17 @@ FTS5 是默认搜索入口，索引规范题干、选项、考点和解析，并
 ```text
 knowledge-base/v2/builds/<build_id>/
   catalog.sqlite3
-  vectors/
   manifest.json
   import-report.json
   conflict-report.json
+
+knowledge-base/v2/vector-indexes/<vec_build_id>/
+  embeddings.npy
+  question_ids.json
+  build-state.json
+  manifest.json
+
+knowledge-base/v2/vector-current.json
 ```
 
 `current.json` 只在以下检查全部通过后切换：
@@ -141,6 +151,8 @@ knowledge-base/v2/builds/<build_id>/
 - FTS 和可选向量 ID 与 question ID 一致；
 - 固定搜索回归集和刷题闭环通过。
 
-当前 build schema 版本为 3。build ID 同时绑定 schema 版本和完整源文件 snapshot；改变规范化/schema 会产生新目录，不覆盖旧 build。schema v3 在 v2 题组结构上增加题号索引，使纯题号查询无需扫描含长解析的主表。
+当前 build schema 版本为 4。build ID 同时绑定 schema 版本和完整源文件 snapshot；改变规范化/schema 会产生新目录，不覆盖旧 build。schema v4 在 v3 基础上要求 `collections.source_file_id` 唯一、保存扩展名，并按包含扩展名的完整相对路径生成 collection ID，因此同名不同格式文件和每个原始文件都能被精确选择。
+
+向量 build ID 绑定 catalog build、snapshot、API URL、模型、维度、文本版本和题目 ID 哈希。运行时只有 catalog build、API URL、模型、维度与激活索引全部一致时才允许 semantic/hybrid 查询。详细安全和构建流程见 `docs/settings-and-semantic-search.md`。
 
 旧 build、旧生产知识库和数据库备份在回滚窗口内保持不变。

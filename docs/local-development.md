@@ -27,6 +27,8 @@ python -m venv .venv
 
 本地配置放在被忽略的 `.env.local` 或环境变量中，不要修改 `.env.example` 来保存个人路径或秘密。
 
+开发环境的设置页管理员口令默认为 `local-admin`，只用于本机。供应商密钥必须先在控制台轮换，再通过设置页录入；不得粘贴到 PowerShell 命令、测试、文档或 Git 文件。
+
 ## 改动边界
 
 一次改动应只承担一个可验证目标，例如：
@@ -53,6 +55,16 @@ $env:LEGACY_SEARCH_ENABLED = "false"
 
 `build_catalog.py` 只读扫描 `data/`，输出 manifest、导入报告和冲突报告；只有构建数据库通过完整性和外键检查后，`--activate` 才更新 `current.json`。
 
+schema v4 把每个具体 Excel/Word 文件作为独立 collection。`init_practice.py` 会把旧 practice schema v1 原位迁移到 v2；运行前应停止本地服务，并使用 SQLite backup API 备份状态库，不能只复制一个仍在写入的数据库文件。
+
+需要语义搜索时，启动网站后在设置页保存并测试嵌入配置，再执行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_vectors.py --activate
+```
+
+该命令从加密设置库读取密钥，按题目批量构建可恢复 mmap 索引，不在 stdout、manifest 或 Git 中写入密钥。中断后重复运行会继续未完成批次；改变 catalog、API URL、模型或维度会产生新的 vector build。
+
 最低检查：
 
 ```powershell
@@ -68,9 +80,13 @@ python -m pytest
 - 单元测试：规范化、题型、答案和选项处理；
 - 数据测试：幂等导入、去重、冲突、来源关系和统计对账；
 - API 测试：搜索、题集、题目详情、刷题提交和答案隐藏；
-- 前端验收：桌面和移动端的搜题及刷题完整流程。
+- 安全测试：管理员鉴权、密钥加密、公共/错误响应不泄密；
+- 向量测试：恢复、复用、维度、catalog 兼容和 semantic/hybrid；
+- 前端验收：桌面和移动端的目录、指定题号、提交、刷新恢复、设置和搜题完整流程。
 
 测试只能使用小型脱敏 fixture。不得把真实题库复制到 `tests/` 或提交 GitHub。
+
+真实数据验收至少核对：2,127 个 source/collection、123,564 occurrences、64,078 questions/FTS、67,650 versions、1,443 groups、3,732 members、4 conflicts、`integrity_check=ok`、外键 0。再抽查 `专硕考研（306临床医学综合能力）/历年真题/2026/2026.xlsx` 的 165 个题号、从指定题号出题和 occurrence 原版本判分。
 
 ## 提交与推送
 

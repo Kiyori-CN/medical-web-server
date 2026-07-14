@@ -26,6 +26,8 @@
 
 原始文件是审计和重建输入，规范化题目数据库是应用事实源，FTS/向量索引是可重建派生物，用户刷题状态是独立持久化数据。
 
+每个具体源文件是一个 collection；文件相对路径和原顺序决定刷题范围。规范 `question_id` 用于去重、搜题向量和跨文件错题统计，`occurrence_id` 用于原文件展示、题号目录、会话与判分。
+
 目标 v2 根目录为：
 
 ```text
@@ -36,8 +38,17 @@
 
 ## 当前实现
 
-- 当前代码：v2 Flask + 结构化 SQLite + FTS5 + 独立刷题状态。
+- 当前代码：v2 Flask + 结构化 SQLite/FTS5 + 精确文件刷题 + 加密设置 + 可选 mmap 语义索引。
 - 迁移兼容：v1 `ikbs_pysearch` 路由和旧 TXT/向量索引仍可通过环境变量启用。
-- 当前本地 build：catalog schema v3，64,078 道规范题，1,443 个病例题组。
-- 可选方向：按规范题 ID 建立本地语义索引；不引入独立向量数据库服务。
+- 当前本地 build：catalog schema v4 `v4_dffb09373b9e0b7fca56`，2,127 个精确文件题集、64,078 道规范题、1,443 个病例题组。
+- 搜索：keyword 始终本地可用；semantic/hybrid 按规范题 ID 使用版本化 NumPy mmap，不引入独立向量数据库服务。
+- 默认嵌入：`Qwen/Qwen3-Embedding-0.6B`、1024 维；供应商 URL、模型和加密密钥由管理员设置页管理。
+- 资源目标：4 核 4G 使用 3 个同步 Gunicorn worker、preload、mmap 和每 worker 1 个 BLAS 线程。
 - 核心约束：无第三方登录、无远程业务数据库、无外部数据接口依赖。
+
+## 设置与秘密
+
+- 服务器设置：`state/settings.sqlite3`；Fernet key：`state/settings.key`。
+- 管理接口：`X-Admin-Token`；生产 `ADMIN_TOKEN` 必须为独立高强度随机值。
+- 公共接口、错误响应、日志、构建产物和 Git 永不返回或保存明文 API 密钥。
+- 聊天或截图中暴露的密钥必须轮换后再通过设置页录入。
