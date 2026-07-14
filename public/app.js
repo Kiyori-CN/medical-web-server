@@ -1,681 +1,1926 @@
-const API = "/api/v2";
-const PREFERENCE_KEY = "medical-v2-preferences";
+const API = "/api";
+const PREFERENCE_KEY = "medical-exam-preferences";
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const state = {
-  publicSettings: null,
-  preferences: loadPreferences(),
-  libraryPath: "",
+  user: null,
+  setupRequired: false,
+  authMode: "login",
+  settings: null,
+  stats: null,
+  libraryPath: { library: "", favorites: "", wrong: "" },
   outline: null,
-  outlineStatus: "all",
+  outlineMode: "practice",
   session: null,
-  practiceIndex: 0,
-  selections: new Map(),
-  results: new Map(),
-  questionStartedAt: 0,
-  adminToken: "",
+  sessionIndex: 0,
+  sessionReturnTarget: null,
+  drafts: {},
+  timerHandle: null,
+  selectionTimer: null,
+  gestureStart: null,
+  suppressClickUntil: 0,
+  navigationDirection: "",
+  searchMode: "keyword",
+  searchResults: [],
+  searchMetadata: {},
+  searchFields: { stem: true, answer: true, point: true, explanation: true },
+  searchQuestionTypes: [],
+  searchSolutionVisibility: { stem: true, answer: true, point: true, explanation: true },
+  searchSettingsExpanded: true,
+  lastSearchQuery: "",
+  adminTab: "overview",
+  adminData: null,
+  comments: {},
 };
 
-document.addEventListener("DOMContentLoaded", () => {
-  bindNavigation();
-  bindSearch();
-  bindLibrary();
-  bindPractice();
-  bindWrongBook();
-  bindSettings();
-  applyPreferences();
-  initialize();
-});
+document.addEventListener("DOMContentLoaded", boot);
+window.addEventListener("hashchange", route);
+document.addEventListener("click", handleClick);
+document.addEventListener("submit", handleSubmit);
+document.addEventListener("pointerdown", handlePracticePointerDown, { passive: true });
+document.addEventListener("pointerup", handlePracticePointerUp, { passive: true });
+document.addEventListener("pointercancel", clearPracticeGesture, { passive: true });
+document.addEventListener("keydown", handlePracticeKeydown);
+window.addEventListener("resize", handlePracticeResize);
 
-async function initialize() {
+async function boot() {
   try {
-    const [health, stats, settings] = await Promise.all([
-      fetchJSON("/api/health"),
-      fetchJSON(`${API}/stats`),
-      fetchJSON(`${API}/settings`),
+    const [setup, me] = await Promise.all([
+      api("/auth/setup", { authRedirect: false }),
+      api("/auth/me", { authRedirect: false }),
     ]);
-    state.publicSettings = settings;
-    const status = $("#catalogStatus");
-    status.classList.add("healthy");
-    status.innerHTML = `<span class="status-dot"></span><span>${formatNumber(health.total_questions)} 题已就绪</span>`;
-    const metrics = [
-      [stats.counts.questions, "规范题目"],
-      [stats.counts.collections, "题库文件"],
-      [stats.counts.question_occurrences, "来源记录"],
-    ];
-    $("#metricRow").innerHTML = metrics
-      .map(([value, label]) => `<div><strong>${formatNumber(value)}</strong><span>${label}</span></div>`)
-      .join("");
-    renderSettingsStatus();
-    applySemanticAvailability();
-  } catch (error) {
-    const status = $("#catalogStatus");
-    status.classList.add("error");
-    status.innerHTML = `<span class="status-dot"></span><span>题库不可用</span>`;
-    toast(error.message, true);
-  }
-}
-
-function bindNavigation() {
-  $$(".mode-tab").forEach((button) => {
-    button.addEventListener("click", () => switchView(button.dataset.view));
-  });
-}
-
-function switchView(view) {
-  $$(".mode-tab").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
-  $$('[data-view-panel]').forEach((panel) => {
-    const active = panel.dataset.viewPanel === view;
-    panel.hidden = !active;
-    panel.classList.toggle("active", active);
-  });
-  if (view === "library" && !state.outline && !$("#practiceWorkspace").hidden) return;
-  if (view === "library" && !state.outline) loadLibrary(state.libraryPath);
-  if (view === "wrong") loadWrongQuestions();
-  if (view === "settings") refreshPublicSettings();
-}
-
-function bindSearch() {
-  $("#searchForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await runSearch();
-  });
-}
-
-async function runSearch() {
-  const query = $("#searchInput").value.trim();
-  if (!query) {
-    toast("请输入题干、题号或关键词", true);
-    $("#searchInput").focus();
-    return;
-  }
-  const container = $("#searchResults");
-  container.className = "card-list";
-  container.innerHTML = loadingMarkup("正在检索结构化题库");
-  $("#searchHeading").textContent = "搜索中";
-  $("#searchMeta").textContent = "";
-  const started = performance.now();
-  try {
-    const payload = await fetchJSON(`${API}/search`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        query,
-        mode: $("#searchMode").value,
-        limit: Number(state.preferences.resultLimit || 10),
-        include_solution: $("#includeSolution").checked,
-        filters: {
-          exam: $("#searchExam").value,
-          question_type: $("#searchType").value,
-        },
-      }),
-    });
-    const elapsed = Math.round(performance.now() - started);
-    $("#searchHeading").textContent = payload.count ? `找到 ${payload.count} 道相关题目` : "没有找到匹配题目";
-    $("#searchMeta").textContent = `${searchModeLabel(payload.mode)} · ${elapsed} ms`;
-    if (!payload.count) {
-      container.className = "card-list empty-state";
-      container.innerHTML = `<div class="empty-icon">∅</div><p>试试更完整的题干，或调整考试、题型与搜索方式。</p>`;
+    state.setupRequired = Boolean(setup.setup_required);
+    if (me.authenticated && me.user) {
+      await enterApp(me.user);
       return;
     }
-    container.innerHTML = payload.results.map((question, index) => questionCard(question, index + 1)).join("");
+    showAuth(state.setupRequired ? "setup" : "login");
   } catch (error) {
-    $("#searchHeading").textContent = "搜索失败";
-    container.className = "card-list empty-state";
-    container.innerHTML = `<p>${escapeHTML(error.message)}</p>`;
+    showAuth("login");
+    setAuthError(error.message || "服务暂时不可用，请稍后重试");
   }
 }
 
-function bindLibrary() {
-  $("#refreshLibrary").addEventListener("click", () => loadLibrary(state.libraryPath));
-  $("#libraryBreadcrumbs").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-library-path]");
-    if (button) loadLibrary(button.dataset.libraryPath);
-  });
-  $("#libraryEntries").addEventListener("click", (event) => {
-    const directory = event.target.closest("[data-directory-path]");
-    if (directory) loadLibrary(directory.dataset.directoryPath);
-    const collection = event.target.closest("[data-collection-id]");
-    if (collection) selectCollection(collection.dataset.collectionId);
-  });
-  $("#backToLibrary").addEventListener("click", showLibraryBrowser);
-  $("#continuePractice").addEventListener("click", continueCollectionPractice);
-  $("#quickPractice").addEventListener("click", () => startCollectionPractice({ orderMode: "random", count: 20, startPosition: 1 }));
-  $("#questionDirectory").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-collection-position]");
-    if (button) startCollectionPractice({ startPosition: Number(button.dataset.collectionPosition), orderMode: "sequential" });
-  });
-  $$("[data-outline-status]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.outlineStatus = button.dataset.outlineStatus;
-      $$("[data-outline-status]").forEach((item) => item.classList.toggle("active", item === button));
-      renderQuestionDirectory();
-    });
-  });
-  $("#outlineType").addEventListener("change", renderQuestionDirectory);
-}
-
-async function loadLibrary(parent = "") {
-  state.libraryPath = parent || "";
-  state.outline = null;
-  $("#libraryBrowser").hidden = false;
-  $("#collectionView").hidden = true;
-  $("#practiceWorkspace").hidden = true;
-  const container = $("#libraryEntries");
-  container.innerHTML = loadingMarkup("正在读取原始题库目录");
-  try {
-    const payload = await fetchJSON(`${API}/library?parent=${encodeURIComponent(state.libraryPath)}`);
-    renderBreadcrumbs(payload.breadcrumbs);
-    const rows = [
-      ...payload.directories.map((item) => libraryEntry(item)),
-      ...payload.collections.map((item) => libraryEntry(item)),
-    ];
-    container.innerHTML = rows.length ? rows.join("") : `<div class="empty-state"><p>此目录没有题库文件。</p></div>`;
-  } catch (error) {
-    container.innerHTML = `<div class="empty-state"><p>${escapeHTML(error.message)}</p></div>`;
+async function api(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (options.body !== undefined && !(options.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
   }
-}
-
-function renderBreadcrumbs(items) {
-  $("#libraryBreadcrumbs").innerHTML = items.map((item, index) => `
-    ${index ? '<span class="breadcrumb-separator">/</span>' : ""}
-    <button class="breadcrumb-button" type="button" data-library-path="${escapeHTML(item.path)}">${escapeHTML(item.name)}</button>`).join("");
-}
-
-function libraryEntry(item) {
-  if (item.kind === "directory") {
-    return `<button class="library-entry folder" type="button" data-directory-path="${escapeHTML(item.path)}">
-      <span class="entry-icon" aria-hidden="true">▰</span>
-      <span class="entry-copy"><strong>${escapeHTML(item.name)}</strong><span>${formatNumber(item.collection_count)} 个文件</span></span>
-      <span class="entry-meta">${formatNumber(item.question_count)} 题 ›</span>
-    </button>`;
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    const csrf = getCookie("medical_csrf");
+    if (csrf) headers.set("X-CSRF-Token", csrf);
   }
-  return `<button class="library-entry file" type="button" data-collection-id="${escapeHTML(item.collection_id)}">
-    <span class="entry-icon" aria-hidden="true">▤</span>
-    <span class="entry-copy"><strong>${escapeHTML(item.name)}</strong><span>${escapeHTML(item.extension)} · ${formatNumber(item.unique_question_count)} 道规范题</span></span>
-    <span class="entry-meta">${formatNumber(item.question_count)} 题 ›</span>
-  </button>`;
-}
-
-async function selectCollection(collectionId) {
-  $("#libraryBrowser").hidden = true;
-  $("#collectionView").hidden = false;
-  $("#practiceWorkspace").hidden = true;
-  $("#questionDirectory").innerHTML = loadingMarkup("正在读取题号目录");
-  try {
-    state.outline = await fetchJSON(`${API}/practice/collections/${encodeURIComponent(collectionId)}/outline`);
-    const collection = state.outline.collection;
-    $("#collectionTitle").textContent = collection.title || collection.relative_path.split("/").at(-1);
-    $("#collectionPath").textContent = collection.relative_path;
-    const types = [...new Set(state.outline.items.map((item) => item.raw_type || item.question_type).filter(Boolean))].sort();
-    $("#outlineType").innerHTML = `<option value="">全部题型</option>${types.map((type) => `<option value="${escapeHTML(type)}">${escapeHTML(type)}</option>`).join("")}`;
-    $("#continuePractice").textContent = state.outline.active_session ? "继续上次练习" : "从未做题开始";
-    renderQuestionDirectory();
-  } catch (error) {
-    $("#questionDirectory").innerHTML = `<div class="empty-state"><p>${escapeHTML(error.message)}</p></div>`;
-  }
-}
-
-function showLibraryBrowser() {
-  state.outline = null;
-  $("#collectionView").hidden = true;
-  $("#practiceWorkspace").hidden = true;
-  $("#libraryBrowser").hidden = false;
-  loadLibrary(state.libraryPath);
-}
-
-function renderQuestionDirectory() {
-  if (!state.outline) return;
-  const selectedType = $("#outlineType").value;
-  const items = state.outline.items.filter((item) => {
-    const statusMatch = state.outlineStatus === "all" || item.status === state.outlineStatus;
-    const typeMatch = !selectedType || (item.raw_type || item.question_type) === selectedType;
-    return statusMatch && typeMatch;
+  const response = await fetch(`${API}${path}`, {
+    ...options,
+    method,
+    headers,
+    credentials: "same-origin",
+    body:
+      options.body === undefined || options.body instanceof FormData
+        ? options.body
+        : JSON.stringify(options.body),
   });
-  $("#questionDirectory").innerHTML = items.length
-    ? items.map((item) => `<button class="question-number ${escapeHTML(item.status)}" type="button"
-        data-collection-position="${item.collection_position}" title="${escapeHTML(item.source_code || item.stem.slice(0, 40))}">${item.collection_position}</button>`).join("")
-    : `<div class="empty-state"><p>当前筛选没有题目。</p></div>`;
-  const summary = state.outline.summary;
-  const accuracy = summary.answered ? Math.round(summary.correct / summary.answered * 100) : 0;
-  $("#outlineSummary").innerHTML = `
-    <span>共 <strong>${summary.total}</strong> 题</span>
-    <span>对 <strong>${summary.correct}</strong></span>
-    <span>错 <strong>${summary.wrong}</strong></span>
-    <span>未做 <strong>${summary.total - summary.answered}</strong></span>
-    <span>正确率 <strong>${accuracy}%</strong></span>`;
-}
-
-async function continueCollectionPractice() {
-  if (!state.outline) return;
-  if (state.outline.active_session) {
-    try {
-      const session = await fetchJSON(`${API}/practice/sessions/${state.outline.active_session.session_id}`);
-      activateSession(session);
-      const firstUnanswered = session.items.findIndex((item) => !item.submission);
-      state.practiceIndex = firstUnanswered >= 0 ? firstUnanswered : 0;
-      renderPracticeQuestion();
-      return;
-    } catch (error) {
-      toast(error.message, true);
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json")
+    ? await response.json()
+    : { error: await response.text() };
+  if (!response.ok) {
+    if (response.status === 401 && options.authRedirect !== false) {
+      state.user = null;
+      showAuth("login");
     }
+    const error = new Error(payload.error || `请求失败（${response.status}）`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
-  const first = state.outline.items.find((item) => item.status === "unanswered") || state.outline.items[0];
-  if (first) startCollectionPractice({ startPosition: first.collection_position, orderMode: "sequential" });
-}
-
-async function startCollectionPractice({ startPosition = 1, orderMode = "sequential", count = null }) {
-  if (!state.outline) return;
-  const buttons = [$("#continuePractice"), $("#quickPractice")];
-  buttons.forEach((button) => { button.disabled = true; });
-  try {
-    const session = await fetchJSON(`${API}/practice/sessions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        collection_id: state.outline.collection.collection_id,
-        start_position: startPosition,
-        order_mode: orderMode,
-        count,
-        mode: orderMode === "random" ? "quick" : "practice",
-      }),
-    });
-    activateSession(session);
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    buttons.forEach((button) => { button.disabled = false; });
-  }
-}
-
-function bindPractice() {
-  $("#exitPractice").addEventListener("click", exitPractice);
-  $("#practiceCard").addEventListener("click", handlePracticeClick);
-  $("#practiceCard").addEventListener("input", handlePracticeInput);
-  $("#sessionGrid").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-session-position]");
-    if (!button || !state.session) return;
-    state.practiceIndex = Number(button.dataset.sessionPosition) - 1;
-    renderPracticeQuestion();
-  });
-}
-
-function activateSession(session) {
-  state.session = session;
-  state.practiceIndex = 0;
-  state.selections.clear();
-  state.results.clear();
-  session.items.forEach((item) => {
-    if (item.submission) state.results.set(item.position, item.submission);
-  });
-  $("#libraryBrowser").hidden = true;
-  $("#collectionView").hidden = true;
-  $("#practiceWorkspace").hidden = false;
-  renderPracticeQuestion();
-}
-
-function renderPracticeQuestion() {
-  const session = state.session;
-  if (!session || !session.items.length) return;
-  const item = session.items[state.practiceIndex];
-  const question = item.question;
-  const result = state.results.get(item.position) || item.submission;
-  const selected = state.selections.get(item.position) || new Set(item.submission?.answer ? [item.submission.answer] : []);
-  const progress = ((state.practiceIndex + 1) / session.items.length) * 100;
-  $("#practiceProgress").textContent = `第 ${state.practiceIndex + 1} / ${session.items.length} 题${item.collection_position ? ` · 原题号 ${item.collection_position}` : ""}`;
-  $("#practiceProgressBar").style.width = `${progress}%`;
-  state.questionStartedAt = performance.now();
-
-  const choice = question.options.length > 0;
-  const multiple = question.question_type === "多选题";
-  const selectedLabels = new Set([...selected].flatMap((value) => String(value).split("")));
-  const options = choice
-    ? `<div class="option-list">${question.options.map((option) => `
-        <button class="option-row selectable ${selectedLabels.has(option.label) ? "selected" : ""}" type="button"
-                data-option="${escapeHTML(option.label)}" ${result ? "disabled" : ""}>
-          <span class="option-label">${escapeHTML(option.label)}</span><span>${escapeHTML(option.text)}</span>
-        </button>`).join("")}</div>`
-    : question.question_type === "简答题" || question.question_type === "论述题"
-      ? `<textarea class="answer-input textarea" id="practiceTextAnswer" placeholder="输入你的答案" ${result ? "disabled" : ""}>${escapeHTML([...selected].join(""))}</textarea>`
-      : `<input class="answer-input" id="practiceTextAnswer" value="${escapeHTML([...selected].join(""))}" placeholder="输入你的答案" ${result ? "disabled" : ""}>`;
-
-  const hasOtherUnanswered = session.items.some((candidate) =>
-    candidate.position !== item.position
-      && !(state.results.get(candidate.position) || candidate.submission));
-  $("#practiceCard").innerHTML = `
-    ${questionTopline(question, state.practiceIndex + 1)}
-    <h3 class="question-stem">${sourceCode(question)}${escapeHTML(question.stem)}</h3>
-    ${multiple && !result ? `<p class="source-line">多选题：可选择多个选项</p>` : ""}
-    ${options}
-    ${result ? resultMarkup(result) : ""}
-    <div class="practice-actions">
-      <button class="secondary-button" type="button" data-action="previous" ${state.practiceIndex === 0 ? "disabled" : ""}>上一题</button>
-      ${result
-        ? `<button class="primary-button" type="button" data-action="next">${state.practiceIndex === session.items.length - 1 ? (hasOtherUnanswered ? "继续未答题" : "查看结果") : "下一题"}</button>`
-        : `<button class="primary-button" type="button" data-action="submit">提交答案</button>`}
-    </div>`;
-  renderSessionGrid();
-}
-
-function renderSessionGrid() {
-  if (!state.session) return;
-  $("#sessionGrid").innerHTML = state.session.items.map((item, index) => {
-    const result = state.results.get(item.position) || item.submission;
-    const status = result ? (result.is_correct === true ? "correct" : result.is_correct === false ? "wrong" : "ungraded") : "unanswered";
-    return `<button class="question-number ${status} ${index === state.practiceIndex ? "current" : ""}" type="button" data-session-position="${index + 1}">${item.collection_position || index + 1}</button>`;
-  }).join("");
-  const answered = state.session.items.filter((item) => state.results.has(item.position) || item.submission).length;
-  $("#practiceScore").textContent = `${answered}/${state.session.items.length}`;
-}
-
-function handlePracticeInput(event) {
-  if (event.target.id !== "practiceTextAnswer" || !state.session) return;
-  const item = state.session.items[state.practiceIndex];
-  state.selections.set(item.position, new Set([event.target.value]));
-}
-
-async function handlePracticeClick(event) {
-  const option = event.target.closest("[data-option]");
-  if (option && state.session) {
-    const item = state.session.items[state.practiceIndex];
-    const selected = new Set(state.selections.get(item.position) || []);
-    const label = option.dataset.option;
-    if (item.question.question_type === "多选题") {
-      selected.has(label) ? selected.delete(label) : selected.add(label);
-    } else {
-      selected.clear(); selected.add(label);
-    }
-    state.selections.set(item.position, selected);
-    renderPracticeQuestion();
-    return;
-  }
-  const action = event.target.closest("[data-action]")?.dataset.action;
-  if (action === "submit") await submitPracticeAnswer();
-  if (action === "previous" && state.practiceIndex > 0) { state.practiceIndex -= 1; renderPracticeQuestion(); }
-  if (action === "next") advancePractice();
-}
-
-async function submitPracticeAnswer() {
-  const item = state.session.items[state.practiceIndex];
-  const selected = [...(state.selections.get(item.position) || [])];
-  const answer = item.question.options.length ? selected.sort().join("") : (selected[0] || "").trim();
-  if (!answer) { toast("请先选择或填写答案", true); return; }
-  const submit = $('[data-action="submit"]', $("#practiceCard"));
-  submit.disabled = true;
-  submit.textContent = "提交中…";
-  try {
-    const result = await fetchJSON(`${API}/practice/sessions/${state.session.session_id}/answers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        position: item.position,
-        answer,
-        elapsed_ms: Math.max(0, Math.round(performance.now() - state.questionStartedAt)),
-      }),
-    });
-    state.results.set(item.position, result);
-    item.submission = result;
-    renderPracticeQuestion();
-  } catch (error) {
-    submit.disabled = false;
-    submit.textContent = "提交答案";
-    toast(error.message, true);
-  }
-}
-
-async function advancePractice() {
-  if (state.practiceIndex < state.session.items.length - 1) {
-    state.practiceIndex += 1; renderPracticeQuestion(); return;
-  }
-  const firstUnanswered = state.session.items.findIndex((item) =>
-    !(state.results.get(item.position) || item.submission));
-  if (firstUnanswered >= 0) {
-    state.practiceIndex = firstUnanswered;
-    renderPracticeQuestion();
-    return;
-  }
-  try { state.session = await fetchJSON(`${API}/practice/sessions/${state.session.session_id}`); } catch (_) {}
-  const summary = state.session.summary;
-  $("#practiceCard").innerHTML = `
-    <p class="eyebrow">SESSION COMPLETE</p><h2>本组练习完成</h2>
-    <div class="metric-row"><div><strong>${summary.answered}</strong><span>已作答</span></div><div><strong>${summary.correct}</strong><span>正确</span></div><div><strong>${summary.wrong}</strong><span>错误</span></div></div>
-    <div class="practice-actions"><button class="secondary-button" type="button" data-action="review">回看题目</button><button class="primary-button" type="button" data-action="directory">返回题号目录</button></div>`;
-  $('[data-action="review"]', $("#practiceCard")).addEventListener("click", () => { state.practiceIndex = 0; renderPracticeQuestion(); }, { once: true });
-  $('[data-action="directory"]', $("#practiceCard")).addEventListener("click", exitPractice, { once: true });
-}
-
-async function exitPractice() {
-  const collectionId = state.session?.collection_id || state.outline?.collection?.collection_id;
-  state.session = null;
-  state.selections.clear(); state.results.clear();
-  $("#practiceWorkspace").hidden = true;
-  if (collectionId) await selectCollection(collectionId); else showLibraryBrowser();
-}
-
-function bindWrongBook() {
-  $("#refreshWrong").addEventListener("click", loadWrongQuestions);
-}
-
-async function loadWrongQuestions() {
-  const container = $("#wrongResults");
-  container.className = "card-list";
-  container.innerHTML = loadingMarkup("正在读取本地错题");
-  try {
-    const payload = await fetchJSON(`${API}/practice/wrong?limit=50`);
-    if (!payload.count) {
-      container.className = "card-list empty-state";
-      container.innerHTML = `<div class="empty-icon">✓</div><p>还没有错题记录。</p>`;
-      return;
-    }
-    container.innerHTML = payload.items.map((item, index) => {
-      const card = questionCard(item.question, index + 1);
-      const progress = `<div class="result-banner wrong">累计错误 ${item.progress.wrong_count} 次 · 最近答案 ${escapeHTML(item.progress.last_answer || "—")}</div>`;
-      return card.replace("</article>", `${progress}</article>`);
-    }).join("");
-  } catch (error) {
-    container.className = "card-list empty-state";
-    container.innerHTML = `<p>${escapeHTML(error.message)}</p>`;
-  }
-}
-
-function bindSettings() {
-  $("#savePreferences").addEventListener("click", savePreferences);
-  $("#unlockAdmin").addEventListener("click", unlockAdminSettings);
-  $("#providerSettings").addEventListener("submit", saveServerSettings);
-  $$('[data-test-provider]').forEach((button) => {
-    button.addEventListener("click", () => testProvider(button.dataset.testProvider));
-  });
-}
-
-function applyPreferences() {
-  $("#preferenceSearchMode").value = state.preferences.searchMode;
-  $("#preferenceResultLimit").value = String(state.preferences.resultLimit);
-  $("#preferenceShowSolution").checked = state.preferences.showSolution;
-  $("#searchMode").value = state.preferences.searchMode;
-  $("#includeSolution").checked = state.preferences.showSolution;
-}
-
-function loadPreferences() {
-  const defaults = { searchMode: "keyword", resultLimit: 10, showSolution: true };
-  try {
-    return { ...defaults, ...JSON.parse(localStorage.getItem(PREFERENCE_KEY) || "{}") };
-  } catch (_) { return defaults; }
-}
-
-function savePreferences() {
-  state.preferences = {
-    searchMode: $("#preferenceSearchMode").value,
-    resultLimit: Number($("#preferenceResultLimit").value),
-    showSolution: $("#preferenceShowSolution").checked,
-  };
-  localStorage.setItem(PREFERENCE_KEY, JSON.stringify(state.preferences));
-  applyPreferences();
-  applySemanticAvailability();
-  toast("浏览器偏好已保存");
-}
-
-async function refreshPublicSettings() {
-  try {
-    state.publicSettings = await fetchJSON(`${API}/settings`);
-    renderSettingsStatus();
-    applySemanticAvailability();
-  } catch (error) { $("#settingsStatus").textContent = error.message; }
-}
-
-function renderSettingsStatus() {
-  if (!state.publicSettings) return;
-  const vector = state.publicSettings.vector_index || {};
-  const embedding = state.publicSettings.embedding || {};
-  const pieces = [
-    `嵌入模型：${embedding.model || "未配置"}`,
-    `密钥：${embedding.api_key_configured ? "已配置" : "未配置"}`,
-    `向量索引：${vector.status === "ready" ? `${formatNumber(vector.count)} 题 / ${vector.dimensions} 维` : "未就绪"}`,
-    `语义搜索：${state.publicSettings.semantic_enabled ? "已启用" : "未启用"}`,
-  ];
-  $("#settingsStatus").textContent = pieces.join(" · ");
-}
-
-function applySemanticAvailability() {
-  if (!state.publicSettings) return;
-  const ready = state.publicSettings.semantic_enabled
-    && state.publicSettings.embedding?.api_key_configured
-    && state.publicSettings.vector_index?.status === "ready";
-  for (const value of ["semantic", "hybrid"]) {
-    const option = $(`#searchMode option[value="${value}"]`);
-    option.disabled = !ready;
-  }
-  const notice = $("#semanticNotice");
-  notice.hidden = ready;
-  notice.textContent = ready ? "" : "语义搜索尚未就绪；关键词与题号搜索仍完全可用。请由管理员配置嵌入模型并激活匹配的向量索引。";
-  if (!ready && $("#searchMode").value !== "keyword") $("#searchMode").value = "keyword";
-}
-
-async function unlockAdminSettings() {
-  const token = $("#adminToken").value;
-  if (!token) { toast("请输入管理员口令", true); return; }
-  try {
-    const payload = await fetchJSON(`${API}/admin/settings`, { headers: { "X-Admin-Token": token } });
-    state.adminToken = token;
-    populateAdminSettings(payload);
-    $("#providerSettings").hidden = false;
-    $("#adminToken").value = "";
-    toast("服务器设置已解锁");
-  } catch (error) { toast(error.message, true); }
-}
-
-function populateAdminSettings(payload) {
-  $("#embeddingApiUrl").value = payload.embedding.api_url;
-  $("#embeddingModel").value = payload.embedding.model;
-  $("#embeddingDimensions").value = String(payload.embedding.dimensions || 1024);
-  $("#embeddingApiKey").value = "";
-  $("#embeddingKeyState").textContent = payload.embedding.api_key_configured ? `现有密钥：${payload.embedding.api_key_masked}` : "尚未配置密钥";
-  $("#llmApiUrl").value = payload.llm.api_url;
-  $("#llmModel").value = payload.llm.model;
-  $("#llmApiKey").value = "";
-  $("#llmKeyState").textContent = payload.llm.api_key_configured ? `现有密钥：${payload.llm.api_key_masked}` : "尚未配置密钥";
-  $("#semanticEnabled").checked = payload.semantic_enabled;
-}
-
-async function saveServerSettings(event) {
-  event.preventDefault();
-  if (!state.adminToken) { toast("请先解锁管理员设置", true); return; }
-  const payload = {
-    app: {
-      semantic_enabled: $("#semanticEnabled").checked,
-      default_search_mode: $("#preferenceSearchMode").value,
-      search_result_limit: Number($("#preferenceResultLimit").value),
-    },
-    providers: {
-      embedding: {
-        api_url: $("#embeddingApiUrl").value.trim(),
-        model: $("#embeddingModel").value.trim(),
-        dimensions: Number($("#embeddingDimensions").value),
-        api_key: $("#embeddingApiKey").value.trim(),
-      },
-      llm: {
-        api_url: $("#llmApiUrl").value.trim(),
-        model: $("#llmModel").value.trim(),
-        api_key: $("#llmApiKey").value.trim(),
-      },
-    },
-  };
-  try {
-    const updated = await fetchJSON(`${API}/admin/settings`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", "X-Admin-Token": state.adminToken },
-      body: JSON.stringify(payload),
-    });
-    populateAdminSettings(updated);
-    await refreshPublicSettings();
-    toast("服务器设置已保存");
-  } catch (error) { toast(error.message, true); }
-}
-
-async function testProvider(provider) {
-  if (!state.adminToken) { toast("请先解锁管理员设置", true); return; }
-  const button = $(`[data-test-provider="${provider}"]`);
-  button.disabled = true;
-  const previous = button.textContent;
-  button.textContent = "测试中…";
-  try {
-    const result = await fetchJSON(`${API}/admin/settings/test`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Admin-Token": state.adminToken },
-      body: JSON.stringify({ provider }),
-    });
-    toast(`${provider === "embedding" ? "嵌入" : "大模型"}连接成功${result.dimensions ? `，${result.dimensions} 维` : ""}`);
-  } catch (error) { toast(error.message, true); }
-  finally { button.disabled = false; button.textContent = previous; }
-}
-
-function questionCard(question, index) {
-  const options = question.options?.length
-    ? `<div class="option-list">${question.options.map((option) => `<div class="option-row"><span class="option-label">${escapeHTML(option.label)}</span><span>${escapeHTML(option.text)}</span></div>`).join("")}</div>` : "";
-  const solution = "answer" in question
-    ? `<div class="solution"><div class="solution-block answer"><strong>答案</strong><p>${escapeHTML(question.answer || "暂无")}</p></div>${question.point ? `<div class="solution-block"><strong>考点</strong><p>${escapeHTML(question.point)}</p></div>` : ""}${question.explanation ? `<div class="solution-block"><strong>解析</strong><p>${escapeHTML(question.explanation)}</p></div>` : ""}</div>` : "";
-  const source = question.sources?.[0]?.relative_path || "";
-  return `<article class="question-card">${questionTopline(question, index)}<h3 class="question-stem">${sourceCode(question)}${escapeHTML(question.stem)}</h3>${options}${solution}${source ? `<div class="source-line">来源：${escapeHTML(source)}${question.source_count > 1 ? ` · 共 ${question.source_count} 个来源` : ""}</div>` : ""}</article>`;
-}
-
-function questionTopline(question, index) {
-  const labels = { exact: "精确匹配", source_code: "题号匹配", semantic: "语义匹配", hybrid: "混合匹配", fts: "全文匹配", short: "短词匹配" };
-  const score = question.match_kind && !["id", "sample", "collection", "occurrence"].includes(question.match_kind)
-    ? `<span class="match-score">${labels[question.match_kind] || "相关匹配"}</span>` : "";
-  return `<div class="question-topline"><div class="tag-row"><span class="tag">${escapeHTML(question.question_type)}</span><span class="tag muted">#${index}</span></div>${score}</div>`;
-}
-
-function sourceCode(question) {
-  return question.source_code ? `<span class="source-code">${escapeHTML(question.source_code)}</span>` : "";
-}
-
-function resultMarkup(result) {
-  const kind = result.is_correct === true ? "correct" : result.is_correct === false ? "wrong" : "ungraded";
-  const title = result.is_correct === true ? "回答正确" : result.is_correct === false ? "回答错误" : "已提交，请自行核对";
-  return `<div class="result-banner ${kind}">${title} · 正确答案：${escapeHTML(result.correct_answer || "暂无")}</div><div class="solution">${result.point ? `<div class="solution-block"><strong>考点</strong><p>${escapeHTML(result.point)}</p></div>` : ""}${result.explanation ? `<div class="solution-block"><strong>解析</strong><p>${escapeHTML(result.explanation)}</p></div>` : ""}</div>`;
-}
-
-async function fetchJSON(url, options = {}) {
-  const response = await fetch(url, options);
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `请求失败（${response.status}）`);
   return payload;
 }
 
-function loadingMarkup(text) { return `<div class="loading-card"><div class="spinner"></div><p>${escapeHTML(text)}</p></div>`; }
-
-function toast(message, error = false) {
-  const element = $("#toast");
-  element.textContent = message;
-  element.classList.toggle("error", error);
-  element.hidden = false;
-  window.clearTimeout(toast.timer);
-  toast.timer = window.setTimeout(() => { element.hidden = true; }, 3400);
+function getCookie(name) {
+  const prefix = `${name}=`;
+  const item = document.cookie.split("; ").find((value) => value.startsWith(prefix));
+  return item ? decodeURIComponent(item.slice(prefix.length)) : "";
 }
 
-function searchModeLabel(mode) { return ({ keyword: "关键词", semantic: "语义", hybrid: "混合" })[mode] || mode; }
-function formatNumber(value) { return new Intl.NumberFormat("zh-CN").format(Number(value || 0)); }
-function escapeHTML(value) {
-  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+function showAuth(mode) {
+  stopTimer();
+  document.body.classList.remove("in-session", "outline-open");
+  state.authMode = mode;
+  $("#app-shell").hidden = true;
+  $("#auth-page").hidden = false;
+  const setup = mode === "setup";
+  const register = mode === "register";
+  $("#auth-heading").innerHTML = `
+    <h2>${setup ? "初始化管理账号" : register ? "创建账号" : "欢迎回来"}</h2>
+    <p class="section-copy">${
+      setup
+        ? "首次部署仅执行一次。完成后，该账号拥有系统管理权限。"
+        : register
+          ? "注册后即可同步保存练习进度、收藏与错题。"
+          : "登录后继续你的检索与训练记录。"
+    }</p>`;
+  $("#auth-tabs").innerHTML = setup
+    ? ""
+    : `<button type="button" role="tab" class="${mode === "login" ? "active" : ""}" data-action="auth-mode" data-mode="login">登录</button>
+       <button type="button" role="tab" class="${mode === "register" ? "active" : ""}" data-action="auth-mode" data-mode="register">注册</button>`;
+  $("#auth-submit").textContent = setup ? "创建管理员并进入系统" : register ? "注册并登录" : "登录";
+  $("#auth-password").autocomplete = register || setup ? "new-password" : "current-password";
+  $("#auth-password-tip").textContent = register || setup
+    ? "至少 10 位，并包含大小写字母、数字或符号中的三类。"
+    : "";
+  $("#auth-error").textContent = "";
+  $("#auth-form").reset();
+  setTimeout(() => $("#auth-username")?.focus(), 0);
+}
+
+function setAuthError(message) {
+  const element = $("#auth-error");
+  if (element) element.textContent = message || "";
+}
+
+async function enterApp(user) {
+  state.user = user;
+  state.comments = {};
+  $("#auth-page").hidden = true;
+  $("#app-shell").hidden = false;
+  $("#profile-name").textContent = user.username;
+  $("#profile-role").textContent = user.role === "admin" ? "管理员" : "普通用户";
+  $("#profile-avatar").textContent = [...user.username][0]?.toUpperCase() || "U";
+  $("#admin-entry").hidden = user.role !== "admin";
+  try {
+    [state.settings, state.stats] = await Promise.all([api("/settings"), api("/stats")]);
+    $("#site-brand-name").textContent = state.settings.site_name || "医考知库";
+    state.searchMode = state.settings.default_search_mode || "keyword";
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+  if (!location.hash) location.hash = "#library";
+  await route();
+}
+
+async function route() {
+  if (!state.user) return;
+  const target = location.hash.replace(/^#/, "") || "library";
+  if (target.startsWith("session/")) {
+    document.body.classList.add("in-session");
+    showPage("practice");
+    setActiveNav("");
+    const sessionId = target.slice("session/".length);
+    if (!state.session || state.session.session_id !== sessionId) {
+      await loadSession(sessionId);
+    } else {
+      renderPractice();
+      startTimer();
+    }
+    return;
+  }
+  document.body.classList.remove("in-session", "outline-open");
+  const allowed = ["library", "search", "favorites", "wrong", "admin"];
+  const page = allowed.includes(target) ? target : "library";
+  if (page === "admin" && state.user.role !== "admin") {
+    location.hash = "#library";
+    return;
+  }
+  stopTimer();
+  showPage(page);
+  setActiveNav(page);
+  if (page === "library" || page === "favorites" || page === "wrong") {
+    const returnTarget = state.sessionReturnTarget;
+    state.sessionReturnTarget = null;
+    if (returnTarget?.kind === page && returnTarget.collectionId) {
+      renderLibraryShell(page);
+      await openCollection(page, returnTarget.collectionId);
+    } else {
+      await renderLibrary(page);
+    }
+  } else if (page === "search") {
+    renderSearchPage();
+  } else if (page === "admin") {
+    await renderAdminPage();
+  }
+}
+
+function showPage(name) {
+  $$(".page").forEach((page) => {
+    page.hidden = page.id !== `page-${name}`;
+  });
+  $("#workspace")?.focus({ preventScroll: true });
+  window.scrollTo({ top: 0, behavior: "instant" });
+}
+
+function setActiveNav(name) {
+  $$('[data-nav]').forEach((item) => item.classList.toggle("active", item.dataset.nav === name));
+}
+
+function loadingMarkup(label = "正在加载") {
+  return `<div class="card loading-state"><span class="loading-spinner" aria-hidden="true"></span><span>${escapeHtml(label)}</span></div>`;
+}
+
+function emptyMarkup(title, copy, icon = "·") {
+  return `<div class="card empty-state"><span class="empty-icon" aria-hidden="true">${icon}</span><h3>${escapeHtml(title)}</h3><p>${escapeHtml(copy)}</p></div>`;
+}
+
+async function renderLibrary(kind) {
+  renderLibraryShell(kind);
+  const container = $(`#page-${kind}`);
+  const parent = state.libraryPath[kind] || "";
+  try {
+    const path = kind === "library"
+      ? `/library?parent=${encodeURIComponent(parent)}`
+      : `/study/${kind}/library?parent=${encodeURIComponent(parent)}`;
+    const payload = await api(path);
+    renderLibraryPayload(kind, payload);
+  } catch (error) {
+    $(`#${kind}-content`).innerHTML = emptyMarkup("目录读取失败", error.message, "!");
+  }
+}
+
+function renderLibraryShell(kind) {
+  const container = $(`#page-${kind}`);
+  const meta = libraryMeta(kind);
+  container.innerHTML = `
+    <div class="page-header page-header-compact">
+      <div class="page-title"><p class="eyebrow">${meta.eyebrow}</p></div>
+    </div>
+    <div id="${kind}-content">${loadingMarkup("正在读取题库目录")}</div>`;
+}
+
+function libraryMeta(kind) {
+  if (kind === "favorites") return { eyebrow: "收藏" };
+  if (kind === "wrong") return { eyebrow: "错题" };
+  return { eyebrow: "题库" };
+}
+
+function renderLibraryPayload(kind, payload) {
+  const content = $(`#${kind}-content`);
+  const stats = kind === "library" && !payload.parent && state.stats
+    ? `<div class="stats-grid">
+        ${statCard("规范题目", state.stats.questions)}
+        ${statCard("原题记录", state.stats.question_occurrences)}
+        ${statCard("题库文件", state.stats.collections)}
+        ${statCard("病例题组", state.stats.question_groups)}
+      </div>`
+    : "";
+  const breadcrumbs = (payload.breadcrumbs || []).map((item, index) => `
+    ${index ? "<span>/</span>" : ""}
+    <button type="button" data-action="library-breadcrumb" data-kind="${kind}" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</button>`).join("");
+  const items = [
+    ...(payload.directories || []).map((item) => libraryItem(item, kind, "directory")),
+    ...(payload.collections || []).map((item) => libraryItem(item, kind, "collection")),
+  ].join("");
+  const total = kind === "library" ? "" : `<span>${formatNumber(payload.total_saved || 0)} 道已归档</span>`;
+  content.innerHTML = `${stats}
+    <div class="breadcrumbs">${breadcrumbs}${total}</div>
+    ${items ? `<div class="library-grid">${items}</div>` : emptyMarkup(
+      kind === "favorites" ? "暂无收藏" : kind === "wrong" ? "暂无错题" : "目录为空",
+      kind === "favorites" ? "在搜题或练习页面点击收藏后，会按原文件路径显示在这里。" : kind === "wrong" ? "答错的客观题会自动归档到这里。" : "当前目录没有可用题库文件。",
+      kind === "favorites" ? "☆" : kind === "wrong" ? "!" : "▦"
+    )}`;
+}
+
+function statCard(label, value, copy) {
+  return `<div class="stat-card"><small>${label}</small><strong>${formatNumber(value || 0)}</strong>${copy ? `<span>${copy}</span>` : ""}</div>`;
+}
+
+function libraryItem(item, kind, type) {
+  const isDirectory = type === "directory";
+  const action = isDirectory ? "open-directory" : "open-collection";
+  const count = item.saved_count ?? item.question_count ?? 0;
+  const extension = String(item.extension || "").replace(/^\./, "").toLowerCase();
+  const displayName = String(item.name || "").replace(/\.xlsx$/i, "");
+  const copy = isDirectory
+    ? `${formatNumber(item.collection_count || 0)} 个文件 · ${formatNumber(item.question_count || 0)} 道题`
+    : `${formatNumber(count)} 道题${extension && extension !== "xlsx" ? ` · ${escapeHtml(extension.toUpperCase())}` : ""}`;
+  return `<button class="library-item ${isDirectory ? "" : "collection"}" type="button" data-action="${action}" data-kind="${kind}" data-path="${escapeAttr(item.path || "")}" data-id="${escapeAttr(item.collection_id || "")}">
+    <span class="library-icon" aria-hidden="true">${isDirectory ? "▦" : "卷"}</span>
+    <span class="library-main"><strong>${escapeHtml(displayName)}</strong><small>${copy}</small></span>
+    <span class="library-arrow" aria-hidden="true">›</span>
+  </button>`;
+}
+
+async function openCollection(kind, collectionId) {
+  const content = $(`#${kind}-content`);
+  content.innerHTML = loadingMarkup("正在读取题号目录");
+  try {
+    const path = kind === "library"
+      ? `/practice/collections/${encodeURIComponent(collectionId)}/outline`
+      : `/study/${kind}/collections/${encodeURIComponent(collectionId)}/outline`;
+    const payload = await api(path);
+    state.outline = { kind, payload };
+  state.outlineMode = "practice";
+    renderOutline();
+  } catch (error) {
+    content.innerHTML = emptyMarkup("题号目录读取失败", error.message, "!");
+  }
+}
+
+function renderOutline() {
+  if (!state.outline) return;
+  const { kind, payload } = state.outline;
+  const content = $(`#${kind}-content`);
+  const collection = payload.collection;
+  const groups = groupOutlineItems(payload.items || []);
+  const groupMarkup = groups.map(([label, items]) => `
+    <section class="outline-group">
+      <h3 class="outline-group-title"><span class="type-dot ${typeClass(label)}"></span><span>${escapeHtml(label)}</span><span>${items.length} 题</span></h3>
+      ${kind === "library" ? `<div class="number-grid">${items.map((item) => `
+        <button class="number-button ${escapeAttr(item.status || "")}" type="button" title="${escapeAttr(item.source_code || `第 ${item.collection_position} 题`)} · ${escapeAttr(label)}" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${item.collection_position}">${item.collection_position}</button>`).join("")}</div>` : `<div class="saved-outline-list">${items.map((item) => `
+        <div class="saved-outline-item">
+          <button class="saved-outline-open" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${item.collection_position}"><span>${item.collection_position}</span><strong>${escapeHtml(item.source_code || `第 ${item.collection_position} 题`)}</strong></button>
+          <button class="button button-danger button-small saved-outline-remove" type="button" data-action="remove-saved-outline" data-kind="${kind}" data-key="${escapeAttr(item.saved?.item_key || "")}">${kind === "wrong" ? "删除错题" : "取消收藏"}</button>
+        </div>`).join("")}</div>`}
+    </section>`).join("");
+  const summary = payload.summary || {};
+  content.innerHTML = `
+    <div class="breadcrumbs"><button type="button" data-action="close-outline" data-kind="${kind}">‹ 返回当前目录</button></div>
+    <div class="page-header">
+      <div class="page-title"><h1>${escapeHtml(fileTitle(collection.relative_path))}</h1><p class="section-copy">${escapeHtml(displaySourcePath(collection.relative_path))} · ${formatNumber((payload.items || []).length)} 题</p></div>
+      <div class="header-actions"><button class="button button-primary" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${payload.items?.[0]?.collection_position || 1}">${modeMeta(state.outlineMode).cta}</button></div>
+    </div>
+    <div class="card outline-card">
+      <div class="outline-toolbar">
+        <div class="outline-mode-row">
+          <div class="segmented" aria-label="学习模式">
+            ${["practice", "speed", "test", "memorize"].map((mode) => `<button class="${state.outlineMode === mode ? "active" : ""}" type="button" data-action="outline-mode" data-mode="${mode}">${modeMeta(mode).label}</button>`).join("")}
+          </div>
+          <button class="button button-secondary button-small outline-reset" type="button" data-action="reset-collection-progress" data-id="${escapeAttr(collection.collection_id)}">重置</button>
+        </div>
+        <p class="mode-description">${modeMeta(state.outlineMode).description}</p>
+        <span class="outline-summary">已答 ${summary.answered || 0} · 正确 ${summary.correct || 0} · 错误 ${summary.wrong || 0} · 未答 ${Math.max(0, (summary.total || payload.items.length) - (summary.answered || 0))}</span>
+      </div>
+      <div class="outline-groups">${groupMarkup || emptyMarkup("没有可练习题目", "该文件没有匹配的题目。")}</div>
+    </div>`;
+}
+
+async function resetCollectionProgress(button) {
+  const outline = state.outline;
+  const collectionId = button.dataset.id;
+  if (!outline || !collectionId) return;
+  const confirmed = await confirmModal(
+    "重置刷题进度",
+    "确认清空当前题库的已答、正确和错误状态？收藏、错题、评论与历史试卷不会被删除。",
+    "确认重置"
+  );
+  if (!confirmed) return;
+  setButtonBusy(button, true, "重置中");
+  try {
+    const result = await api(`/practice/collections/${encodeURIComponent(collectionId)}/progress/reset`, {
+      method: "POST",
+      body: {},
+    });
+    if (state.outline === outline) {
+      outline.payload.items = (outline.payload.items || []).map((item) => ({
+        ...item,
+        status: "unanswered",
+        progress: null,
+      }));
+      outline.payload.summary = {
+        ...(outline.payload.summary || {}),
+        total: outline.kind === "library" ? result.summary.total : outline.payload.items.length,
+        answered: 0,
+        correct: 0,
+        wrong: 0,
+        ungraded: 0,
+      };
+      outline.payload.active_session = null;
+      renderOutline();
+    }
+    showToast(result.reset_count ? `已重置 ${result.reset_count} 道题的刷题状态` : "当前题库暂无需要重置的进度");
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+function groupOutlineItems(items) {
+  const groups = new Map();
+  items.forEach((item) => {
+    const label = item.type_label || item.raw_type || item.question_type || "其他题型";
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(item);
+  });
+  return [...groups.entries()];
+}
+
+function typeClass(label) {
+  const value = String(label || "").toUpperCase();
+  if (value.startsWith("B")) return "type-b";
+  if (value.startsWith("X") || value.includes("多选")) return "type-x";
+  if (["简答", "论述", "名词", "填空"].some((part) => value.includes(part))) return "type-subjective";
+  return "";
+}
+
+function modeMeta(mode) {
+  const modes = {
+    practice: {
+      label: "练习模式",
+      short: "练习",
+      cta: "开始练习",
+      description: "逐题作答，提交后立即查看正确答案与解析。",
+    },
+    speed: {
+      label: "快刷模式",
+      short: "快刷",
+      cta: "开始快刷",
+      description: "选对即进入下一题，选错停留并展开解析。",
+    },
+    test: {
+      label: "测试模式",
+      short: "测试",
+      cta: "开始测试",
+      description: "作答后自动进入下一题，交卷前不显示对错。",
+    },
+    memorize: {
+      label: "背题模式",
+      short: "背题",
+      cta: "开始背题",
+      description: "直接查看答案、考点与解析，不需要提交作答。",
+    },
+  };
+  return modes[mode] || modes.practice;
+}
+
+function renderSearchPage() {
+  const vector = state.settings?.vector_index || {};
+  const semanticReady = vector.status === "ready" && vector.semantic_enabled && state.searchFields.stem;
+  const container = $("#page-search");
+  container.innerHTML = `
+    <div class="page-header page-header-compact">
+      <div class="page-title"><p class="eyebrow">搜题</p></div>
+    </div>
+    <div class="search-hero">
+      <form id="search-form">
+        <div class="search-box"><input id="search-input" name="query" type="search" maxlength="200" value="${escapeAttr(state.lastSearchQuery)}" placeholder="输入关键词或原题号" required><button class="button button-primary" type="submit">搜题</button></div>
+        <div class="search-preference-panel">
+          <div class="search-preference-toolbar">
+            <strong>搜索设置</strong>
+            <div class="search-preference-toolbar-actions">
+              <button class="search-preference-reset" type="button" data-action="reset-search-settings">重置</button>
+              <button class="search-preference-toggle" type="button" data-action="toggle-search-settings" aria-expanded="${state.searchSettingsExpanded}" aria-controls="search-preference-body"><span aria-hidden="true">${state.searchSettingsExpanded ? "⌃" : "⌄"}</span>${state.searchSettingsExpanded ? "收起" : "展开"}</button>
+            </div>
+          </div>
+          <div id="search-preference-body" class="search-preference-body" ${state.searchSettingsExpanded ? "" : "hidden"}>
+          <div class="search-control-row">
+            <span class="search-control-label">搜索模式</span>
+            <div class="search-mode-list" role="radiogroup" aria-label="搜索模式">
+              ${searchModeButton("keyword", "关键词", true)}
+              ${searchModeButton("semantic", "语义", semanticReady)}
+              ${searchModeButton("hybrid", "混合", semanticReady)}
+            </div>
+          </div>
+          <div class="search-control-row">
+            <span class="search-control-label">搜索题型</span>
+            <div class="search-type-list ${isAllSearchQuestionTypes() ? "all-selected" : ""}" role="group" aria-label="搜索题型">
+              ${searchAllButton("question-types", isAllSearchQuestionTypes())}
+              ${renderSearchQuestionTypes()}
+            </div>
+          </div>
+          <div class="search-control-row">
+            <span class="search-control-label">搜索范围</span>
+            <div class="search-toggle-grid columns-4" role="group" aria-label="搜索范围">
+              ${searchAllButton("search-fields", allSearchFieldsSelected())}
+              ${searchFieldButton("stem", "题干", 1)}
+              ${searchFieldButton("answer", "答案", 2)}
+              ${searchFieldButton("point", "考点还原", 3)}
+              ${searchFieldButton("explanation", "标准解析", 4)}
+            </div>
+          </div>
+          <div class="search-control-row">
+            <span class="search-control-label">显示内容</span>
+            <div class="search-toggle-grid columns-4" role="group" aria-label="结果显示内容">
+              ${searchAllButton("search-content", allSearchSolutionSelected())}
+              ${searchSolutionButton("stem", "题干", 1)}
+              ${searchSolutionButton("answer", "答案", 2)}
+              ${searchSolutionButton("point", "考点还原", 3)}
+              ${searchSolutionButton("explanation", "标准解析", 4)}
+            </div>
+          </div>
+          </div>
+        </div>
+      </form>
+    </div>
+    <div id="search-results">${state.searchResults.length ? renderSearchResults(state.searchResults, state.searchMetadata) : ""}</div>`;
+  refreshFavoriteButtons();
+}
+
+function searchModeButton(mode, label, enabled) {
+  const active = state.searchMode === mode || (!enabled && state.searchMode === mode && mode === "keyword");
+  const palette = { keyword: 0, semantic: 1, hybrid: 2 }[mode] ?? 0;
+  return `<button class="search-filter-toggle search-mode-toggle palette-${palette} ${active ? "active" : ""}" type="button" role="radio" data-action="search-mode" data-mode="${mode}" aria-checked="${active}" ${enabled ? "" : "disabled"}><span aria-hidden="true"></span>${label}</button>`;
+}
+
+function searchAllButton(group, active) {
+  return `<button class="search-filter-toggle search-all-toggle palette-0 ${active ? "active" : ""}" type="button" role="checkbox" data-action="search-all-toggle" data-group="${group}" aria-checked="${active}"><span aria-hidden="true"></span>全部</button>`;
+}
+
+function searchSolutionButton(field, label, palette = searchFieldPalette(field)) {
+  const active = !allSearchSolutionSelected() && state.searchSolutionVisibility[field] !== false;
+  return `<button class="search-filter-toggle palette-${palette} ${active ? "active" : ""}" type="button" data-action="search-solution-toggle" data-field="${field}" aria-pressed="${active}"><span aria-hidden="true"></span>${label}</button>`;
+}
+
+function searchFieldButton(field, label, palette = searchFieldPalette(field)) {
+  const active = !allSearchFieldsSelected() && state.searchFields[field] !== false;
+  return `<button class="search-filter-toggle palette-${palette} ${active ? "active" : ""}" type="button" data-action="search-field-toggle" data-field="${field}" aria-pressed="${active}"><span aria-hidden="true"></span>${label}</button>`;
+}
+
+function searchFieldPalette(field) {
+  return ({ stem: 0, answer: 1, point: 2, explanation: 3 })[field] ?? 0;
+}
+
+function searchQuestionTypeOptions() {
+  const counts = state.stats?.by_question_type || state.stats?.by_type || {};
+  const preferred = [
+    "A1型题", "A2型题", "A3/A4型题", "B型题", "B1型题", "C型题", "单选题",
+    "X型题", "多选题", "判断题", "填空题", "名词解释", "简答题", "论述题",
+    "知识点", "未知题型",
+  ];
+  const available = Object.keys(counts).filter(Boolean);
+  const ordered = [
+    ...preferred.filter((type) => available.includes(type)),
+    ...available.filter((type) => !preferred.includes(type)).sort((left, right) => left.localeCompare(right, "zh-CN")),
+  ];
+  return { counts, ordered };
+}
+
+function isAllSearchQuestionTypes() {
+  const { ordered } = searchQuestionTypeOptions();
+  return state.searchQuestionTypes.length === 0
+    || (ordered.length > 0 && ordered.every((type) => state.searchQuestionTypes.includes(type)));
+}
+
+function allSearchFieldsSelected() {
+  return Object.values(state.searchFields).every(Boolean);
+}
+
+function allSearchSolutionSelected() {
+  return Object.values(state.searchSolutionVisibility).every(Boolean);
+}
+
+function renderSearchQuestionTypes() {
+  const { counts, ordered } = searchQuestionTypeOptions();
+  const allActive = isAllSearchQuestionTypes();
+  return ordered.map((type, index) => {
+    const active = !allActive && state.searchQuestionTypes.includes(type);
+    const label = type;
+    return `<button class="search-filter-toggle search-type-toggle palette-${(index + 1) % 12} ${active ? "active" : ""}" type="button" role="checkbox" data-action="search-question-type" data-type="${escapeAttr(type)}" aria-checked="${active}" title="${escapeAttr(`${label} · ${counts[type]} 题`)}"><span aria-hidden="true"></span>${escapeHtml(label)}</button>`;
+  }).join("");
+}
+
+async function toggleSearchAll(group) {
+  if (group === "question-types") state.searchQuestionTypes = [];
+  if (group === "search-fields") state.searchFields = { stem: true, answer: true, point: true, explanation: true };
+  if (group === "search-content") state.searchSolutionVisibility = { stem: true, answer: true, point: true, explanation: true };
+  savePreferences();
+  renderSearchPage();
+  if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
+  $("#search-input")?.focus();
+}
+
+async function toggleSearchQuestionType(type) {
+  const normalized = String(type || "");
+  if (!normalized) {
+    return toggleSearchAll("question-types");
+  } else {
+    const { ordered } = searchQuestionTypeOptions();
+    const selected = new Set(isAllSearchQuestionTypes() ? [] : state.searchQuestionTypes);
+    selected.has(normalized) ? selected.delete(normalized) : selected.add(normalized);
+    state.searchQuestionTypes = ordered.length && ordered.every((type) => selected.has(type))
+      ? []
+      : [...selected];
+  }
+  savePreferences();
+  renderSearchPage();
+  if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
+  $("#search-input")?.focus();
+}
+
+async function toggleSearchField(field) {
+  if (!Object.prototype.hasOwnProperty.call(state.searchFields, field)) return;
+  if (allSearchFieldsSelected()) {
+    state.searchFields = { stem: false, answer: false, point: false, explanation: false };
+    state.searchFields[field] = true;
+  } else {
+    const activeCount = Object.values(state.searchFields).filter(Boolean).length;
+    if (state.searchFields[field] && activeCount === 1) {
+      showToast("至少保留一个搜索范围", "error");
+      return;
+    }
+    state.searchFields[field] = !state.searchFields[field];
+  }
+  if (!state.searchFields.stem && state.searchMode !== "keyword") {
+    state.searchMode = "keyword";
+    showToast("语义与混合搜索需要题干范围，已切换为关键词搜索");
+  }
+  savePreferences();
+  renderSearchPage();
+  if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
+  $("#search-input")?.focus();
+}
+
+async function toggleSearchSolution(field) {
+  if (!Object.prototype.hasOwnProperty.call(state.searchSolutionVisibility, field)) return;
+  if (allSearchSolutionSelected()) {
+    state.searchSolutionVisibility = { stem: false, answer: false, point: false, explanation: false };
+    state.searchSolutionVisibility[field] = true;
+  } else {
+    state.searchSolutionVisibility[field] = !state.searchSolutionVisibility[field];
+  }
+  savePreferences();
+  renderSearchPage();
+  if (field !== "stem" && state.lastSearchQuery) await runSearch(state.lastSearchQuery);
+  $("#search-input")?.focus();
+}
+
+function toggleSearchSettings() {
+  state.searchSettingsExpanded = !state.searchSettingsExpanded;
+  savePreferences();
+  renderSearchPage();
+}
+
+async function resetSearchSettings() {
+  state.searchMode = "keyword";
+  state.searchFields = { stem: true, answer: true, point: true, explanation: true };
+  state.searchQuestionTypes = [];
+  state.searchSolutionVisibility = { stem: true, answer: true, point: true, explanation: true };
+  state.searchSettingsExpanded = true;
+  savePreferences();
+  renderSearchPage();
+  showToast("搜索标签已重置");
+  if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
+  $("#search-input")?.focus();
+}
+
+function renderSearchResults(results, metadata = {}) {
+  if (!results.length) return emptyMarkup("未找到匹配题目", "可缩短题干、去掉标点或切换搜索方式后重试。", "⌕");
+  return `<div class="results-header"><h2>检索结果</h2><span>${results.length} 条 · ${escapeHtml(metadata.mode || state.searchMode)}</span></div>
+    <div class="result-list">${results.map(searchResultCard).join("")}</div>`;
+}
+
+function searchResultCard(item) {
+  const source = (item.sources || [])[0] || {};
+  const showStem = state.searchSolutionVisibility.stem !== false;
+  return `<article class="card question-card">
+    <div class="question-meta"><span class="badge">${escapeHtml(item.type_label || item.raw_type || item.question_type)}</span>${item.source_code ? `<span class="badge badge-neutral">${escapeHtml(item.source_code)}</span>` : ""}<span class="badge badge-neutral">${item.source_count || 0} 个来源</span></div>
+    ${showStem ? `<p class="question-stem">${searchHighlightText(item.stem)}</p>${renderOptions(item.options || [], state.searchSolutionVisibility.answer ? item.answer : "", searchHighlightText)}` : ""}
+    ${renderSolution(item, state.searchSolutionVisibility, searchHighlightText)}
+    <p class="source-path">${escapeHtml(source.relative_path ? displaySourcePath(source.relative_path) : "来源路径未记录")}</p>
+    <div class="question-actions">
+      <button class="button button-secondary button-small favorite-button" type="button" data-action="toggle-favorite" data-occurrence="${source.occurrence_id || ""}" data-question="${escapeAttr(item.question_id)}" data-favorited="false" aria-pressed="false"><span class="favorite-icon" aria-hidden="true">☆</span><span class="favorite-label">收藏</span></button>
+      ${source.collection_id ? `<button class="button button-quiet button-small" type="button" data-action="practice-source" data-id="${escapeAttr(source.collection_id)}" data-position="${source.position || 1}">练习此文件</button>` : ""}
+    </div>
+  </article>`;
+}
+
+function renderOptions(options, correctAnswer = "", textRenderer = escapeHtml) {
+  if (!options.length) return "";
+  const correct = new Set(String(correctAnswer || "").toUpperCase().match(/[A-Z]/g) || []);
+  return `<ul class="option-list">${options.map((option) => {
+    const isCorrect = correct.has(String(option.label || "").toUpperCase());
+    return `<li class="option-row ${isCorrect ? "correct" : ""}"${isCorrect ? ' aria-label="正确答案"' : ""}><span class="option-label">${escapeHtml(option.label)}</span><span>${textRenderer(option.text)}</span>${isCorrect ? `<span class="option-state" aria-hidden="true"></span>` : ""}</li>`;
+  }).join("")}</ul>`;
+}
+
+function renderSolution(question, visibility = null, textRenderer = escapeHtml) {
+  const showAnswer = visibility?.answer !== false;
+  const showPoint = visibility?.point !== false;
+  const showExplanation = visibility?.explanation !== false;
+  const answer = showAnswer ? question.answer ?? "" : "";
+  const userAnswer = question.user_answer;
+  const isCorrect = question.is_correct;
+  const point = showPoint ? question.point ?? "" : "";
+  const explanation = showExplanation ? question.explanation ?? "" : "";
+  if (!answer && !point && !explanation) return "";
+  return `<div class="solution-stack">
+    ${answer ? renderAnswerSolution(answer, userAnswer, isCorrect, textRenderer) : ""}
+    ${point ? renderSolutionSection("point", "考点还原", point, textRenderer) : ""}
+    ${explanation ? renderSolutionSection("explanation", "标准解析", explanation, textRenderer) : ""}
+  </div>`;
+}
+
+function renderAnswerSolution(answer, userAnswer, isCorrect, textRenderer = escapeHtml) {
+  const hasUserAnswer = userAnswer !== undefined && userAnswer !== null && String(userAnswer) !== "";
+  const userClass = isCorrect === true ? "correct" : isCorrect === false ? "incorrect" : "neutral";
+  return `<section class="solution-section solution-answer">
+    <div class="solution-heading"><strong>答案</strong></div>
+    <div class="solution-content answer-summary">标准答案：<strong class="standard-answer-value">${textRenderer(answer)}</strong>${hasUserAnswer ? `，你的答案：<strong class="user-answer-value ${userClass}">${textRenderer(userAnswer)}</strong>` : ""}</div>
+  </section>`;
+}
+
+function renderSolutionSection(kind, label, content, textRenderer = escapeHtml) {
+  return `<section class="solution-section solution-${kind}">
+    <div class="solution-heading"><strong>${label}</strong></div>
+    <div class="solution-content">${textRenderer(content)}</div>
+  </section>`;
+}
+
+async function startSession({ collectionId, position = 1, kind = "library", mode = state.outlineMode }) {
+  const body = {
+    collection_id: collectionId,
+    start_position: Number(position) || 1,
+    order_mode: "sequential",
+    mode,
+  };
+  if (kind === "favorites") body.saved_kind = "favorite";
+  if (kind === "wrong") body.saved_kind = "wrong";
+  try {
+    const session = await api("/practice/sessions", { method: "POST", body });
+    state.session = session;
+    state.sessionIndex = 0;
+    state.drafts = {};
+    location.hash = `#session/${session.session_id}`;
+    await route();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function loadSession(sessionId) {
+  const container = $("#page-practice");
+  container.innerHTML = loadingMarkup("正在恢复练习进度");
+  try {
+    state.session = await api(`/practice/sessions/${encodeURIComponent(sessionId)}`);
+    state.sessionIndex = Math.max(
+      0,
+      state.session.items.findIndex((item) => !item.submission)
+    );
+    state.drafts = {};
+    renderPractice();
+    startTimer();
+  } catch (error) {
+    container.innerHTML = emptyMarkup("练习恢复失败", error.message, "!");
+  }
+}
+
+function renderPractice() {
+  const session = state.session;
+  if (!session?.items?.length) return;
+  document.body.classList.remove("outline-open");
+  const index = Math.min(Math.max(0, state.sessionIndex), session.items.length - 1);
+  state.sessionIndex = index;
+  const item = session.items[index];
+  const question = item.question;
+  const submitted = item.submission;
+  const isComplete = session.status === "complete";
+  const mode = session.mode || "practice";
+  const meta = modeMeta(mode);
+  const reveal = session.solution_visible || (Boolean(submitted) && mode !== "test");
+  const draft = state.drafts[item.position] || "";
+  const source = (question.sources || [])[0] || {};
+  const occurrenceId = Number(question.occurrence_id || item.occurrence_id || source.occurrence_id) || null;
+  const title = fileTitle(source.relative_path || session.collection_id || "练习");
+  const answerMarkup = renderAnswerArea(item, draft, reveal, isComplete);
+  const summary = session.summary || {};
+  const canPrev = index > 0;
+  const isLast = index === session.items.length - 1;
+  const showSubmit = mode === "practice" && !submitted && !isComplete;
+  const finishButton = ["practice", "test"].includes(mode)
+    ? `<button class="button button-danger button-small" type="button" data-action="finish-session" ${isComplete ? "disabled" : ""}>${isComplete ? "已交卷" : "交卷"}</button>`
+    : "";
+  const statusNote = mode === "speed" && submitted && submitted.is_correct === false
+    ? `<p class="practice-feedback-note wrong">未选中正确答案，答案与解析已展开；确认后可继续下一题。</p>`
+    : mode === "test" && !isComplete
+      ? `<p class="practice-feedback-note">测试进行中，交卷前不会显示对错。</p>`
+      : "";
+  const resultPanel = isComplete && mode !== "memorize"
+    ? `<section class="session-result" aria-label="本次成绩">
+        <span><small>得分</small><strong>${summary.correct || 0}<em> / ${summary.total || session.items.length}</em></strong></span>
+        <span><small>正确率</small><strong>${summary.total ? Math.round(((summary.correct || 0) / summary.total) * 100) : 0}<em>%</em></strong></span>
+        <span><small>未作答</small><strong>${Math.max(0, (summary.total || 0) - (summary.answered || 0))}</strong></span>
+      </section>`
+    : "";
+  const outlineStats = mode === "test" && !isComplete
+    ? `${summary.answered || 0} 已答 · ${Math.max(0, (summary.total || 0) - (summary.answered || 0))} 未答`
+    : `${summary.correct || 0} 对 · ${summary.wrong || 0} 错 · ${Math.max(0, (summary.total || 0) - (summary.answered || 0))} 未答`;
+  $("#page-practice").innerHTML = `
+    <div class="practice-top practice-top-immersive">
+      <button class="button button-secondary" type="button" data-action="leave-session">‹ <span>返回题库</span></button>
+      <div class="practice-top-main"><h1>${escapeHtml(title)}</h1><p><span class="mode-chip mode-${mode}">${meta.label}</span> · ${summary.answered || 0}/${summary.total || session.items.length} 已完成</p></div>
+      <span class="timer-pill" id="practice-timer" aria-label="本次练习用时">◷ ${sessionDuration()}</span>
+      ${finishButton}
+    </div>
+    <div class="practice-layout">
+      <article class="card practice-question ${state.navigationDirection ? `slide-${state.navigationDirection}` : ""}" data-mode="${mode}">
+        <div class="practice-progress"><strong>第 ${item.position} 题 / 共 ${session.items.length} 题</strong><span>${escapeHtml(question.type_label || question.raw_type || question.question_type)}${question.source_code ? ` · ${escapeHtml(question.source_code)}` : ""}</span></div>
+        ${resultPanel}
+        <div class="question-meta">
+          <span class="badge">${escapeHtml(question.type_label || question.raw_type || question.question_type)}</span>
+          ${question.source_code ? `<span class="badge badge-neutral">${escapeHtml(question.source_code)}</span>` : ""}
+          ${!submitted && isComplete && session.mode !== "memorize" ? `<span class="badge badge-warn">未作答</span>` : ""}
+        </div>
+        <p class="question-stem">${escapeHtml(question.stem)}</p>
+        ${answerMarkup}
+        ${statusNote}
+        ${reveal ? `<div class="practice-solution">${renderSolution(submitted ? {
+          answer: submitted.correct_answer,
+          user_answer: submitted.answer,
+          is_correct: submitted.is_correct,
+          point: submitted.point,
+          explanation: submitted.explanation,
+        } : question)}</div>` : ""}
+        ${reveal ? `<div class="question-comments-slot" data-comments-occurrence="${occurrenceId || ""}">${renderQuestionComments(occurrenceId)}</div>` : ""}
+        <div class="practice-footer" data-action-count="${4 + Number(showSubmit) + Number(session.saved_kind === "wrong")}">
+          <button class="button button-secondary practice-footer-button practice-footer-prev" type="button" data-action="session-prev" aria-label="上一题" ${canPrev ? "" : "disabled"}><span class="practice-footer-icon" aria-hidden="true">←</span><span class="practice-footer-label">上一题</span></button>
+          <button class="button button-secondary practice-footer-button mobile-outline-trigger" type="button" data-action="toggle-outline" aria-controls="practice-outline" aria-expanded="false"><span class="practice-footer-label">题号</span></button>
+          ${showSubmit ? `<button class="button button-primary practice-footer-button practice-footer-main practice-footer-submit" type="button" data-action="submit-answer" ${draft ? "" : "disabled"}><span class="practice-footer-label">提交答案</span></button>` : ""}
+          <button class="button button-secondary practice-footer-button practice-footer-favorite favorite-button" type="button" data-action="toggle-favorite" aria-label="收藏本题" data-occurrence="${occurrenceId || ""}" data-question="${escapeAttr(question.question_id)}" data-favorited="false" aria-pressed="false"><span class="practice-footer-icon favorite-icon" aria-hidden="true">☆</span><span class="practice-footer-label favorite-label">收藏</span></button>
+          ${session.saved_kind === "wrong" ? `<button class="button button-danger practice-footer-button practice-remove-button" type="button" data-action="remove-current-wrong" data-key="occurrence:${occurrenceId || ""}"><span class="practice-footer-label">删除错题</span></button>` : ""}
+          <button class="button ${showSubmit || isLast ? "button-secondary" : "button-primary"} practice-footer-button practice-footer-next" type="button" data-action="session-next" aria-label="下一题"><span class="practice-footer-label">下一题</span><span class="practice-footer-icon" aria-hidden="true">→</span></button>
+        </div>
+      </article>
+      <button id="practice-outline-backdrop" class="practice-outline-backdrop" type="button" data-action="close-practice-outline" aria-label="关闭题号目录"></button>
+      <aside id="practice-outline" class="card practice-outline">
+        <div class="practice-outline-grabber" aria-hidden="true"></div>
+        <div class="practice-outline-head"><strong>题号目录</strong><span>${outlineStats}</span><button class="practice-outline-close" type="button" data-action="close-practice-outline" aria-label="关闭题号目录">×</button></div>
+        <div class="practice-outline-body">${renderSessionOutline(session, index)}</div>
+      </aside>
+    </div>`;
+  updateTimerText();
+  state.navigationDirection = "";
+  refreshFavoriteButtons();
+  if (reveal) ensureQuestionComments(occurrenceId);
+}
+
+function renderAnswerArea(item, draft, reveal, isComplete) {
+  const question = item.question;
+  const submitted = item.submission;
+  const mode = state.session.mode || "practice";
+  if (mode === "memorize") {
+    return renderReviewOptions(question.options || [], question.answer || "");
+  }
+  let options = question.options || [];
+  if (!options.length && question.question_type === "判断题") {
+    options = [
+      { label: "A", text: "正确" },
+      { label: "B", text: "错误" },
+    ];
+  }
+  if (options.length) {
+    const selected = new Set(String(submitted?.answer || draft).split(""));
+    const correctAnswer = submitted?.correct_answer || (reveal ? question.answer || "" : "");
+    const correct = new Set(String(correctAnswer).split(""));
+    const canSpeedRetry = mode === "speed" && submitted && submitted.is_correct === false && !isComplete;
+    const disabled = isComplete || (submitted && !canSpeedRetry);
+    return `<div class="answer-options">${options.map((option) => {
+      const classes = ["answer-option"];
+      if (selected.has(option.label)) classes.push("selected");
+      if (reveal && correct.has(option.label)) classes.push("correct");
+      if (reveal && selected.has(option.label) && !correct.has(option.label)) classes.push("incorrect");
+      const stateMark = classes.includes("correct") ? "正确答案" : classes.includes("incorrect") ? "回答错误" : "";
+      return `<button class="${classes.join(" ")}" type="button" data-action="select-option" data-label="${escapeAttr(option.label)}" ${disabled ? "disabled" : ""}><span class="option-label">${escapeHtml(option.label)}</span><span class="option-text">${escapeHtml(option.text)}</span>${stateMark ? `<span class="option-state" aria-label="${stateMark}"></span>` : ""}</button>`;
+    }).join("")}</div>`;
+  }
+  return `<div class="subjective-answer"><label class="field"><span>作答内容</span><textarea id="subjective-draft" data-action="subjective-draft" placeholder="输入你的答案" ${(submitted || isComplete) ? "disabled" : ""}>${escapeHtml(submitted?.answer || draft)}</textarea></label></div>`;
+}
+
+function renderReviewOptions(options, answer) {
+  if (!options.length) return "";
+  const correct = new Set(String(answer || "").split(""));
+  return `<div class="answer-options answer-options-review" role="list">${options.map((option) => {
+    const isCorrect = correct.has(option.label);
+    return `<div class="answer-option ${isCorrect ? "correct" : ""}" role="listitem"><span class="option-label">${escapeHtml(option.label)}</span><span class="option-text">${escapeHtml(option.text)}</span>${isCorrect ? `<span class="option-state" aria-label="正确答案"></span>` : ""}</div>`;
+  }).join("")}</div>`;
+}
+
+function renderSessionOutline(session, currentIndex) {
+  const groups = new Map();
+  session.items.forEach((item, index) => {
+    const label = item.question.type_label || item.question.raw_type || item.question.question_type;
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push({ item, index });
+  });
+  return [...groups.entries()].map(([label, entries]) => `
+    <section class="outline-group"><h3 class="outline-group-title"><span class="type-dot ${typeClass(label)}"></span><span>${escapeHtml(label)}</span></h3>
+      <div class="number-grid">${entries.map(({ item, index }) => {
+        const result = item.submission?.is_correct;
+        const hiddenResult = session.mode === "test" && session.status !== "complete";
+        const status = hiddenResult && item.submission ? "answered" : result === true ? "correct" : result === false ? "wrong" : item.submission ? "ungraded" : "";
+        return `<button class="number-button ${status} ${index === currentIndex ? "current" : ""}" type="button" data-action="session-jump" data-index="${index}">${item.position}</button>`;
+      }).join("")}</div>
+     </section>`).join("");
+}
+
+function renderQuestionComments(occurrenceId) {
+  if (!occurrenceId) {
+    return `<section class="question-comments"><div class="comments-heading"><h2>评论</h2></div><p class="comments-empty">当前题目没有可用的原题来源。</p></section>`;
+  }
+  const record = state.comments[String(occurrenceId)];
+  const items = record?.items || [];
+  const list = !record || record.loading
+    ? `<div class="comments-loading"><span class="loading-spinner" aria-hidden="true"></span><span>正在加载评论</span></div>`
+    : record.error
+      ? `<div class="comments-error"><span>${escapeHtml(record.error)}</span><button class="text-button" type="button" data-action="reload-comments" data-occurrence="${occurrenceId}">重新加载</button></div>`
+      : items.length
+        ? `<div class="comment-list">${items.map((comment) => `
+            <article class="comment-item">
+              <div class="comment-avatar" aria-hidden="true">${escapeHtml([...String(comment.author_name || "用户")][0] || "用")}</div>
+              <div class="comment-main">
+                <div class="comment-meta"><strong>${escapeHtml(comment.author_name || "用户")}</strong><time datetime="${escapeAttr(comment.created_at || "")}">${escapeHtml(formatDate(comment.created_at))}</time>${comment.can_delete ? `<button class="text-button comment-delete" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">删除</button>` : ""}</div>
+                <p>${escapeHtml(comment.body)}</p>
+              </div>
+            </article>`).join("")}</div>`
+        : `<p class="comments-empty">暂无评论</p>`;
+  return `<section class="question-comments" aria-label="本题评论">
+    <div class="comments-heading"><h2>评论</h2><span>${items.length} 条</span></div>
+    ${list}
+    <form class="comment-form" data-form="question-comment" data-occurrence="${occurrenceId}">
+      <textarea name="body" maxlength="2000" rows="3" required placeholder="写下你的理解或疑问"></textarea>
+      <div class="comment-form-actions"><small>最多 2000 字</small><button class="button button-primary button-small" type="submit">发表评论</button></div>
+    </form>
+  </section>`;
+}
+
+async function ensureQuestionComments(occurrenceId, { force = false } = {}) {
+  if (!occurrenceId) return;
+  const key = String(occurrenceId);
+  if (state.comments[key] && !force) return;
+  const existing = state.comments[key];
+  state.comments[key] = { loading: true, items: existing?.items || [], error: "" };
+  updateQuestionComments(occurrenceId);
+  try {
+    const payload = await api(`/study/comments?occurrence_id=${encodeURIComponent(occurrenceId)}`);
+    state.comments[key] = { loading: false, items: payload.items || [], error: "" };
+  } catch (error) {
+    state.comments[key] = { loading: false, items: existing?.items || [], error: error.message || "评论加载失败" };
+  }
+  updateQuestionComments(occurrenceId);
+}
+
+function updateQuestionComments(occurrenceId) {
+  const slot = $(`[data-comments-occurrence="${Number(occurrenceId)}"]`);
+  if (slot) slot.innerHTML = renderQuestionComments(Number(occurrenceId));
+}
+
+async function submitQuestionComment(form) {
+  const occurrenceId = Number(form.dataset.occurrence);
+  const body = String(new FormData(form).get("body") || "").trim();
+  if (!occurrenceId || !body) return;
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "发表中");
+  try {
+    const item = await api("/study/comments", {
+      method: "POST",
+      body: { occurrence_id: occurrenceId, body },
+    });
+    const key = String(occurrenceId);
+    const items = state.comments[key]?.items || [];
+    state.comments[key] = { loading: false, items: [...items, item], error: "" };
+    updateQuestionComments(occurrenceId);
+    showToast("评论已发表");
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function deleteQuestionComment(commentId, occurrenceId) {
+  const confirmed = await confirmModal("删除评论", "确认删除这条评论？", "确认删除");
+  if (!confirmed) return;
+  try {
+    await api(`/study/comments/${encodeURIComponent(commentId)}`, { method: "DELETE", body: {} });
+    const key = String(occurrenceId);
+    const record = state.comments[key] || { loading: false, items: [], error: "" };
+    state.comments[key] = {
+      ...record,
+      items: (record.items || []).filter((item) => item.comment_id !== commentId),
+    };
+    updateQuestionComments(occurrenceId);
+    showToast("评论已删除");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function submitCurrentAnswer({ autoAdvance = false } = {}) {
+  const session = state.session;
+  const index = state.sessionIndex;
+  const item = session.items[index];
+  const answer = state.drafts[item.position] || "";
+  if (!answer) return;
+  try {
+    const result = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}/answers`, {
+      method: "POST",
+      body: { position: item.position, answer, elapsed_ms: sessionElapsedMs() },
+    });
+    state.session = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}`);
+    state.sessionIndex = Math.min(index, state.session.items.length - 1);
+    const canAdvance = autoAdvance && index < state.session.items.length - 1 && state.session.status !== "complete";
+    if (canAdvance && session.mode === "test") {
+      state.sessionIndex = index + 1;
+      renderPractice();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (canAdvance && session.mode === "speed" && result.is_correct === true) {
+      renderPractice();
+      state.selectionTimer = window.setTimeout(() => {
+        state.selectionTimer = null;
+        const currentItem = state.session?.items?.[index];
+        if (
+          state.session?.session_id === session.session_id &&
+          state.sessionIndex === index &&
+          currentItem?.submission?.is_correct === true
+        ) {
+          state.navigationDirection = "forward";
+          state.sessionIndex = index + 1;
+          renderPractice();
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        }
+      }, 360);
+    } else {
+      renderPractice();
+    }
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function finishCurrentSession() {
+  const session = state.session;
+  const unanswered = Math.max(0, session.summary.total - session.summary.answered);
+  const confirmed = await confirmModal(
+    "确认交卷",
+    unanswered ? `还有 ${unanswered} 道题未作答。交卷后仍会保留这些题为未答，并进入整卷复盘。` : "所有题目均已作答，确认提交本次练习？",
+    "确认交卷"
+  );
+  if (!confirmed) return;
+  try {
+    state.session = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}/finish`, { method: "POST", body: {} });
+    renderPractice();
+    showToast("交卷完成，可以逐题复盘答案与解析");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function startTimer() {
+  stopTimer();
+  state.timerHandle = window.setInterval(updateTimerText, 1000);
+  updateTimerText();
+}
+
+function stopTimer() {
+  if (state.timerHandle) window.clearInterval(state.timerHandle);
+  state.timerHandle = null;
+}
+
+function sessionElapsedMs() {
+  if (!state.session) return 0;
+  if (state.session.duration_ms != null) return Number(state.session.duration_ms);
+  const start = Date.parse(state.session.created_at);
+  const end = state.session.completed_at ? Date.parse(state.session.completed_at) : Date.now();
+  return Number.isFinite(start) ? Math.max(0, end - start) : 0;
+}
+
+function sessionDuration() {
+  const total = Math.floor(sessionElapsedMs() / 1000);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return hours
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function updateTimerText() {
+  const timer = $("#practice-timer");
+  if (timer) timer.textContent = `◷ ${sessionDuration()}`;
+}
+
+async function renderAdminPage() {
+  const container = $("#page-admin");
+  container.innerHTML = `<div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">账号、模型、检索能力与运行状态集中管理。</p></div></div>${loadingMarkup("正在读取系统状态")}`;
+  try {
+    const [dashboard, settings, users] = await Promise.all([
+      api("/admin/dashboard"),
+      api("/admin/settings"),
+      api("/admin/users"),
+    ]);
+    state.adminData = { dashboard, settings, users: users.users || [] };
+    renderAdminContent();
+  } catch (error) {
+    container.innerHTML += emptyMarkup("管理数据读取失败", error.message, "!");
+  }
+}
+
+function renderAdminContent() {
+  const data = state.adminData;
+  if (!data) return;
+  $("#page-admin").innerHTML = `
+    <div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">账号、模型、检索能力与运行状态集中管理。</p></div></div>
+    <div class="admin-layout">
+      <nav class="card admin-nav" aria-label="管理导航">
+        ${adminTabButton("overview", "运行概览")}${adminTabButton("users", "账号管理")}${adminTabButton("models", "模型与检索")}${adminTabButton("site", "网站设置")}
+      </nav>
+      <div class="admin-content">${renderAdminTab()}</div>
+    </div>`;
+}
+
+function adminTabButton(tab, label) {
+  return `<button class="${state.adminTab === tab ? "active" : ""}" type="button" data-action="admin-tab" data-tab="${tab}">${label}</button>`;
+}
+
+function renderAdminTab() {
+  const { dashboard, settings, users } = state.adminData;
+  if (state.adminTab === "users") return renderUsers(users);
+  if (state.adminTab === "models") return renderModelSettings(settings);
+  if (state.adminTab === "site") return renderSiteSettings(settings);
+  const vector = dashboard.vector_index || {};
+  const vectorReady = vector.status === "ready";
+  return `<section class="card admin-section">
+    <div class="section-heading"><div><h2>运行概览</h2><p>题库、用户、学习数据与检索服务状态。</p></div></div>
+    <div class="admin-status-banner ${vectorReady ? "ready" : "pending"}">
+      <span class="status-dot" aria-hidden="true"></span>
+      <div><strong>${vectorReady ? "系统运行正常，语义检索可用" : "系统运行正常，语义检索待配置"}</strong><small>${vectorReady ? `${escapeHtml(vector.model || "嵌入模型")} · ${formatNumber(vector.count || 0)} 条向量` : "关键词搜题、刷题、收藏与错题功能不受影响"}</small></div>
+      <span class="badge ${vectorReady ? "" : "badge-warn"}">${vectorReady ? "全部可用" : "基础功能可用"}</span>
+    </div>
+    <div class="stats-grid">
+      ${statCard("注册用户", dashboard.accounts.users, `${dashboard.accounts.admins} 位管理员`)}
+      ${statCard("有效登录", dashboard.accounts.active_sessions, "当前未过期会话")}
+      ${statCard("答题次数", dashboard.activity.answers, `${dashboard.activity.sessions} 份练习`)}
+      ${statCard("规范题目", dashboard.catalog.questions, `${formatNumber(dashboard.catalog.collections)} 个题库文件`)}
+    </div>
+    <div class="settings-grid">
+      <div class="settings-group"><h3>学习数据</h3><div class="solution-row"><strong>收藏</strong><span>${formatNumber(dashboard.activity.favorites)}</span></div><div class="solution-row"><strong>错题</strong><span>${formatNumber(dashboard.activity.wrong_items)}</span></div><div class="solution-row"><strong>进行中</strong><span>${formatNumber(dashboard.activity.active_practice)}</span></div></div>
+      <div class="settings-group"><h3>向量索引</h3><div class="solution-row"><strong>状态</strong><span>${escapeHtml(vector.status || "unavailable")}</span></div><div class="solution-row"><strong>模型</strong><span>${escapeHtml(vector.model || "尚未构建")}</span></div><div class="solution-row"><strong>向量数</strong><span>${formatNumber(vector.count || 0)}</span></div></div>
+    </div>
+  </section>`;
+}
+
+function renderUsers(users) {
+  const admins = users.filter((user) => user.role === "admin" && user.status === "active").length;
+  const disabled = users.filter((user) => user.status === "disabled").length;
+  return `<section class="card admin-section">
+    <div class="section-heading"><div><h2>账号管理</h2><p>创建账号、调整角色、重置密码或停用访问权限。</p></div></div>
+    <div class="admin-mini-stats"><span><strong>${users.length}</strong>全部账号</span><span><strong>${admins}</strong>有效管理员</span><span><strong>${disabled}</strong>已停用</span></div>
+    <form id="create-user-form" class="settings-group create-user-box">
+      <h3>创建账号</h3><div class="inline-fields"><label class="field"><span>用户名</span><input name="username" required minlength="3" maxlength="32"></label><label class="field"><span>角色</span><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label></div>
+      <label class="field field-spaced"><span>初始密码</span><input name="password" type="password" required minlength="10"></label>
+      <div class="question-actions"><button class="button button-primary button-small" type="submit">创建账号</button></div>
+    </form>
+    <div class="table-wrap user-table-wrap"><table class="data-table user-table"><thead><tr><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody>${users.map((user) => `<tr>
+      <td data-label="用户"><div class="user-identity"><span>${escapeHtml(user.username.slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(user.username)}</strong></div></td>
+      <td data-label="角色"><select class="compact-select" data-user-role="${escapeAttr(user.user_id)}" ${user.user_id === state.user.user_id ? "disabled" : ""}><option value="user" ${user.role === "user" ? "selected" : ""}>普通用户</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>管理员</option></select></td>
+      <td data-label="状态"><span class="status-pill ${user.status}">${user.status === "active" ? "正常" : "已停用"}</span></td>
+      <td data-label="最近登录">${formatDate(user.last_login_at)}</td>
+      <td data-label="操作"><div class="table-actions">${user.user_id === state.user.user_id ? `<span class="current-user-label">当前账号</span><button class="button button-secondary button-small" type="button" data-action="reset-user-password" data-id="${escapeAttr(user.user_id)}" data-name="${escapeAttr(user.username)}">修改密码</button>` : `<button class="button button-secondary button-small" type="button" data-action="update-user-role" data-id="${escapeAttr(user.user_id)}">保存角色</button><button class="button button-secondary button-small" type="button" data-action="reset-user-password" data-id="${escapeAttr(user.user_id)}" data-name="${escapeAttr(user.username)}">重置密码</button><button class="button ${user.status === "active" ? "button-danger" : "button-quiet"} button-small" type="button" data-action="toggle-user-status" data-id="${escapeAttr(user.user_id)}" data-status="${user.status === "active" ? "disabled" : "active"}">${user.status === "active" ? "停用" : "启用"}</button>`}</div></td>
+    </tr>`).join("")}</tbody></table></div>
+  </section>`;
+}
+
+function renderModelSettings(settings) {
+  const embedding = settings.embedding || {};
+  const llm = settings.llm || {};
+  const vector = settings.vector_index || {};
+  const vectorReady = vector.status === "ready";
+  return `<section class="card admin-section">
+    <div class="section-heading"><div><h2>模型与检索</h2><p>密钥加密保存在本机，仅管理员可更新或测试连接。</p></div></div>
+    <div class="model-status-grid">
+      <div><span class="status-dot ${embedding.api_key_configured ? "ready" : ""}"></span><small>嵌入模型</small><strong>${embedding.api_key_configured ? "已配置" : "未配置"}</strong></div>
+      <div><span class="status-dot ${vectorReady ? "ready" : ""}"></span><small>向量索引</small><strong>${vectorReady ? `${formatNumber(vector.count || 0)} 条` : "未构建"}</strong></div>
+      <div><span class="status-dot ${settings.semantic_enabled && vectorReady ? "ready" : ""}"></span><small>语义搜题</small><strong>${settings.semantic_enabled && vectorReady ? "可用" : "未启用"}</strong></div>
+    </div>
+    <form id="model-settings-form" class="stack-form">
+      <div class="settings-grid">
+        ${providerFields("embedding", "嵌入模型", embedding, true)}
+        ${providerFields("llm", "大模型", llm, false)}
+      </div>
+      <div class="settings-group">
+        <div class="switch-row"><div class="switch-copy"><strong>启用语义检索</strong><small>需要当前模型配置与已激活向量索引完全匹配</small></div><label class="switch"><input name="semantic_enabled" type="checkbox" ${settings.semantic_enabled ? "checked" : ""}><span></span></label></div>
+        <label class="field"><span>默认搜索模式</span><select name="default_search_mode"><option value="keyword" ${settings.default_search_mode === "keyword" ? "selected" : ""}>关键词</option><option value="hybrid" ${settings.default_search_mode === "hybrid" ? "selected" : ""}>混合</option><option value="semantic" ${settings.default_search_mode === "semantic" ? "selected" : ""}>语义</option></select></label>
+      </div>
+      <div class="question-actions"><button class="button button-secondary" type="button" data-action="test-provider" data-provider="embedding">测试嵌入模型</button><button class="button button-secondary" type="button" data-action="test-provider" data-provider="llm">测试大模型</button><button class="button button-primary" type="submit">保存配置</button></div>
+    </form>
+  </section>`;
+}
+
+function providerFields(prefix, title, provider, dimensions) {
+  return `<div class="settings-group"><h3>${title}</h3><label class="field"><span>API 地址</span><input name="${prefix}_api_url" type="url" value="${escapeAttr(provider.api_url || "")}" required></label><label class="field"><span>模型</span><input name="${prefix}_model" value="${escapeAttr(provider.model || "")}" required></label>${dimensions ? `<label class="field"><span>向量维度</span><input name="embedding_dimensions" type="number" min="64" max="1024" step="64" value="${provider.dimensions || 1024}" required></label>` : ""}<label class="field"><span>API 密钥</span><input name="${prefix}_api_key" type="password" autocomplete="new-password" placeholder="${provider.api_key_configured ? `已配置 ${escapeAttr(provider.api_key_masked || "")}` : "尚未配置"}"></label></div>`;
+}
+
+function renderSiteSettings(settings) {
+  return `<section class="card admin-section"><div class="section-heading"><div><h2>网站设置</h2><p>设置站点名称、注册策略和默认结果数量。</p></div></div><form id="site-settings-form" class="stack-form"><label class="field"><span>站点名称</span><input name="site_name" value="${escapeAttr(settings.site_name || "医考知库")}" minlength="2" maxlength="30" required></label><label class="field"><span>默认搜索结果数</span><input name="search_result_limit" type="number" min="1" max="50" value="${settings.search_result_limit || 10}" required></label><div class="settings-group"><div class="switch-row"><div class="switch-copy"><strong>开放用户注册</strong><small>关闭后仅管理员可在账号管理中创建用户</small></div><label class="switch"><input name="allow_registration" type="checkbox" ${settings.allow_registration ? "checked" : ""}><span></span></label></div></div><div class="question-actions"><button class="button button-primary" type="submit">保存网站设置</button></div></form></section>`;
+}
+
+async function handleClick(event) {
+  if (Date.now() < state.suppressClickUntil) return;
+  const target = event.target.closest("[data-action]");
+  if (!target) return;
+  const action = target.dataset.action;
+  if (action === "toggle-password") {
+    const input = $("#auth-password");
+    input.type = input.type === "password" ? "text" : "password";
+    target.textContent = input.type === "password" ? "显示" : "隐藏";
+    return;
+  }
+  if (action === "auth-mode") return showAuth(target.dataset.mode);
+  if (action === "toggle-profile") {
+    const menu = $("#profile-menu");
+    menu.hidden = !menu.hidden;
+    target.setAttribute("aria-expanded", String(!menu.hidden));
+    return;
+  }
+  if (action === "change-password") return changeOwnPassword();
+  if (action === "logout") return logout();
+  if (action === "open-admin") { location.hash = "#admin"; return; }
+  if (action === "library-home") {
+    event.preventDefault();
+    state.libraryPath.library = "";
+    state.outline = null;
+    setPracticeOutline(false);
+    if (location.hash === "#library") return renderLibrary("library");
+    location.hash = "#library";
+    return;
+  }
+  if (action === "open-directory") {
+    state.libraryPath[target.dataset.kind] = target.dataset.path;
+    return renderLibrary(target.dataset.kind);
+  }
+  if (action === "library-breadcrumb") {
+    state.libraryPath[target.dataset.kind] = target.dataset.path;
+    return renderLibrary(target.dataset.kind);
+  }
+  if (action === "open-collection") return openCollection(target.dataset.kind, target.dataset.id);
+  if (action === "close-outline") return renderLibrary(target.dataset.kind);
+  if (action === "outline-mode") {
+    state.outlineMode = target.dataset.mode;
+    renderOutline();
+    return;
+  }
+  if (action === "reset-collection-progress") return resetCollectionProgress(target);
+  if (action === "start-session") {
+    return startSession({ collectionId: target.dataset.id, position: target.dataset.position, kind: target.dataset.kind, mode: state.outlineMode });
+  }
+  if (action === "practice-source") {
+    return startSession({ collectionId: target.dataset.id, position: target.dataset.position, kind: "library", mode: "practice" });
+  }
+  if (action === "search-mode") {
+    state.searchMode = target.dataset.mode;
+    savePreferences();
+    renderSearchPage();
+    $("#search-input")?.focus();
+    return;
+  }
+  if (action === "search-solution-toggle") return toggleSearchSolution(target.dataset.field);
+  if (action === "search-field-toggle") return toggleSearchField(target.dataset.field);
+  if (action === "search-question-type") return toggleSearchQuestionType(target.dataset.type);
+  if (action === "search-all-toggle") return toggleSearchAll(target.dataset.group);
+  if (action === "reset-search-settings") return resetSearchSettings();
+  if (action === "toggle-search-settings") return toggleSearchSettings();
+  if (action === "leave-session") {
+    clearSelectionTimer();
+    setPracticeOutline(false);
+    const kind = state.session?.saved_kind === "favorite" ? "favorites" : state.session?.saved_kind === "wrong" ? "wrong" : "library";
+    if (state.session?.collection_id) {
+      state.sessionReturnTarget = {
+        kind,
+        collectionId: state.session.collection_id,
+      };
+    }
+    location.hash = `#${kind}`;
+    return;
+  }
+  if (action === "session-prev") return moveSession(-1);
+  if (action === "session-next") return moveSession(1);
+  if (action === "session-jump") {
+    state.sessionIndex = Number(target.dataset.index);
+    setPracticeOutline(false);
+    renderPractice();
+    return;
+  }
+  if (action === "toggle-outline") {
+    setPracticeOutline(!$("#practice-outline")?.classList.contains("open"));
+    return;
+  }
+  if (action === "close-practice-outline") return setPracticeOutline(false);
+  if (action === "select-option") return selectAnswerOption(target.dataset.label);
+  if (action === "submit-answer") return submitCurrentAnswer();
+  if (action === "finish-session") return finishCurrentSession();
+  if (action === "toggle-favorite") return toggleFavorite(target);
+  if (action === "remove-current-wrong") return removeCurrentWrong(target.dataset.key);
+  if (action === "remove-saved-outline") return removeSavedOutlineItem(target.dataset.kind, target.dataset.key);
+  if (action === "reload-comments") return ensureQuestionComments(Number(target.dataset.occurrence), { force: true });
+  if (action === "delete-comment") return deleteQuestionComment(target.dataset.commentId, Number(target.dataset.occurrence));
+  if (action === "admin-tab") {
+    state.adminTab = target.dataset.tab;
+    renderAdminContent();
+    return;
+  }
+  if (action === "toggle-user-status") return toggleUserStatus(target.dataset.id, target.dataset.status);
+  if (action === "update-user-role") return updateUserRole(target.dataset.id);
+  if (action === "reset-user-password") return resetUserPassword(target.dataset.id, target.dataset.name);
+  if (action === "test-provider") return testProvider(target.dataset.provider, target);
+}
+
+async function handleSubmit(event) {
+  event.preventDefault();
+  if (event.target.id === "auth-form") return submitAuth(event.target);
+  if (event.target.id === "search-form") return submitSearch(event.target);
+  if (event.target.id === "model-settings-form") return saveModelSettings(event.target);
+  if (event.target.id === "site-settings-form") return saveSiteSettings(event.target);
+  if (event.target.id === "create-user-form") return createUser(event.target);
+  if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);
+}
+
+document.addEventListener("input", (event) => {
+  if (event.target.dataset.action !== "subjective-draft" || !state.session) return;
+  const item = state.session.items[state.sessionIndex];
+  state.drafts[item.position] = event.target.value.trim();
+  const submit = $('[data-action="submit-answer"]');
+  if (submit) submit.disabled = !state.drafts[item.position];
+});
+
+async function submitAuth(form) {
+  const submit = $("#auth-submit");
+  setButtonBusy(submit, true, "请稍候");
+  setAuthError("");
+  try {
+    const data = Object.fromEntries(new FormData(form));
+    const path = state.authMode === "setup" ? "/auth/setup" : state.authMode === "register" ? "/auth/register" : "/auth/login";
+    const result = await api(path, { method: "POST", body: data, authRedirect: false });
+    await enterApp(result.user);
+  } catch (error) {
+    setAuthError(error.message);
+  } finally {
+    setButtonBusy(submit, false);
+  }
+}
+
+async function logout() {
+  try {
+    await api("/auth/logout", { method: "POST", body: {} });
+  } catch (_) {
+    // Clearing the local UI is still correct when the server session expired.
+  }
+  state.user = null;
+  state.session = null;
+  state.comments = {};
+  $("#profile-menu").hidden = true;
+  location.hash = "";
+  showAuth("login");
+}
+
+async function changeOwnPassword() {
+  $("#profile-menu").hidden = true;
+  const values = await ownPasswordModal();
+  if (!values) return;
+  try {
+    await api("/auth/password", { method: "POST", body: values });
+    state.user = null;
+    state.session = null;
+    state.comments = {};
+    showAuth("login");
+    showToast("密码已修改，请重新登录");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function submitSearch(form) {
+  const query = new FormData(form).get("query")?.trim();
+  if (!query) return;
+  await runSearch(query);
+}
+
+async function runSearch(query) {
+  state.lastSearchQuery = query;
+  const results = $("#search-results");
+  if (!results) return;
+  results.innerHTML = loadingMarkup("正在检索题库");
+  try {
+    const includeSolution = ["answer", "point", "explanation"]
+      .some((field) => state.searchSolutionVisibility[field]);
+    const searchFields = Object.entries(state.searchFields)
+      .filter(([, enabled]) => enabled)
+      .map(([field]) => field);
+    const payload = await api("/search", {
+      method: "POST",
+      body: {
+        query,
+        mode: state.searchMode,
+        limit: state.settings?.search_result_limit || 10,
+        include_solution: includeSolution,
+        search_fields: searchFields,
+        question_types: state.searchQuestionTypes,
+      },
+    });
+    state.searchResults = payload.results || [];
+    state.searchMetadata = payload;
+    results.innerHTML = renderSearchResults(state.searchResults, payload);
+    refreshFavoriteButtons();
+  } catch (error) {
+    results.innerHTML = emptyMarkup("检索失败", error.message, "!");
+  }
+}
+
+function selectAnswerOption(label) {
+  const item = state.session.items[state.sessionIndex];
+  const mode = state.session.mode || "practice";
+  if (mode === "speed" && item.submission) {
+    const correct = new Set(String(item.submission.correct_answer || "").split(""));
+    if (correct.has(label)) moveSession(1);
+    return;
+  }
+  const current = new Set(String(state.drafts[item.position] || "").split(""));
+  if (item.question.question_type === "多选题") {
+    current.has(label) ? current.delete(label) : current.add(label);
+    state.drafts[item.position] = [...current].sort().join("");
+  } else {
+    state.drafts[item.position] = label;
+  }
+  renderPractice();
+  if (["speed", "test"].includes(mode)) {
+    clearSelectionTimer();
+    const position = item.position;
+    const delay = item.question.question_type === "多选题" ? 520 : 0;
+    state.selectionTimer = window.setTimeout(() => {
+      state.selectionTimer = null;
+      const currentItem = state.session?.items?.[state.sessionIndex];
+      if (currentItem?.position === position && !currentItem.submission) {
+        submitCurrentAnswer({ autoAdvance: true });
+      }
+    }, delay);
+  }
+}
+
+function moveSession(delta) {
+  const next = state.sessionIndex + delta;
+  if (next < 0) {
+    showToast("已经是第一题");
+    return;
+  }
+  if (next >= state.session.items.length) {
+    showToast("已经是最后一题");
+    return;
+  }
+  clearSelectionTimer();
+  state.navigationDirection = delta > 0 ? "forward" : "backward";
+  state.sessionIndex = next;
+  renderPractice();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function clearSelectionTimer() {
+  if (state.selectionTimer) window.clearTimeout(state.selectionTimer);
+  state.selectionTimer = null;
+}
+
+function handlePracticePointerDown(event) {
+  if (!event.isPrimary || !document.body.classList.contains("in-session")) return;
+  const outlineHandle = event.target.closest(".practice-outline-grabber, .practice-outline-head");
+  if (outlineHandle && $("#practice-outline")?.classList.contains("open")) {
+    state.gestureStart = { kind: "outline", x: event.clientX, y: event.clientY, time: Date.now(), pointerId: event.pointerId };
+    return;
+  }
+  if (!event.target.closest(".practice-question") || event.target.closest("input, textarea, select")) return;
+  state.gestureStart = { kind: "question", x: event.clientX, y: event.clientY, time: Date.now(), pointerId: event.pointerId };
+}
+
+function handlePracticePointerUp(event) {
+  const start = state.gestureStart;
+  state.gestureStart = null;
+  if (!start || start.pointerId !== event.pointerId) return;
+  const dx = event.clientX - start.x;
+  const dy = event.clientY - start.y;
+  if (Date.now() - start.time > 750) return;
+  if (start.kind === "outline") {
+    if (dy > 56 && Math.abs(dy) > Math.abs(dx) * 1.2) {
+      state.suppressClickUntil = Date.now() + 250;
+      setPracticeOutline(false);
+    }
+    return;
+  }
+  if (Math.abs(dx) < 56 || Math.abs(dx) < Math.abs(dy) * 1.25) return;
+  state.suppressClickUntil = Date.now() + 250;
+  moveSession(dx < 0 ? 1 : -1);
+}
+
+function clearPracticeGesture() {
+  state.gestureStart = null;
+}
+
+function handlePracticeKeydown(event) {
+  if (!document.body.classList.contains("in-session")) return;
+  if (event.key === "Escape") {
+    setPracticeOutline(false);
+    return;
+  }
+  if (event.target.matches("input, textarea, select")) return;
+  if (event.key === "ArrowLeft") moveSession(-1);
+  if (event.key === "ArrowRight") moveSession(1);
+}
+
+function handlePracticeResize() {
+  if (window.innerWidth > 760) setPracticeOutline(false);
+}
+
+function setPracticeOutline(open) {
+  const outline = $("#practice-outline");
+  const backdrop = $("#practice-outline-backdrop");
+  const trigger = $('[data-action="toggle-outline"]');
+  const shouldOpen = Boolean(open) && window.matchMedia("(max-width: 760px)").matches;
+  outline?.classList.toggle("open", shouldOpen);
+  backdrop?.classList.toggle("open", shouldOpen);
+  trigger?.setAttribute("aria-expanded", String(shouldOpen));
+  document.body.classList.toggle("outline-open", shouldOpen);
+}
+
+async function toggleFavorite(button) {
+  const occurrence = button.dataset.occurrence;
+  button.disabled = true;
+  try {
+    const result = await api("/study/favorites/toggle", {
+      method: "POST",
+      body: {
+        occurrence_id: occurrence ? Number(occurrence) : null,
+        question_id: button.dataset.question || "",
+      },
+    });
+    applyFavoriteState(result.occurrence_id, Boolean(result.favorited));
+    showToast(result.favorited ? "已收藏，并按原文件路径归档" : "已取消收藏");
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function refreshFavoriteButtons() {
+  const buttons = $$('[data-action="toggle-favorite"][data-occurrence]')
+    .filter((button) => button.dataset.occurrence);
+  const occurrenceIds = [...new Set(buttons.map((button) => Number(button.dataset.occurrence)).filter(Number.isFinite))];
+  if (!occurrenceIds.length) return;
+  try {
+    const result = await api(`/study/favorites/status?occurrence_ids=${occurrenceIds.join(",")}`);
+    const saved = new Set((result.occurrence_ids || []).map(Number));
+    occurrenceIds.forEach((occurrenceId) => applyFavoriteState(occurrenceId, saved.has(occurrenceId)));
+  } catch (_) {
+    // 收藏状态读取失败不阻断搜题和刷题。
+  }
+}
+
+function applyFavoriteState(occurrenceId, favorited) {
+  $$(`[data-action="toggle-favorite"][data-occurrence="${Number(occurrenceId)}"]`).forEach((button) => {
+    button.dataset.favorited = String(favorited);
+    button.setAttribute("aria-pressed", String(favorited));
+    button.setAttribute("aria-label", favorited ? "取消收藏本题" : "收藏本题");
+    button.classList.toggle("favorited", favorited);
+    const icon = $(".favorite-icon", button);
+    const label = $(".favorite-label", button);
+    if (icon) icon.textContent = favorited ? "★" : "☆";
+    if (label) label.textContent = favorited ? "已收藏" : "收藏";
+  });
+}
+
+async function removeSavedOutlineItem(kind, itemKey) {
+  if (!state.outline || !itemKey) return;
+  try {
+    await api(`/study/${encodeURIComponent(kind)}/${encodeURIComponent(itemKey)}`, { method: "DELETE", body: {} });
+    state.outline.payload.items = (state.outline.payload.items || [])
+      .filter((item) => item.saved?.item_key !== itemKey);
+    state.outline.payload.summary = {
+      ...(state.outline.payload.summary || {}),
+      total: state.outline.payload.items.length,
+      saved: state.outline.payload.items.length,
+    };
+    renderOutline();
+    showToast(kind === "wrong" ? "错题已删除" : "收藏已取消");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function removeCurrentWrong(itemKey) {
+  if (!itemKey || itemKey.endsWith("undefined")) return;
+  try {
+    await api(`/study/wrong/${encodeURIComponent(itemKey)}`, { method: "DELETE", body: {} });
+    showToast("已从错题中移除");
+    state.session.items.splice(state.sessionIndex, 1);
+    if (!state.session.items.length) {
+      location.hash = "#wrong";
+      return;
+    }
+    state.sessionIndex = Math.min(state.sessionIndex, state.session.items.length - 1);
+    renderPractice();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function toggleUserStatus(userId, status) {
+  const verb = status === "disabled" ? "停用" : "启用";
+  const confirmed = await confirmModal(`${verb}账号`, `确认${verb}该账号？停用会立即撤销其全部登录会话。`, `确认${verb}`);
+  if (!confirmed) return;
+  try {
+    const updated = await api(`/admin/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: { status } });
+    const index = state.adminData.users.findIndex((user) => user.user_id === userId);
+    if (index >= 0) state.adminData.users[index] = updated;
+    renderAdminContent();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function updateUserRole(userId) {
+  const select = $(`[data-user-role="${userId}"]`);
+  if (!select) return;
+  const current = state.adminData.users.find((user) => user.user_id === userId);
+  const role = select.value;
+  if (!current || current.role === role) {
+    showToast("角色没有变化");
+    return;
+  }
+  if (current.role === "admin" && role === "user") {
+    const confirmed = await confirmModal("调整管理员角色", `确认将 ${current.username} 调整为普通用户？`, "确认调整");
+    if (!confirmed) {
+      select.value = current.role;
+      return;
+    }
+  }
+  try {
+    const updated = await api(`/admin/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: { role } });
+    const index = state.adminData.users.findIndex((user) => user.user_id === userId);
+    if (index >= 0) state.adminData.users[index] = updated;
+    renderAdminContent();
+    showToast("账号角色已更新");
+  } catch (error) {
+    select.value = current.role;
+    showToast(error.message, "error");
+  }
+}
+
+async function resetUserPassword(userId, username) {
+  const password = await passwordModal(username);
+  if (!password) return;
+  try {
+    await api(`/admin/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: { password } });
+    if (userId === state.user.user_id) {
+      state.user = null;
+      state.session = null;
+      showAuth("login");
+      showToast("密码已修改，请使用新密码重新登录");
+      return;
+    }
+    showToast("密码已重置，该账号的既有会话已撤销");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function createUser(form) {
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "创建中");
+  try {
+    const body = Object.fromEntries(new FormData(form));
+    const user = await api("/admin/users", { method: "POST", body });
+    state.adminData.users.push(user);
+    renderAdminContent();
+    showToast("账号已创建");
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function saveModelSettings(form) {
+  const values = Object.fromEntries(new FormData(form));
+  const body = {
+    app: {
+      semantic_enabled: form.elements.semantic_enabled.checked,
+      default_search_mode: values.default_search_mode,
+    },
+    providers: {
+      embedding: {
+        api_url: values.embedding_api_url,
+        model: values.embedding_model,
+        dimensions: Number(values.embedding_dimensions),
+      },
+      llm: {
+        api_url: values.llm_api_url,
+        model: values.llm_model,
+      },
+    },
+  };
+  if (values.embedding_api_key) body.providers.embedding.api_key = values.embedding_api_key;
+  if (values.llm_api_key) body.providers.llm.api_key = values.llm_api_key;
+  try {
+    state.adminData.settings = await api("/admin/settings", { method: "PUT", body });
+    state.settings = state.adminData.settings;
+    renderAdminContent();
+    showToast("模型与检索配置已保存");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function saveSiteSettings(form) {
+  const values = Object.fromEntries(new FormData(form));
+  try {
+    state.adminData.settings = await api("/admin/settings", {
+      method: "PUT",
+      body: {
+        app: {
+          site_name: values.site_name,
+          search_result_limit: Number(values.search_result_limit),
+          allow_registration: form.elements.allow_registration.checked,
+        },
+      },
+    });
+    state.settings = state.adminData.settings;
+    $("#site-brand-name").textContent = state.settings.site_name;
+    renderAdminContent();
+    showToast("网站设置已保存");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function testProvider(provider, button) {
+  setButtonBusy(button, true, "测试中");
+  try {
+    const result = await api("/admin/settings/test", { method: "POST", body: { provider } });
+    showToast(`${provider === "embedding" ? "嵌入模型" : "大模型"}连接正常${result.model ? ` · ${result.model}` : ""}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+function setButtonBusy(button, busy, label = "处理中") {
+  if (!button) return;
+  if (busy) {
+    button.dataset.originalText = button.textContent;
+    button.textContent = label;
+    button.disabled = true;
+  } else {
+    button.textContent = button.dataset.originalText || button.textContent;
+    button.disabled = false;
+  }
+}
+
+function confirmModal(title, message, confirmLabel = "确认") {
+  return new Promise((resolve) => {
+    const root = $("#modal-root");
+    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><h2 id="modal-title">${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="button" data-modal="confirm">${escapeHtml(confirmLabel)}</button></div></section></div>`;
+    const finish = (value) => { root.innerHTML = ""; resolve(value); };
+    $('[data-modal="cancel"]', root).addEventListener("click", () => finish(false));
+    $('[data-modal="confirm"]', root).addEventListener("click", () => finish(true));
+    $(".modal-backdrop", root).addEventListener("click", (event) => {
+      if (event.target.classList.contains("modal-backdrop")) finish(false);
+    });
+  });
+}
+
+function passwordModal(username) {
+  return new Promise((resolve) => {
+    const root = $("#modal-root");
+    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="password-modal-title"><h2 id="password-modal-title">重置密码</h2><p>为 ${escapeHtml(username)} 设置新密码，保存后会撤销该账号的既有登录会话。</p><form id="password-reset-form" class="stack-form"><label class="field"><span>新密码</span><input name="password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required placeholder="至少 10 位，包含三类字符"></label><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="submit">确认重置</button></div></form></section></div>`;
+    const finish = (value) => { root.innerHTML = ""; resolve(value); };
+    $('[data-modal="cancel"]', root).addEventListener("click", () => finish(null));
+    $("#password-reset-form", root).addEventListener("submit", (event) => {
+      event.preventDefault();
+      finish(event.target.elements.password.value);
+    });
+    $(".modal-backdrop", root).addEventListener("click", (event) => {
+      if (event.target.classList.contains("modal-backdrop")) finish(null);
+    });
+    $("input", root).focus();
+  });
+}
+
+function ownPasswordModal() {
+  return new Promise((resolve) => {
+    const root = $("#modal-root");
+    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="own-password-modal-title"><h2 id="own-password-modal-title">修改密码</h2><p>验证当前密码后设置新密码。修改成功后需要重新登录。</p><form id="own-password-form" class="stack-form"><label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label><label class="field"><span>新密码</span><input name="new_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required placeholder="至少 10 位，包含三类字符"></label><label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label><p class="form-error" data-password-error></p><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="submit">保存新密码</button></div></form></section></div>`;
+    const finish = (value) => { root.innerHTML = ""; resolve(value); };
+    $('[data-modal="cancel"]', root).addEventListener("click", () => finish(null));
+    $("#own-password-form", root).addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = event.target;
+      if (form.elements.new_password.value !== form.elements.confirm_password.value) {
+        $('[data-password-error]', form).textContent = "两次输入的新密码不一致";
+        return;
+      }
+      finish({
+        current_password: form.elements.current_password.value,
+        new_password: form.elements.new_password.value,
+      });
+    });
+    $(".modal-backdrop", root).addEventListener("click", (event) => {
+      if (event.target.classList.contains("modal-backdrop")) finish(null);
+    });
+    $("input", root).focus();
+  });
+}
+
+function showToast(message, type = "success") {
+  const toast = document.createElement("div");
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  $("#toast-region").append(toast);
+  window.setTimeout(() => toast.remove(), 3600);
+}
+
+function fileTitle(path) {
+  const name = String(path || "").replaceAll("\\", "/").split("/").pop() || "题库文件";
+  return name.replace(/\.(xlsx|docx)$/i, "");
+}
+
+function displaySourcePath(path) {
+  return String(path || "").replace(/\.xlsx$/i, "");
+}
+
+function formatNumber(value) {
+  return new Intl.NumberFormat("zh-CN").format(Number(value) || 0);
+}
+
+function formatDate(value) {
+  if (!value) return "从未登录";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "-" : new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
+}
+
+function searchHighlightText(value) {
+  const text = String(value ?? "");
+  if (state.searchMode !== "keyword" || !state.lastSearchQuery.trim()) return escapeHtml(text);
+  const query = state.lastSearchQuery.trim();
+  const terms = [...new Set([
+    query,
+    ...(query.match(/[\u3400-\u4dbf\u4e00-\u9fff]+|[A-Za-z0-9]+/g) || []),
+  ])]
+    .map((term) => term.trim())
+    .filter((term) => term.length > 0)
+    .sort((left, right) => right.length - left.length);
+  if (!terms.length) return escapeHtml(text);
+  const pattern = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const matcher = new RegExp(pattern, "gi");
+  let output = "";
+  let cursor = 0;
+  for (const match of text.matchAll(matcher)) {
+    const start = match.index ?? cursor;
+    output += escapeHtml(text.slice(cursor, start));
+    output += `<mark class="search-hit">${escapeHtml(match[0])}</mark>`;
+    cursor = start + match[0].length;
+  }
+  return output + escapeHtml(text.slice(cursor));
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/`/g, "&#96;");
+}
+
+function savePreferences() {
+  try {
+    localStorage.setItem(PREFERENCE_KEY, JSON.stringify({
+      searchMode: state.searchMode,
+      searchFields: state.searchFields,
+      searchQuestionTypes: state.searchQuestionTypes,
+      searchSolutionVisibility: state.searchSolutionVisibility,
+      searchSettingsExpanded: state.searchSettingsExpanded,
+    }));
+  } catch (_) {
+    // 浏览器禁用本地存储时仍可在当前会话使用设置。
+  }
+}
+
+try {
+  const preferences = JSON.parse(localStorage.getItem(PREFERENCE_KEY) || "{}");
+  if (preferences.searchMode) state.searchMode = preferences.searchMode;
+  if (Array.isArray(preferences.searchQuestionTypes)) {
+    state.searchQuestionTypes = [...new Set(preferences.searchQuestionTypes.map((value) => String(value || "").trim()).filter(Boolean))];
+  } else if (typeof preferences.searchQuestionType === "string" && preferences.searchQuestionType) {
+    state.searchQuestionTypes = [preferences.searchQuestionType];
+  }
+  if (preferences.searchFields && typeof preferences.searchFields === "object") {
+    for (const field of ["stem", "answer", "point", "explanation"]) {
+      if (typeof preferences.searchFields[field] === "boolean") {
+        state.searchFields[field] = preferences.searchFields[field];
+      }
+    }
+    if (!Object.values(state.searchFields).some(Boolean)) {
+      state.searchFields.stem = true;
+    }
+    if (!state.searchFields.stem && state.searchMode !== "keyword") {
+      state.searchMode = "keyword";
+    }
+  }
+  if (preferences.searchSolutionVisibility && typeof preferences.searchSolutionVisibility === "object") {
+    for (const field of ["stem", "answer", "point", "explanation"]) {
+      if (typeof preferences.searchSolutionVisibility[field] === "boolean") {
+        state.searchSolutionVisibility[field] = preferences.searchSolutionVisibility[field];
+      }
+    }
+  }
+  if (typeof preferences.searchSettingsExpanded === "boolean") {
+    state.searchSettingsExpanded = preferences.searchSettingsExpanded;
+  }
+} catch (_) {
+  localStorage.removeItem(PREFERENCE_KEY);
 }

@@ -5,8 +5,8 @@ import json
 import sqlite3
 from pathlib import Path
 
-from medical_v2.builder import activate_build, build_catalog
-from medical_v2.catalog import resolve_catalog_path
+from medical_app.builder import activate_build, build_catalog
+from medical_app.catalog import resolve_catalog_path
 
 
 def _hash_tree(root: Path) -> dict[str, str]:
@@ -25,6 +25,8 @@ def test_build_catalog_is_structured_idempotent_and_read_only(sample_source_tree
 
     assert first["snapshot_id"] == second["snapshot_id"]
     assert first["build_id"] == second["build_id"]
+    assert first["build_id"].startswith("catalog_")
+    assert first["schema_revision"] == 1
     assert first["reused"] is False
     assert second["reused"] is True
     assert before == _hash_tree(sample_source_tree)

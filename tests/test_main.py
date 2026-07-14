@@ -4,91 +4,126 @@ import importlib
 import sys
 from pathlib import Path
 
-from medical_v2.builder import build_catalog
-from medical_v2.catalog import Catalog
-from medical_v2.practice import PracticeStore
+from medical_app.builder import build_catalog
 
 
-def test_main_serves_public_assets_and_v2_health(
-    sample_source_tree: Path, tmp_path: Path, monkeypatch
-):
+def _load_app(sample_source_tree: Path, tmp_path: Path, monkeypatch):
     manifest = build_catalog(sample_source_tree, tmp_path / "builds")
     catalog_path = tmp_path / "builds" / manifest["build_id"] / "catalog.sqlite3"
-    practice_path = tmp_path / "state" / "practice.sqlite3"
-    PracticeStore(practice_path, Catalog(catalog_path)).initialize()
-
     monkeypatch.setenv("FLASK_ENV", "development")
     monkeypatch.setenv("CATALOG_DB", str(catalog_path))
-    monkeypatch.setenv("PRACTICE_DB", str(practice_path))
+    monkeypatch.setenv("APP_DB", str(tmp_path / "state" / "app.sqlite3"))
     monkeypatch.setenv("SETTINGS_DB", str(tmp_path / "state" / "settings.sqlite3"))
     monkeypatch.setenv("SETTINGS_KEY_PATH", str(tmp_path / "state" / "settings.key"))
-    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
-    monkeypatch.setenv("AI_API_KEY", "")
-    monkeypatch.setenv("LEGACY_SEARCH_ENABLED", "false")
+    monkeypatch.setenv("SECURE_COOKIES", "false")
     for module_name in ("main", "config"):
         sys.modules.pop(module_name, None)
-    main = importlib.import_module("main")
-    client = main.app.test_client()
+    return importlib.import_module("main").app
+
+
+def _csrf(client) -> dict[str, str]:
+    cookie = client.get_cookie("medical_csrf")
+    assert cookie is not None
+    return {"X-CSRF-Token": cookie.value}
+
+
+def test_main_auth_roles_health_assets_and_practice(
+    sample_source_tree: Path, tmp_path: Path, monkeypatch
+):
+    app = _load_app(sample_source_tree, tmp_path, monkeypatch)
+    client = app.test_client()
 
     health = client.get("/api/health")
     assert health.status_code == 200
-    assert health.get_json()["engine"] == "sqlite-fts5"
-    assert health.get_json()["legacy"] == {"enabled": False, "status": "disabled"}
+    assert health.get_json()["catalog"]["engine"] == "sqlite-fts5"
+    assert health.get_json()["setup_required"] is True
+    assert client.get("/api/stats").status_code == 401
 
     index = client.get("/")
     assert index.status_code == 200
-    assert "找到原题，沿原题库路径练会它。" in index.get_data(as_text=True)
+    html = index.get_data(as_text=True)
+    assert "把检索、练习与复习" in html
+    assert "找到原题，沿原题库路径练会它" not in html
     assert client.get("/app.js").status_code == 200
-    assert client.get("/api/v2/practice/health").status_code == 200
-    settings = client.get("/api/v2/settings")
-    assert settings.status_code == 200
-    assert settings.get_json()["embedding"]["model"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert "frame-ancestors 'none'" in index.headers["Content-Security-Policy"]
 
-    missing_ai = client.post(
-        "/api/ai/chat",
-        json={"messages": [{"role": "user", "content": "test"}]},
+    setup = client.post(
+        "/api/auth/setup",
+        json={"username": "test-admin", "password": "StrongPass1!"},
     )
-    assert missing_ai.status_code == 503
+    assert setup.status_code == 201
+    assert setup.get_json()["user"]["role"] == "admin"
+    assert client.post(
+        "/api/auth/setup",
+        json={"username": "again", "password": "StrongPass1!"},
+    ).status_code == 409
 
-    main.settings_store.update(
-        {
-            "providers": {
-                "llm": {
-                    "api_url": "https://example.invalid/v1/chat/completions",
-                    "model": "test-chat-model",
-                    "api_key": "sk-test-chat-secret",
-                }
-            }
-        }
+    assert client.get("/api/settings").status_code == 200
+    assert client.get("/api/admin/dashboard").status_code == 200
+    stats = client.get("/api/stats").get_json()
+    assert stats["questions"] == 5
+    search = client.post(
+        "/api/search",
+        json={"query": "细胞膜运输", "include_solution": False},
     )
-    captured = {}
+    assert search.status_code == 200
+    assert "answer" not in search.get_json()["results"][0]
 
-    class FakeResponse:
-        status_code = 200
-        encoding = "utf-8"
-
-        @staticmethod
-        def iter_lines(decode_unicode=True):
-            assert decode_unicode is True
-            return iter(
-                [
-                    'data: {"choices":[{"delta":{"content":"OK"}}]}',
-                    "data: [DONE]",
-                ]
-            )
-
-    def fake_post(url, **kwargs):
-        captured.update({"url": url, **kwargs})
-        return FakeResponse()
-
-    monkeypatch.setattr(main.http_requests, "post", fake_post)
-    chat = client.post(
-        "/api/ai/chat",
-        json={"messages": [{"role": "user", "content": "test"}]},
+    created = client.post(
+        "/api/practice/sessions",
+        headers=_csrf(client),
+        json={"count": 1, "filters": {"question_type": "单选题"}},
     )
-    assert chat.status_code == 200
-    assert "OK" in chat.get_data(as_text=True)
-    assert "sk-test-chat-secret" not in chat.get_data(as_text=True)
-    assert captured["url"] == "https://example.invalid/v1/chat/completions"
-    assert captured["json"]["model"] == "test-chat-model"
-    assert captured["headers"]["Authorization"] == "Bearer sk-test-chat-secret"
+    assert created.status_code == 201
+    assert "answer" not in created.get_json()["items"][0]["question"]
+
+    ordinary = app.test_client()
+    registered = ordinary.post(
+        "/api/auth/register",
+        json={"username": "ordinary-user", "password": "UserStrong1!"},
+    )
+    assert registered.status_code == 201
+    assert registered.get_json()["user"]["role"] == "user"
+    assert ordinary.get("/api/admin/dashboard").status_code == 403
+    assert ordinary.get("/api/settings").status_code == 200
+    wrong_password = ordinary.post(
+        "/api/auth/password",
+        headers=_csrf(ordinary),
+        json={"current_password": "WrongPass1!", "new_password": "RenewedUser2!"},
+    )
+    assert wrong_password.status_code == 409
+    changed_password = ordinary.post(
+        "/api/auth/password",
+        headers=_csrf(ordinary),
+        json={"current_password": "UserStrong1!", "new_password": "RenewedUser2!"},
+    )
+    assert changed_password.status_code == 200
+    assert ordinary.get("/api/auth/me").get_json()["authenticated"] is False
+    assert ordinary.post(
+        "/api/auth/login",
+        json={"username": "ordinary-user", "password": "RenewedUser2!"},
+    ).status_code == 200
+
+
+def test_registration_can_be_disabled_by_admin(
+    sample_source_tree: Path, tmp_path: Path, monkeypatch
+):
+    app = _load_app(sample_source_tree, tmp_path, monkeypatch)
+    admin = app.test_client()
+    admin.post(
+        "/api/auth/setup",
+        json={"username": "test-admin", "password": "StrongPass1!"},
+    )
+    response = admin.put(
+        "/api/admin/settings",
+        headers=_csrf(admin),
+        json={"app": {"allow_registration": False}},
+    )
+    assert response.status_code == 200
+    visitor = app.test_client()
+    denied = visitor.post(
+        "/api/auth/register",
+        json={"username": "blocked-user", "password": "UserStrong1!"},
+    )
+    assert denied.status_code == 409
+    assert "未开放注册" in denied.get_json()["error"]

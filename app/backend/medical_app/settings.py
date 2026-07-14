@@ -13,7 +13,7 @@ from .normalize import display_text
 from .providers import validate_provider_url
 
 
-SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_SCHEMA_REVISION = 1
 DEFAULT_EMBEDDING_API_URL = "https://api.siliconflow.cn/v1/embeddings"
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
@@ -66,13 +66,15 @@ class SettingsStore:
                 """
             )
             connection.execute(
-                "INSERT OR REPLACE INTO settings_meta(key, value) VALUES ('schema_version', ?)",
-                (str(SETTINGS_SCHEMA_VERSION),),
+                "INSERT OR REPLACE INTO settings_meta(key, value) VALUES ('schema_revision', ?)",
+                (str(SETTINGS_SCHEMA_REVISION),),
             )
             defaults = {
                 "semantic_enabled": False,
                 "default_search_mode": "keyword",
                 "search_result_limit": 10,
+                "allow_registration": True,
+                "site_name": "医考知库",
             }
             for key, value in defaults.items():
                 connection.execute(
@@ -121,6 +123,8 @@ class SettingsStore:
             "semantic_enabled": bool(app["semantic_enabled"]),
             "default_search_mode": app["default_search_mode"],
             "search_result_limit": int(app["search_result_limit"]),
+            "allow_registration": bool(app["allow_registration"]),
+            "site_name": str(app["site_name"]),
             "embedding": embedding,
             "llm": llm,
         }
@@ -177,6 +181,17 @@ class SettingsStore:
                 if "search_result_limit" in app_payload:
                     limit = max(1, min(int(app_payload["search_result_limit"]), 50))
                     self._set_app(connection, "search_result_limit", limit)
+                if "allow_registration" in app_payload:
+                    if not isinstance(app_payload["allow_registration"], bool):
+                        raise ValueError("allow_registration must be a boolean")
+                    self._set_app(
+                        connection, "allow_registration", app_payload["allow_registration"]
+                    )
+                if "site_name" in app_payload:
+                    site_name = display_text(app_payload["site_name"])
+                    if not 2 <= len(site_name) <= 30:
+                        raise ValueError("site_name must be between 2 and 30 characters")
+                    self._set_app(connection, "site_name", site_name)
                 for provider in ("embedding", "llm"):
                     if provider in providers_payload:
                         value = providers_payload[provider]

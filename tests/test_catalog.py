@@ -1,10 +1,10 @@
 from pathlib import Path
 
-from flask import Flask
+from flask import Flask, g
 
-from medical_v2.api import create_catalog_blueprint
-from medical_v2.builder import build_catalog
-from medical_v2.catalog import Catalog
+from medical_app.api import create_catalog_blueprint
+from medical_app.builder import build_catalog
+from medical_app.catalog import Catalog
 
 
 def _catalog(sample_source_tree: Path, tmp_path: Path) -> Catalog:
@@ -35,6 +35,20 @@ def test_catalog_search_filters_and_solution_boundary(sample_source_tree: Path, 
     assert "answer" not in fuzzy[0]
     assert "explanation" not in fuzzy[0]
 
+    by_source_type = catalog.search(
+        "细胞膜运输",
+        question_types=["A1型题"],
+        include_solution=False,
+    )
+    assert by_source_type and all(item["type_label"] == "A1型题" for item in by_source_type)
+    ordinary_only = catalog.search(
+        "细胞膜运输",
+        question_types=["单选题"],
+        include_solution=False,
+    )
+    assert ordinary_only and all(item["type_label"] == "单选题" for item in ordinary_only)
+    assert "A1型题" in catalog.stats()["by_question_type"]
+
     assert catalog.search("细胞膜运输", exam="三基考试") == []
     assert catalog.health()["total_questions"] == 5
     assert catalog.stats()["counts"]["question_occurrences"] == 6
@@ -42,6 +56,7 @@ def test_catalog_search_filters_and_solution_boundary(sample_source_tree: Path, 
     grouped = catalog.search("初步诊断是", include_solution=False)
     assert grouped and grouped[0]["groups"]
     assert grouped[0]["groups"][0]["sub_stem"] == "初步诊断是"
+    assert catalog.search("ZZZQXJ987654321") == []
 
 
 def test_catalog_collections_and_blueprint(sample_source_tree: Path, tmp_path: Path):
@@ -64,15 +79,19 @@ def test_catalog_collections_and_blueprint(sample_source_tree: Path, tmp_path: P
     assert {item["name"] for item in leaf["collections"]} == {"第一章.xlsx", "第一章.docx"}
 
     app = Flask(__name__)
+    @app.before_request
+    def authenticate():
+        g.current_user = {"user_id": "usr_test", "role": "user"}
+
     app.register_blueprint(create_catalog_blueprint(catalog.database_path))
     client = app.test_client()
 
-    health = client.get("/api/v2/health")
+    health = client.get("/api/catalog/health")
     assert health.status_code == 200
     assert health.get_json()["engine"] == "sqlite-fts5"
 
     response = client.post(
-        "/api/v2/search",
+        "/api/search",
         json={"query": "细胞膜运输", "include_solution": False},
     )
     assert response.status_code == 200
@@ -80,11 +99,11 @@ def test_catalog_collections_and_blueprint(sample_source_tree: Path, tmp_path: P
     assert payload["count"] >= 1
     assert "answer" not in payload["results"][0]
 
-    missing = client.get("/api/v2/questions/q_missing")
+    missing = client.get("/api/questions/q_missing")
     assert missing.status_code == 404
 
-    assert client.post("/api/v2/search", json=[]).status_code == 400
+    assert client.post("/api/search", json=[]).status_code == 400
     assert client.post(
-        "/api/v2/search",
+        "/api/search",
         json={"query": "细胞膜运输", "include_solution": "false"},
     ).status_code == 400

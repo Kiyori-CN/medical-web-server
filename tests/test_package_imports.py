@@ -20,9 +20,9 @@ def guarded_import(name, *args, **kwargs):
     return original_import(name, *args, **kwargs)
 
 builtins.__import__ = guarded_import
-import medical_v2.api
-import medical_v2.practice_api
-import medical_v2.settings_api
+import medical_app.api
+import medical_app.practice_api
+import medical_app.settings_api
 """
     completed = subprocess.run(
         [sys.executable, "-c", script],

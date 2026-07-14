@@ -107,8 +107,8 @@ def sample_source_tree(tmp_path: Path) -> Path:
         ],
     )
 
-    # Same logical collection as 第一章.xlsx but a different source format.
-    # Real data contains this pattern and both files must share one collection.
+    # Same display name as 第一章.xlsx but a different source format. Each
+    # physical file remains an independent collection.
     docx_path = source_root / "执业医师" / "学科刷题" / "生理学" / "第一章.docx"
     docx_path.parent.mkdir(parents=True, exist_ok=True)
     document = Document()

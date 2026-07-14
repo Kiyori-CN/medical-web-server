@@ -1,51 +1,63 @@
 # 设置与语义搜索
 
-## 运行原则
+## 基本原则
 
-关键词搜题、题库浏览和刷题只依赖本地 SQLite/FTS5。语义搜索是可关闭的增强层：只有管理员启用语义搜索、配置嵌入 API，且激活索引与当前 catalog 的 build、API URL、模型和维度全部一致时才可用。
+关键词搜题、题库浏览、刷题、账号、收藏和错题完全本地运行。语义搜索是可关闭的增强层；外部模型不可用时，keyword 和全部学习功能继续工作。
 
-4 核 4G 服务器不运行 Milvus、Qdrant、Elasticsearch 等独立服务。当前 64,078 道规范题按题目建立 `float32` 归一化矩阵；使用 1024 维时约 250 MiB，由 NumPy mmap 加载并通过操作系统页缓存跨 Gunicorn worker 共享。查询执行精确余弦扫描，BLAS 每 worker 限 1 线程。
+## 权限与存储
 
-## 设置存储与鉴权
+- 网站与模型设置：`state/settings.sqlite3`；
+- API 密钥加密 key：`state/settings.key`；
+- 管理写接口：管理员登录会话 + CSRF；
+- 公共设置接口：只返回非秘密配置、配置状态与掩码；
+- 普通用户：不能看到管理入口，调用管理 API 返回 403；
+- 本地 state 不上传生产，生产独立创建数据库和 key。
 
-- 普通浏览器偏好仅写入浏览器 localStorage，不包含口令或 API 密钥。
-- 服务端设置写入 `state/settings.sqlite3`。
-- API 密钥使用 Fernet 加密；独立 key 写入 `state/settings.key`，生产权限必须为 `600`。
-- `GET /api/v2/settings` 只返回是否已配置和掩码，不返回明文。
-- 管理端点要求 `X-Admin-Token`；生产 `ADMIN_TOKEN` 使用独立的高强度随机值。
-- 管理员口令和密钥不写入浏览器存储；模型供应商错误响应也不得原样回显。
-- API URL 不允许内嵌用户名、密码、query 参数或 URL fragment，密钥只能放在密钥字段。
+API URL 不允许包含用户名、密码、query 密钥或 fragment。供应商错误正文不得原样透传。聊天、截图或日志中出现过的密钥必须先在供应商后台轮换，再通过 HTTPS 设置页录入。
 
-聊天中、截图中或日志中出现过的密钥都视为已泄露，必须先在供应商控制台轮换，再通过设置页录入。不得把真实密钥写入命令历史、Git、文档、测试或构建 manifest。
+## 管理页面
+
+管理员可以配置：
+
+- 站点名称；
+- 是否开放注册；
+- 默认搜索结果数；
+- 是否启用语义搜索；
+- 默认 keyword / semantic / hybrid；
+- 嵌入 API URL、模型、维度和密钥；
+- 大模型 API URL、模型和密钥；
+- 用户创建、启停和角色状态；
+- 用户角色调整、密码重置和既有会话撤销；
+- catalog、账号、练习和向量运行概览。
 
 ## 默认嵌入配置
 
 ```text
-API URL:   https://api.siliconflow.cn/v1/embeddings
-模型:      Qwen/Qwen3-Embedding-0.6B
-维度:      1024
-切分单位:  一道规范题一个向量
-嵌入文本:  题型 + 题干 + 有序选项
-排除内容:  答案 + 考点解析
+API URL: https://api.siliconflow.cn/v1/embeddings
+模型: Qwen/Qwen3-Embedding-0.6B
+维度: 1024
+单位: 一道规范题
+文本: 题型 + 题干 + 有序选项
+排除: 答案 + 考点 + 解析
 ```
 
-A3/A4 子题仍一题一个向量；题干保留原始完整病例信息，不把多道子题拼成跨题 chunk。文件路径和原题号是刷题 provenance，不作为新的向量单位。
+A3/A4 子题各自生成向量，保留完整病例题干，不跨题拼接。文件路径和原题号只用于来源追溯，不重复构建向量。
 
-## 本地构建
+## 构建流程
 
-1. 启动网站，在设置页用开发管理员口令解锁。
-2. 填入已轮换的嵌入 API 密钥、URL、模型和维度并保存，先执行连接测试。
-3. 从当前 catalog 构建并激活可恢复索引：
+1. 管理员在设置页保存已轮换的嵌入配置；
+2. 执行连接测试；
+3. 构建并激活索引：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\build_vectors.py --activate
 ```
 
-构建产物：
+产物：
 
 ```text
-knowledge-base/v2/
-  vector-indexes/<vec_build_id>/
+knowledge-base/
+  vector-indexes/<vector_id>/
     embeddings.npy
     question_ids.json
     build-state.json
@@ -53,29 +65,42 @@ knowledge-base/v2/
   vector-current.json
 ```
 
-每批写入矩阵后都会 flush 并原子更新进度；中断后重复命令从 `next_index` 继续。完整构建会检查题目 ID、矩阵形状、有限值和单位范数，只有 `--activate` 才原子切换指针。
+构建中断后可从 `next_index` 继续。激活前检查题目 ID、矩阵形状、有限值、单位范数和文件哈希。
 
-## 搜索模式
+## 检索模式
 
-- `keyword`：精确题干、原题号、FTS5，始终可用。
-- `semantic`：调用已配置 API 生成查询向量，扫描 mmap 矩阵并返回余弦排序。
-- `hybrid`：对关键词和语义候选做 RRF 融合，精确题干和题号结果保持强优先级。
+- `keyword`：题号、精确片段、FTS5 与结构化过滤；
+- `semantic`：查询嵌入与 mmap 矩阵的归一化点积；
+- `hybrid`：关键词与语义候选的 RRF 融合，精确题号保持优先。
 
-查询向量在进程内使用小型 LRU 缓存。模型 API 故障、索引缺失或配置不兼容时，语义接口明确返回 `semantic_unavailable`，关键词功能不受影响。
+题型筛选使用 catalog 的实际来源题型标签。前端标签、`question_types` 请求数组、关键词过滤和 semantic/hybrid 候选收敛都使用同一规范化 raw type；例如只选择 `单选题` 不会返回 `A1型题`、`A2型题` 等其他标签，若需要这些细分题型可分别多选。空数组表示不限制题型。
 
-## 大模型设置
+搜索题型、搜索范围和显示内容三组的第一个标签固定为“全部”。默认只显示“全部”选中，所有未勾选的具体标签都使用白色中性背景；从“全部”状态点击某个具体标签会切换为仅该标签，之后可继续多选；重新选择“全部”恢复该组全部选项的全选视觉状态。未选中的搜索模式也保持白色中性背景，只有当前选中标签使用对应彩色。搜索设置工具栏提供“重置”和“收起/展开”两个操作，重置恢复关键词模式、三个“全部”状态和展开状态；“全部”只负责前端状态，不会作为题型或字段值发送，题型全选时请求使用空数组表示不限制。默认值会写回浏览器偏好，当前已有查询会按新设置重新检索。
 
-第三方大模型 URL、模型和密钥使用同一套加密设置。现有 `/api/ai/chat` 优先读取该设置，仅在迁移期间回退到旧环境变量；未配置密钥时返回 503。上游错误正文不得透传给浏览器。
+搜索结果的选项、考点还原和标准解析正文统一使用黑色字色。keyword 模式使用经过 HTML 转义和正则转义的查询词，在题干、选项、答案、考点还原和标准解析中以珊瑚红高亮；semantic / hybrid 不进行关键词高亮。
 
-## 生产迁移
+语义索引必须匹配当前 catalog ID、题目 ID 哈希、API URL、模型和维度。任一不匹配都返回明确的 unavailable 状态，不自动使用错误索引。
 
-向量索引是独立数据制品，不能随代码包或 Git 发布。生产迁移前后必须核对：
+## 4 核 4G 资源预算
 
-- `vec_build_id`、catalog build ID、模型、API URL、维度和题量；
-- `embeddings.npy` 与 `question_ids.json` 哈希及 manifest 校验；
-- `settings.sqlite3`、`settings.key` 权限与备份；
-- `vector-current.json` 原指针和回滚指针；
-- keyword、semantic、hybrid 的代表查询、零结果和延迟；
-- 进程 RSS、磁盘空间、并发查询以及服务日志。
+- 64,078 × 1024 × float32 约 250 MiB；
+- NumPy mmap 加载；
+- 3 个同步 Gunicorn worker；
+- preload；
+- 每 worker 单线程 BLAS；
+- 查询向量使用小型进程内 LRU；
+- 不部署 Milvus、Qdrant、Elasticsearch 等独立服务。
 
-旧 v1 向量库和 catalog 旧 build 在回滚窗口内保持不变。
+## 验收
+
+真实向量完成后核对：
+
+- 64,078 行、1024 维、float32；
+- 所有值有限且行向量单位范数；
+- catalog ID、API URL、模型和维度完全匹配；
+- keyword、semantic、hybrid 代表查询；
+- 零结果与语义关闭边界；
+- 查询延迟、Gunicorn RSS、并发查询和日志；
+- 管理读取始终只显示密钥掩码。
+
+当前聊天中出现过的 SiliconFlow 密钥不得使用。真实构建必须等待用户轮换后从设置页录入。

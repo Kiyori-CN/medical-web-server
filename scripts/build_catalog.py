@@ -11,16 +11,16 @@ BACKEND_ROOT = REPO_ROOT / "app" / "backend"
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from medical_v2.builder import activate_build, build_catalog  # noqa: E402
+from medical_app.builder import activate_build, build_catalog  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a versioned medical v2 SQLite catalog")
+    parser = argparse.ArgumentParser(description="Build the medical SQLite catalog")
     parser.add_argument("--source", type=Path, default=REPO_ROOT / "data")
     parser.add_argument(
         "--builds-root",
         type=Path,
-        default=REPO_ROOT / "knowledge-base" / "v2" / "builds",
+        default=REPO_ROOT / "knowledge-base" / "builds",
     )
     parser.add_argument("--force", action="store_true", help="Rebuild an existing build ID")
     parser.add_argument(
@@ -37,7 +37,7 @@ def main() -> int:
     summary = {
         "build_id": manifest["build_id"],
         "snapshot_id": manifest["snapshot_id"],
-        "schema_version": manifest["schema_version"],
+        "schema_revision": manifest["schema_revision"],
         "stats": manifest["stats"],
         "reused": manifest.get("reused", False),
     }

@@ -5,7 +5,7 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 branch = true
-source = ["app/backend/medical_v2"]
+source = ["app/backend/medical_app"]
 
 [tool.coverage.report]
 show_missing = true

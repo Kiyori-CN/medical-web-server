@@ -3,12 +3,15 @@
 set -euo pipefail
 
 export FLASK_ENV=production
-export KB_PATH=/srv/projects/medical-web-server/knowledge-base/西医题库
-: "${EMBED_API_KEY:?Set EMBED_API_KEY in the environment or /etc/medical-exam.env}"
-export EMBED_API_URL=https://api.siliconflow.cn/v1/embeddings
-export EMBED_MODEL=BAAI/bge-m3
-: "${LLM_API_KEY:?Set LLM_API_KEY in the environment or /etc/medical-exam.env}"
-export LLM_API_URL=https://api.siliconflow.cn/v1/chat/completions
+export KNOWLEDGE_BASE_ROOT=/srv/projects/medical-web-server/knowledge-base
+export APP_DB=/srv/projects/medical-web-server/state/app.sqlite3
+export SETTINGS_DB=/srv/projects/medical-web-server/state/settings.sqlite3
+export SETTINGS_KEY_PATH=/srv/projects/medical-web-server/state/settings.key
+export SECURE_COOKIES=true
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 
 BACKEND_DIR=/srv/projects/medical-web-server/app/backend
 

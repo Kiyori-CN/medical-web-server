@@ -6,13 +6,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from medical_v2.builder import build_catalog
-from medical_v2.catalog import Catalog
-from medical_v2.providers import EmbeddingClient
-from medical_v2.semantic import SemanticSearchService, SemanticSearchUnavailable
-from medical_v2.settings import SettingsStore
-from medical_v2.vector_builder import activate_vector_index, build_vector_index
-from medical_v2.vectors import VectorIndexManager
+from medical_app.builder import build_catalog
+from medical_app.catalog import Catalog
+from medical_app.providers import EmbeddingClient
+from medical_app.semantic import SemanticSearchService, SemanticSearchUnavailable
+from medical_app.settings import SettingsStore
+from medical_app.vector_builder import activate_vector_index, build_vector_index
+from medical_app.vectors import VectorIndexManager
 
 
 def _fake_embed(self, texts: list[str]) -> np.ndarray:
@@ -89,6 +89,18 @@ def test_vector_build_resume_contract_and_semantic_search(
     assert metadata["vector_index"]["build_id"] == built["build_id"]
     assert service.status()["status"] == "ready"
     assert VectorIndexManager(knowledge_root).status()["status"] == "ready"
+
+    hybrid_results, hybrid_metadata = service.search(
+        "细胞膜运输",
+        mode="hybrid",
+        limit=3,
+        include_solution=False,
+        filters={},
+    )
+    assert hybrid_results
+    assert hybrid_metadata["mode"] == "hybrid"
+    assert hybrid_metadata["vector_index"]["build_id"] == built["build_id"]
+    assert all("answer" not in result for result in hybrid_results)
 
     # API-provided JSON numbers can arrive as strings; the service must clamp
     # them before sizing candidate sets.

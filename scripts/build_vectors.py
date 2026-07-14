@@ -12,20 +12,20 @@ BACKEND_ROOT = REPO_ROOT / "app" / "backend"
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from medical_v2.catalog import resolve_catalog_path  # noqa: E402
-from medical_v2.settings import (  # noqa: E402
+from medical_app.catalog import resolve_catalog_path  # noqa: E402
+from medical_app.settings import (  # noqa: E402
     DEFAULT_EMBEDDING_API_URL,
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     SettingsStore,
 )
-from medical_v2.vector_builder import activate_vector_index, build_vector_index  # noqa: E402
+from medical_app.vector_builder import activate_vector_index, build_vector_index  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a resumable question-level vector index")
     parser.add_argument(
-        "--knowledge-base-root", type=Path, default=REPO_ROOT / "knowledge-base" / "v2"
+        "--knowledge-base-root", type=Path, default=REPO_ROOT / "knowledge-base"
     )
     parser.add_argument("--catalog-db", type=Path)
     parser.add_argument("--settings-db", type=Path, default=REPO_ROOT / "state" / "settings.sqlite3")

@@ -13,7 +13,7 @@ import numpy as np
 from .providers import EmbeddingClient, ProviderError, validate_provider_url
 
 
-VECTOR_TEXT_VERSION = 1
+VECTOR_TEXT_REVISION = 1
 
 
 def _utc_now() -> str:
@@ -42,7 +42,7 @@ def _catalog_items(database_path: Path) -> tuple[dict[str, Any], list[dict[str, 
     try:
         run = connection.execute(
             """
-            SELECT snapshot_id, schema_version FROM import_runs
+            SELECT snapshot_id, schema_revision FROM import_runs
             WHERE status = 'complete' ORDER BY completed_at DESC LIMIT 1
             """
         ).fetchone()
@@ -75,7 +75,7 @@ def _catalog_items(database_path: Path) -> tuple[dict[str, Any], list[dict[str, 
         question["embedding_text"] = "\n".join(parts)
     return {
         "snapshot_id": run["snapshot_id"],
-        "catalog_schema_version": run["schema_version"],
+        "catalog_schema_revision": run["schema_revision"],
         "catalog_build_id": database_path.parent.name,
     }, questions
 
@@ -115,7 +115,7 @@ def build_vector_index(
             "api_url": api_url,
             "model": model,
             "dimensions": dimensions,
-            "text_version": VECTOR_TEXT_VERSION,
+            "text_revision": VECTOR_TEXT_REVISION,
             "question_ids_sha256": ids_hash,
         },
         length=32,
@@ -147,7 +147,7 @@ def build_vector_index(
         "dimensions": dimensions,
         "count": len(items),
         "question_ids_sha256": ids_hash,
-        "text_version": VECTOR_TEXT_VERSION,
+        "text_revision": VECTOR_TEXT_REVISION,
     }
     if state_path.is_file() and matrix_path.is_file() and ids_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -232,7 +232,7 @@ def build_vector_index(
         "dtype": "float32",
         "normalized": True,
         "count": len(items),
-        "text_version": VECTOR_TEXT_VERSION,
+        "text_revision": VECTOR_TEXT_REVISION,
         "question_ids_sha256": ids_hash,
         "matrix": "embeddings.npy",
         "question_ids": "question_ids.json",

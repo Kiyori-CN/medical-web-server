@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+from flask import Blueprint, g, jsonify, request
+
+from .auth import csrf_required, login_required
+from .catalog import Catalog, CatalogUnavailable
+from .practice import (
+    PracticeConflict,
+    PracticeForbidden,
+    PracticeNotFound,
+    PracticeStore,
+    PracticeUnavailable,
+)
+
+
+def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
+    blueprint = Blueprint("practice", __name__, url_prefix="/api")
+    catalog = Catalog(catalog_path)
+    PracticeStore(app_database_path, catalog, profile_id="system").initialize()
+
+    def store() -> PracticeStore:
+        return PracticeStore(
+            app_database_path,
+            catalog,
+            profile_id=g.current_user["user_id"],
+        )
+
+    @blueprint.errorhandler(CatalogUnavailable)
+    @blueprint.errorhandler(PracticeUnavailable)
+    def handle_unavailable(error):
+        return jsonify({"error": str(error), "status": "unavailable"}), 503
+
+    @blueprint.errorhandler(PracticeNotFound)
+    def handle_not_found(error):
+        return jsonify({"error": str(error)}), 404
+
+    @blueprint.errorhandler(PracticeConflict)
+    def handle_conflict(error):
+        return jsonify({"error": str(error)}), 409
+
+    @blueprint.errorhandler(PracticeForbidden)
+    def handle_forbidden(error):
+        return jsonify({"error": str(error)}), 403
+
+    @blueprint.errorhandler(ValueError)
+    def handle_value_error(error):
+        return jsonify({"error": str(error)}), 400
+
+    @blueprint.get("/practice/health")
+    @login_required
+    def health():
+        payload = store().health()
+        return jsonify(payload), 200 if payload["status"] == "healthy" else 503
+
+    @blueprint.post("/practice/sessions")
+    @login_required
+    @csrf_required
+    def create_session():
+        data = _json_object()
+        filters = data.get("filters") if isinstance(data.get("filters"), dict) else {}
+        session = store().create_session(
+            count=data.get("count", None if data.get("collection_id") else 10),
+            collection_id=data.get("collection_id", ""),
+            filters=filters,
+            mode=data.get("mode", "practice"),
+            order_mode=data.get("order_mode", "sequential"),
+            start_position=data.get("start_position", 1),
+            saved_kind=_saved_kind(data.get("saved_kind", "")),
+        )
+        return jsonify(session), 201
+
+    @blueprint.get("/practice/collections/<collection_id>/outline")
+    @login_required
+    def collection_outline(collection_id: str):
+        return jsonify(store().collection_outline(collection_id))
+
+    @blueprint.post("/practice/collections/<collection_id>/progress/reset")
+    @login_required
+    @csrf_required
+    def reset_collection_progress(collection_id: str):
+        return jsonify(store().reset_collection_progress(collection_id))
+
+    @blueprint.get("/practice/sessions/<session_id>")
+    @login_required
+    def session_detail(session_id: str):
+        return jsonify(store().get_session(session_id))
+
+    @blueprint.post("/practice/sessions/<session_id>/answers")
+    @login_required
+    @csrf_required
+    def submit_answer(session_id: str):
+        data = _json_object()
+        if "position" not in data or "answer" not in data:
+            return jsonify({"error": "position and answer are required"}), 400
+        result = store().submit_answer(
+            session_id,
+            position=data["position"],
+            answer=data["answer"],
+            elapsed_ms=data.get("elapsed_ms"),
+        )
+        return jsonify(result)
+
+    @blueprint.post("/practice/sessions/<session_id>/finish")
+    @login_required
+    @csrf_required
+    def finish_session(session_id: str):
+        return jsonify(store().finish_session(session_id))
+
+    @blueprint.get("/study/<kind>/library")
+    @login_required
+    def saved_library(kind: str):
+        return jsonify(
+            store().saved_library(_saved_kind(kind), request.args.get("parent", ""))
+        )
+
+    @blueprint.get("/study/<kind>/collections/<collection_id>/outline")
+    @login_required
+    def saved_outline(kind: str, collection_id: str):
+        return jsonify(store().saved_outline(_saved_kind(kind), collection_id))
+
+    @blueprint.post("/study/favorites")
+    @login_required
+    @csrf_required
+    def add_favorite():
+        data = _json_object()
+        occurrence_id = data.get("occurrence_id")
+        item = store().add_favorite(
+            occurrence_id=int(occurrence_id) if occurrence_id not in (None, "") else None,
+            question_id=data.get("question_id", ""),
+        )
+        return jsonify(item), 201
+
+    @blueprint.post("/study/favorites/toggle")
+    @login_required
+    @csrf_required
+    def toggle_favorite():
+        data = _json_object()
+        occurrence_id = data.get("occurrence_id")
+        item = store().toggle_favorite(
+            occurrence_id=int(occurrence_id) if occurrence_id not in (None, "") else None,
+            question_id=data.get("question_id", ""),
+        )
+        return jsonify(item)
+
+    @blueprint.get("/study/favorites/status")
+    @login_required
+    def favorite_status():
+        raw_ids = str(request.args.get("occurrence_ids", "")).split(",")
+        occurrence_ids = [int(value) for value in raw_ids if value.strip()]
+        return jsonify(
+            {"occurrence_ids": store().favorite_occurrence_ids(occurrence_ids)}
+        )
+
+    @blueprint.delete("/study/<kind>/<path:item_key>")
+    @login_required
+    @csrf_required
+    def remove_saved(kind: str, item_key: str):
+        removed = store().remove_saved_item(_saved_kind(kind), item_key)
+        return jsonify({"removed": removed})
+
+    @blueprint.get("/study/comments")
+    @login_required
+    def list_comments():
+        payload = store().list_comments(
+            request.args.get("occurrence_id"),
+            viewer_is_admin=g.current_user.get("role") == "admin",
+        )
+        return jsonify(payload)
+
+    @blueprint.post("/study/comments")
+    @login_required
+    @csrf_required
+    def create_comment():
+        data = _json_object()
+        item = store().create_comment(
+            data.get("occurrence_id"),
+            author_name=g.current_user.get("username", ""),
+            body=data.get("body"),
+        )
+        return jsonify(item), 201
+
+    @blueprint.delete("/study/comments/<comment_id>")
+    @login_required
+    @csrf_required
+    def delete_comment(comment_id: str):
+        removed = store().delete_comment(
+            comment_id, is_admin=g.current_user.get("role") == "admin"
+        )
+        return jsonify({"removed": removed})
+
+    return blueprint
+
+
+def _saved_kind(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "favorite": "favorite",
+        "favorites": "favorite",
+        "wrong": "wrong",
+        "wrongs": "wrong",
+        "": "",
+    }
+    if normalized not in aliases:
+        raise ValueError("saved kind must be favorites or wrong")
+    return aliases[normalized]
+
+
+def _json_object() -> dict:
+    data = request.get_json(silent=True)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("JSON body must be an object")
+    return data

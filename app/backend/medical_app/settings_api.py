@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import hmac
 from collections.abc import Callable
 from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from .auth import admin_required, csrf_required, login_required
 from .providers import EmbeddingClient, ProviderError, test_chat_provider
 from .settings import SettingsStore, SettingsUnavailable
 
@@ -13,11 +13,10 @@ from .settings import SettingsStore, SettingsUnavailable
 def create_settings_blueprint(
     store: SettingsStore,
     *,
-    admin_token: str,
     vector_status: Callable[[], dict[str, Any]] | None = None,
     provider_timeout: int = 30,
 ) -> Blueprint:
-    blueprint = Blueprint("medical_v2_settings", __name__, url_prefix="/api/v2")
+    blueprint = Blueprint("settings", __name__, url_prefix="/api")
 
     @blueprint.errorhandler(SettingsUnavailable)
     def handle_unavailable(error):
@@ -32,36 +31,34 @@ def create_settings_blueprint(
         return jsonify({"error": str(error)}), 400
 
     @blueprint.get("/settings")
+    @login_required
     def public_settings():
         payload = store.public_settings()
-        payload["admin_enabled"] = bool(admin_token)
         payload["vector_index"] = vector_status() if vector_status else {"status": "unavailable"}
         return jsonify(payload)
 
     @blueprint.get("/admin/settings")
+    @admin_required
     def admin_settings():
-        denied = _authorize(admin_token)
-        if denied:
-            return denied
         payload = store.admin_settings()
         payload["vector_index"] = vector_status() if vector_status else {"status": "unavailable"}
         return jsonify(payload)
 
     @blueprint.put("/admin/settings")
+    @admin_required
+    @csrf_required
     def update_settings():
-        denied = _authorize(admin_token)
-        if denied:
-            return denied
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             raise ValueError("JSON body must be an object")
-        return jsonify(store.update(data))
+        payload = store.update(data)
+        payload["vector_index"] = vector_status() if vector_status else {"status": "unavailable"}
+        return jsonify(payload)
 
     @blueprint.post("/admin/settings/test")
+    @admin_required
+    @csrf_required
     def test_provider():
-        denied = _authorize(admin_token)
-        if denied:
-            return denied
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             raise ValueError("JSON body must be an object")
@@ -88,12 +85,3 @@ def create_settings_blueprint(
         raise ValueError("provider must be embedding or llm")
 
     return blueprint
-
-
-def _authorize(admin_token: str):
-    if not admin_token:
-        return jsonify({"error": "Admin settings are disabled"}), 503
-    provided = request.headers.get("X-Admin-Token", "")
-    if not provided or not hmac.compare_digest(provided, admin_token):
-        return jsonify({"error": "Admin authorization required"}), 401
-    return None

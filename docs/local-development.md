@@ -1,10 +1,8 @@
-# 本地开发工作流
+# 本地开发
 
-## 原则
+## 权威流程
 
-`D:\10_Project\medical-web-server` 是唯一开发工作区。所有源码、文档、测试和迁移工具都在本地完成；GitHub `main` 是唯一发布源；服务器只做部署、运行和生产验收。
-
-这一模式适合本项目，因为题库和数据库都是本地文件，不依赖第三方登录或远程业务数据接口。它也让 Windows 上的 Excel/Word 数据处理和离线测试更直接。
+`D:\10_Project\medical-web-server` 是唯一开发工作区。源码、文档、数据构建、测试和浏览器验收都在本地完成；GitHub `main` 是唯一发布源；服务器只做部署镜像、生产运行和最终验收。
 
 ## 开始任务
 
@@ -15,7 +13,7 @@ git fetch origin --prune
 git merge --ff-only origin/main
 ```
 
-如果存在未提交修改，先确认归属并保留。`data/` 是用户本地题库，不得清理、覆盖或提交。
+存在未提交修改时必须保留并避免覆盖。禁止清理 `data/`、`knowledge-base/` 或 `state/`。
 
 ## Python 环境
 
@@ -25,72 +23,104 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-本地配置放在被忽略的 `.env.local` 或环境变量中，不要修改 `.env.example` 来保存个人路径或秘密。
+本地秘密只放在被忽略的环境变量、设置数据库或 `.env.local`。不得把真实 API 密钥写入 `.env.example`。
 
-开发环境的设置页管理员口令默认为 `local-admin`，只用于本机。供应商密钥必须先在控制台轮换，再通过设置页录入；不得粘贴到 PowerShell 命令、测试、文档或 Git 文件。
-
-## 改动边界
-
-一次改动应只承担一个可验证目标，例如：
-
-- 一个导入器或 schema 版本；
-- 一组数据质量规则；
-- 一类搜索接口；
-- 一个刷题闭环；
-- 一次前端交互改进。
-
-不要在同一个提交中同时重写数据模型、搜索算法、前端和部署脚本。
-
-## 本地验证
-
-构建并启动 v2：
+## 构建数据
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\build_catalog.py --activate
-.\.venv\Scripts\python.exe scripts\init_practice.py
+.\.venv\Scripts\python.exe scripts\init_app.py
+```
+
+`build_catalog.py` 只读扫描 `data/` 并写入新的不可变 build。只有完整性、外键、统计和报告全部通过后，`--activate` 才更新 `knowledge-base/current.json`。
+
+`init_app.py` 初始化：
+
+- `state/app.sqlite3` 的账号、会话、文件刷题状态、收藏、错题和评论表；
+- `state/settings.sqlite3` 的网站与模型设置；
+- `state/settings.key` 的独立加密 key。
+
+全新状态库不创建默认账号。首次打开网站时通过一次性页面创建首位管理员。
+
+## 启动
+
+```powershell
 $env:FLASK_ENV = "development"
-$env:LEGACY_SEARCH_ENABLED = "false"
+$env:SECURE_COOKIES = "false"
 .\.venv\Scripts\python.exe app\backend\main.py
 ```
 
-`build_catalog.py` 只读扫描 `data/`，输出 manifest、导入报告和冲突报告；只有构建数据库通过完整性和外键检查后，`--activate` 才更新 `current.json`。
+本地地址：`http://127.0.0.1:5001/`。
 
-schema v4 把每个具体 Excel/Word 文件作为独立 collection。`init_practice.py` 会把旧 practice schema v1 原位迁移到 v2；运行前应停止本地服务，并使用 SQLite backup API 备份状态库，不能只复制一个仍在写入的数据库文件。
+## 语义向量
 
-需要语义搜索时，启动网站后在设置页保存并测试嵌入配置，再执行：
+先在管理员设置页保存并测试已轮换的嵌入配置，再执行：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\build_vectors.py --activate
 ```
 
-该命令从加密设置库读取密钥，按题目批量构建可恢复 mmap 索引，不在 stdout、manifest 或 Git 中写入密钥。中断后重复运行会继续未完成批次；改变 catalog、API URL、模型或维度会产生新的 vector build。
+脚本从加密设置库读取密钥，按批次 flush 矩阵并原子更新进度。改变 catalog、API URL、模型或维度会生成新的 vector build。stdout、manifest 和 Git 中不得出现密钥。
 
-最低检查：
+## 开发粒度
+
+每项改动应形成完整可验证闭环，例如：
+
+- 一个导入或质量规则；
+- 一个 API 与其安全测试；
+- 一种刷题模式；
+- 一组响应式 UI 改进；
+- 一项部署或文档规范。
+
+功能、API、路径、安全边界或部署方式变化时，同步修改 README、PROJECT、AGENTS、对应 docs 和项目技能。
+
+## 自动化验证
 
 ```powershell
+git status --short --branch
 git diff --check
-python -m py_compile app\backend\config.py app\backend\gunicorn_config.py app\backend\ikbs_pysearch.py app\backend\main.py app\backend\incremental_index.py app\backend\update_index.py
-python -m compileall -q app\backend\medical_v2 scripts
+python -m py_compile app\backend\config.py app\backend\gunicorn_config.py app\backend\main.py
+python -m compileall -q app\backend\medical_app scripts
 node --check public\app.js
 python -m pytest
 ```
 
-功能实现后应补充：
+测试只使用脱敏小型 fixture。真实题库不能复制到 `tests/`。
 
-- 单元测试：规范化、题型、答案和选项处理；
-- 数据测试：幂等导入、去重、冲突、来源关系和统计对账；
-- API 测试：搜索、题集、题目详情、刷题提交和答案隐藏；
-- 安全测试：管理员鉴权、密钥加密、公共/错误响应不泄密；
-- 向量测试：恢复、复用、维度、catalog 兼容和 semantic/hybrid；
-- 前端验收：桌面和移动端的目录、指定题号、提交、刷新恢复、设置和搜题完整流程。
+## 浏览器验收
 
-测试只能使用小型脱敏 fixture。不得把真实题库复制到 `tests/` 或提交 GitHub。
+使用本地真实 catalog，至少覆盖：
 
-真实数据验收至少核对：2,127 个 source/collection、123,564 occurrences、64,078 questions/FTS、67,650 versions、1,443 groups、3,732 members、4 conflicts、`integrity_check=ok`、外键 0。再抽查 `专硕考研（306临床医学综合能力）/历年真题/2026/2026.xlsx` 的 165 个题号、从指定题号出题和 occurrence 原版本判分。
+- 顶层、学科、系统和年份固定顺序；
+- 2026 文件 165 题及题型目录；
+- 练习模式必须提交后才显示解析；
+- 快刷选错停留、选对自动前进；
+- 测试自动前进且交卷前无答案/对错，交卷后显示成绩；
+- 背题直接显示答案解析；
+- 未答交卷、刷新恢复、计时；
+- 收藏、错题路径与删除；
+- 当前文件刷题状态重置、确认弹窗、账号/文件隔离，以及历史试卷、收藏、错题和评论不受影响；
+- 未解锁答案解析时不显示或加载评论；解锁后验证标准解析下方的评论加载、空内容和长度校验、发表、作者删除与管理员删除；
+- 收藏后再次点击可取消，错题文件目录可直接删除单题；
+- 未提交选项灰色，提交后错误红色、正确绿色；
+- 未提交也能进入下一题，返回后草稿仍在；
+- 管理员和普通用户权限；
+- 搜题、零结果和收藏搜索结果；
+- 搜题结果的题干（含选项）、答案、考点还原、标准解析四个显示开关、浏览器偏好恢复、无答案请求，以及答案开启时的正确选项绿色状态；
+- 搜题结果选项、考点还原和标准解析的黑色正文，以及关键词模式下题干、选项、答案、考点和解析的红色命中高亮；
+- 搜索标签按分组位置复用配色顺序，以及设置面板整体重置、收起/展开和状态恢复；
+- 搜索范围四项多选、至少一项约束、字段级关键词结果、未选择题干时自动退回关键词模式，以及与显示内容一致的固定宽度彩色标签布局；
+- catalog 实际来源题型标签（含 A1/A2/A3-A4/B/X 等细分类型）完整显示，题型/范围/显示内容首项“全部”默认唯一视觉选中，具体标签多选、重置后恢复“全部”、零选择代表全部、浏览器偏好恢复，以及关键词/语义/混合三种模式下与结果徽标一致的精确 `question_types` 过滤；
+- 题库、搜题、收藏和错题页只显示对应的红色栏目名，且顶部空间无重复黑色标题；
+- `390×844` 沉浸式刷题、左右滑动、题号抽屉下拉关闭、自适应底栏及“题号—提交答案—收藏”顺序；
+- `1440×900` 题目/题号双栏、管理页和搜题结果；
+- 无新增前端异常或服务端错误。
 
 ## 提交与推送
 
-只有用户明确要求时才提交和推送：
+本地 `FLASK_ENV=development` 启动时启用 Flask 自动重载；如果使用生产环境变量或外部进程管理器运行本地服务，修改后端 Python 文件后必须重启该进程，避免继续使用旧内存代码。前端静态资源仍需刷新页面才能重新读取。
+
+用户已授权本项目最终发布和部署时，仍应精确暂存源码与文档：
 
 ```powershell
 git status --short --branch
@@ -99,12 +129,13 @@ git diff --stat
 git add <明确文件>
 git commit -m "<明确说明>"
 git push origin main
+git rev-parse HEAD
 ```
 
-不要使用 `git add .` 无差别加入本地文件。推送后记录完整提交哈希，部署必须绑定该哈希。
+不要使用 `git add .` 无差别加入本地文件。确认 `data/`、catalog、state、日志和密钥均未进入提交。
 
 ## 服务器边界
 
-服务器上的 `/srv/projects/medical-web-server/repo` 只是部署镜像。部署时可以快进、归档和验证，但不能在那里进行常规开发。生产题库、状态、环境文件和日志不随 Git 更新。
+所有服务器操作使用 Tencent Cloud wrapper。`/srv/projects/medical-web-server/repo` 只允许快进到已发布的 GitHub 精确提交；生产运行目录不能做常规源码编辑。
 
-部署流程见 `docs/deployment.md`。
+部署见 [deployment.md](deployment.md)。

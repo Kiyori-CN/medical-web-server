@@ -10,9 +10,11 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 from .normalize import display_text, extract_source_code, key_text
+from .ordering import question_type_label, sort_library_entries
 
 
-_SEGMENT_RE = re.compile(r"[\w\u3400-\u4dbf\u4e00-\u9fff]+", re.UNICODE)
+_SEGMENT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+|[^\W_]+", re.UNICODE)
+SEARCH_FIELDS = ("stem", "answer", "point", "explanation")
 
 
 class CatalogUnavailable(RuntimeError):
@@ -31,7 +33,7 @@ def resolve_catalog_path(
         return root / "builds" / "unavailable" / "catalog.sqlite3"
     data = json.loads(pointer.read_text(encoding="utf-8"))
     build_id = display_text(data.get("build_id"))
-    if not re.fullmatch(r"v\d+_[a-f0-9]{20,64}", build_id):
+    if not re.fullmatch(r"catalog_[a-f0-9]{24,64}", build_id):
         raise CatalogUnavailable(f"Invalid build_id in {pointer}: {build_id!r}")
     return root / "builds" / build_id / "catalog.sqlite3"
 
@@ -57,14 +59,14 @@ class Catalog:
 
     def health(self) -> dict[str, Any]:
         with self.connect() as connection:
-            schema_version = connection.execute(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            schema_revision = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_revision'"
             ).fetchone()
             total_questions = connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
         return {
             "status": "healthy",
             "engine": "sqlite-fts5",
-            "schema_version": int(schema_version[0]) if schema_version else None,
+            "schema_revision": int(schema_revision[0]) if schema_revision else None,
             "total_questions": total_questions,
             "integrity_validation": "build-time",
         }
@@ -73,7 +75,7 @@ class Catalog:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT snapshot_id, schema_version
+                SELECT snapshot_id, schema_revision
                 FROM import_runs
                 WHERE status = 'complete'
                 ORDER BY completed_at DESC LIMIT 1
@@ -84,7 +86,7 @@ class Catalog:
         return {
             "catalog_build_id": self.database_path.parent.name,
             "snapshot_id": row["snapshot_id"],
-            "catalog_schema_version": row["schema_version"],
+            "catalog_schema_revision": row["schema_revision"],
         }
 
     def stats(self) -> dict[str, Any]:
@@ -111,6 +113,17 @@ class Catalog:
                     """
                 )
             }
+            by_question_type: dict[str, int] = {}
+            for row in connection.execute(
+                """
+                SELECT raw_type, canonical_type, COUNT(*) AS count
+                FROM questions
+                GROUP BY raw_type, canonical_type
+                ORDER BY raw_type, canonical_type
+                """
+            ):
+                label = question_type_label(row["raw_type"], row["canonical_type"])
+                by_question_type[label] = by_question_type.get(label, 0) + row["count"]
             by_exam = {
                 row["exam"]: row["count"]
                 for row in connection.execute(
@@ -122,7 +135,12 @@ class Catalog:
                     """
                 )
             }
-        return {"counts": counts, "by_type": by_type, "by_exam": by_exam}
+        return {
+            "counts": counts,
+            "by_type": by_type,
+            "by_question_type": by_question_type,
+            "by_exam": by_exam,
+        }
 
     def search(
         self,
@@ -130,11 +148,14 @@ class Catalog:
         *,
         limit: int = 10,
         canonical_type: str = "",
+        canonical_types: list[str] | tuple[str, ...] | None = None,
+        question_types: list[str] | tuple[str, ...] | None = None,
         exam: str = "",
         collection_kind: str = "",
         subject: str = "",
         year: int | None = None,
         include_solution: bool = True,
+        search_fields: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         query = display_text(query)
         if not query:
@@ -142,8 +163,15 @@ class Catalog:
         if len(query) > 500:
             raise ValueError("query is too long; maximum length is 500 characters")
         limit = max(1, min(int(limit), 50))
+        fields = normalize_search_fields(search_fields)
         filters = {
             "canonical_type": display_text(canonical_type),
+            "canonical_types": [
+                display_text(value) for value in (canonical_types or []) if display_text(value)
+            ],
+            "question_types": [
+                display_text(value) for value in (question_types or []) if display_text(value)
+            ],
             "exam": display_text(exam),
             "collection_kind": display_text(collection_kind),
             "subject": display_text(subject),
@@ -154,9 +182,10 @@ class Catalog:
 
         with self.connect() as connection:
             candidates: list[tuple[str, float, str]] = []
-            exact = self._find_exact(connection, normalized_query, filters, limit)
-            candidates.extend((question_id, 1.0, "exact") for question_id in exact)
-            if query_source_code:
+            if "stem" in fields:
+                exact = self._find_exact(connection, normalized_query, filters, limit)
+                candidates.extend((question_id, 1.0, "exact") for question_id in exact)
+            if query_source_code and "stem" in fields:
                 source_code_rows = self._find_source_code(
                     connection, query_source_code, filters, limit
                 )
@@ -167,16 +196,39 @@ class Catalog:
             remaining = limit - len({candidate[0] for candidate in candidates})
             if remaining > 0 and normalized_query:
                 if len(normalized_query) >= 3:
-                    expression = _fts_expression(query_without_code)
-                    fts_rows = self._find_fts(
-                        connection, expression, filters, max(limit * 4, 40)
-                    )
-                    for row in fts_rows:
-                        score = _rank_score(row["rank"])
-                        candidates.append((row["question_id"], score, "fts"))
+                    fts_fields = [
+                        field for field in fields if field in {"stem", "point", "explanation"}
+                    ]
+                    if fts_fields:
+                        expression = _scoped_fts_expression(
+                            _fts_expression(query_without_code), fts_fields
+                        )
+                        fts_rows = self._find_fts(
+                            connection, expression, filters, max(limit * 4, 40)
+                        )
+                        for row in fts_rows:
+                            score = _rank_score(row["rank"])
+                            candidates.append((row["question_id"], score, "fts"))
+                    if "answer" in fields:
+                        answer_rows = self._find_contains(
+                            connection,
+                            query_without_code,
+                            normalized_query,
+                            filters,
+                            ["answer"],
+                            max(limit * 4, 40),
+                        )
+                        candidates.extend(
+                            (question_id, 0.55, "answer") for question_id in answer_rows
+                        )
                 else:
-                    short_rows = self._find_short(
-                        connection, normalized_query, filters, max(limit * 4, 40)
+                    short_rows = self._find_contains(
+                        connection,
+                        query_without_code,
+                        normalized_query,
+                        filters,
+                        fields,
+                        max(limit * 4, 40),
                     )
                     candidates.extend((question_id, 0.4, "short") for question_id in short_rows)
 
@@ -189,7 +241,12 @@ class Catalog:
                 deduplicated.append(candidate)
                 if len(deduplicated) >= limit:
                     break
-            return self._load_questions(connection, deduplicated, include_solution=include_solution)
+            return self._load_questions(
+                connection,
+                deduplicated,
+                include_solution=include_solution,
+                question_types=filters["question_types"],
+            )
 
     def get_question(self, question_id: str, *, include_solution: bool = True) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -289,6 +346,9 @@ class Catalog:
                         "version_id": row["version_id"],
                         "question_type": row["question_type"],
                         "raw_type": row["raw_type"],
+                        "type_label": question_type_label(
+                            row["raw_type"], row["question_type"]
+                        ),
                         "source_code": row["source_code"],
                         "stem": row["stem"],
                         "options": [
@@ -425,12 +485,26 @@ class Catalog:
             ).fetchone()
         return dict(row) if row else None
 
-    def browse_library(self, parent: str = "") -> dict[str, Any]:
+    def browse_library(
+        self,
+        parent: str = "",
+        *,
+        collection_ids: set[str] | None = None,
+        collection_counts: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
         parent_path = _safe_library_path(parent)
         prefix = f"{parent_path}/" if parent_path else ""
         directories: dict[str, dict[str, Any]] = {}
         collections: list[dict[str, Any]] = []
         for row in self._library_rows():
+            if collection_ids is not None and row["collection_id"] not in collection_ids:
+                continue
+            row = dict(row)
+            if collection_counts is not None:
+                saved_count = int(collection_counts.get(row["collection_id"], 0))
+                row["question_count"] = saved_count
+                row["unique_question_count"] = saved_count
+                row["saved_count"] = saved_count
             relative_path = row["relative_path"]
             if not relative_path.startswith(prefix):
                 continue
@@ -466,8 +540,8 @@ class Catalog:
         return {
             "parent": parent_path,
             "breadcrumbs": breadcrumbs,
-            "directories": sorted(directories.values(), key=lambda item: item["name"].casefold()),
-            "collections": sorted(collections, key=lambda item: item["name"].casefold()),
+            "directories": sort_library_entries(list(directories.values()), parent_path),
+            "collections": sort_library_entries(collections, parent_path),
         }
 
     def collection_outline(self, collection_id: str) -> list[dict[str, Any]]:
@@ -486,7 +560,13 @@ class Catalog:
                 """,
                 (display_text(collection_id),),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            {
+                **dict(row),
+                "type_label": question_type_label(row["raw_type"], row["question_type"]),
+            }
+            for row in rows
+        ]
 
     def select_practice_items(
         self,
@@ -531,6 +611,8 @@ class Catalog:
         *,
         include_solution: bool = True,
         canonical_type: str = "",
+        canonical_types: list[str] | tuple[str, ...] | None = None,
+        question_types: list[str] | tuple[str, ...] | None = None,
         exam: str = "",
         collection_kind: str = "",
         subject: str = "",
@@ -541,6 +623,12 @@ class Catalog:
             return []
         filters = {
             "canonical_type": display_text(canonical_type),
+            "canonical_types": [
+                display_text(value) for value in (canonical_types or []) if display_text(value)
+            ],
+            "question_types": [
+                display_text(value) for value in (question_types or []) if display_text(value)
+            ],
             "exam": display_text(exam),
             "collection_kind": display_text(collection_kind),
             "subject": display_text(subject),
@@ -548,7 +636,12 @@ class Catalog:
         }
         with self.connect() as connection:
             filtered = self._filter_candidates(connection, candidates, filters, limit)
-            return self._load_questions(connection, filtered, include_solution=include_solution)
+            return self._load_questions(
+                connection,
+                filtered,
+                include_solution=include_solution,
+                question_types=filters["question_types"],
+            )
 
     def _filter_candidates(
         self,
@@ -678,17 +771,40 @@ class Catalog:
             [expression, *params, limit],
         ).fetchall()
 
-    def _find_short(self, connection, query: str, filters: dict, limit: int) -> list[str]:
+    def _find_contains(
+        self,
+        connection,
+        raw_query: str,
+        normalized_query: str,
+        filters: dict,
+        fields: list[str] | tuple[str, ...],
+        limit: int,
+    ) -> list[str]:
         filter_sql, params = _question_filters(filters)
+        scope_clauses: list[str] = []
+        scope_params: list[str] = []
+        if "stem" in fields and normalized_query:
+            scope_clauses.append("instr(q.normalized_stem, ?) > 0")
+            scope_params.append(normalized_query)
+        for field, column in (
+            ("answer", "answer"),
+            ("point", "point"),
+            ("explanation", "explanation"),
+        ):
+            if field in fields:
+                scope_clauses.append(f"instr(lower(q.{column}), lower(?)) > 0")
+                scope_params.append(display_text(raw_query))
+        if not scope_clauses:
+            return []
         rows = connection.execute(
             f"""
             SELECT q.question_id
             FROM questions q
-            WHERE instr(q.normalized_stem, ?) > 0 {filter_sql}
+            WHERE ({' OR '.join(scope_clauses)}) {filter_sql}
             ORDER BY length(q.normalized_stem), q.question_id
             LIMIT ?
             """,
-            [query, *params, limit],
+            [*scope_params, *params, limit],
         ).fetchall()
         return [row["question_id"] for row in rows]
 
@@ -698,6 +814,7 @@ class Catalog:
         candidates: list[tuple[str, float, str]],
         *,
         include_solution: bool,
+        question_types: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         if not candidates:
             return []
@@ -739,10 +856,30 @@ class Catalog:
                 question_ids,
             )
         }
+        matched_raw_types: dict[str, list[str]] = {question_id: [] for question_id in question_ids}
+        requested_type_keys = {
+            _question_type_key(value)
+            for value in (question_types or [])
+            if _question_type_key(value)
+        }
+        if requested_type_keys:
+            for row in connection.execute(
+                f"""
+                SELECT qo.question_id, qv.raw_type
+                FROM question_occurrences qo
+                JOIN question_versions qv ON qv.version_id = qo.version_id
+                WHERE qo.question_id IN ({placeholders})
+                ORDER BY qo.question_id, qo.occurrence_id
+                """,
+                question_ids,
+            ):
+                raw_type = str(row["raw_type"] or "")
+                if _question_type_key(raw_type) in requested_type_keys:
+                    matched_raw_types[row["question_id"]].append(raw_type)
         sources: dict[str, list[dict[str, Any]]] = {question_id: [] for question_id in question_ids}
         for row in connection.execute(
             f"""
-            SELECT qo.question_id, sf.relative_path, sf.exam, sf.collection_kind,
+            SELECT qo.question_id, qo.occurrence_id, sf.relative_path, sf.exam, sf.collection_kind,
                    sf.subject, sf.title, sf.year, qo.sheet_name, qo.row_number,
                    qo.position, cq.collection_id
             FROM question_occurrences qo
@@ -755,6 +892,7 @@ class Catalog:
         ):
             sources[row["question_id"]].append(
                 {
+                    "occurrence_id": row["occurrence_id"],
                     "relative_path": row["relative_path"],
                     "exam": row["exam"],
                     "collection_kind": row["collection_kind"],
@@ -792,10 +930,14 @@ class Catalog:
             row = rows.get(question_id)
             if row is None:
                 continue
+            raw_type = row["raw_type"]
+            if matched_raw_types.get(question_id):
+                raw_type = matched_raw_types[question_id][0]
             item = {
                 "question_id": question_id,
                 "question_type": row["canonical_type"],
-                "raw_type": row["raw_type"],
+                "raw_type": raw_type,
+                "type_label": question_type_label(raw_type, row["canonical_type"]),
                 "source_code": row["source_code"],
                 "stem": row["stem"],
                 "options": options.get(question_id, []),
@@ -813,6 +955,20 @@ class Catalog:
         return result
 
 
+def normalize_search_fields(value: object) -> list[str]:
+    if value is None:
+        return list(SEARCH_FIELDS)
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError("search_fields must be an array")
+    fields = list(dict.fromkeys(display_text(field).lower() for field in value))
+    invalid = [field for field in fields if field not in SEARCH_FIELDS]
+    if invalid:
+        raise ValueError("search_fields contains an unsupported field")
+    if not fields:
+        raise ValueError("search_fields must contain at least one field")
+    return fields
+
+
 def _rank_score(rank: float) -> float:
     rank = abs(float(rank))
     return 1.0 - math.exp(-rank) if rank > 0 else 0.25
@@ -825,7 +981,12 @@ def _fts_expression(query: str) -> str:
         compact = key_text(segment)
         if len(compact) < 3:
             continue
-        if len(compact) == 3:
+        if not any("\u3400" <= character <= "\u9fff" for character in compact):
+            # Keep Latin, Greek and numeric medical terms intact. Expanding a
+            # nonexistent identifier into numeric trigrams can otherwise
+            # recall unrelated years, dosages and question numbers.
+            terms.append(compact)
+        elif len(compact) == 3:
             terms.append(compact)
         else:
             grams = [compact[index : index + 3] for index in range(len(compact) - 2)]
@@ -839,10 +1000,52 @@ def _fts_expression(query: str) -> str:
     return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
 
 
+def _scoped_fts_expression(expression: str, fields: list[str]) -> str:
+    columns = [field for field in fields if field in {"stem", "point", "explanation"}]
+    if not columns:
+        raise ValueError("search_fields does not contain an FTS field")
+    return "{" + " ".join(columns) + "} : (" + expression + ")"
+
+
 def _question_filters(filters: dict[str, Any]) -> tuple[str, list[Any]]:
     clauses = []
     params: list[Any] = []
-    if filters.get("canonical_type"):
+    question_types = list(dict.fromkeys(filters.get("question_types") or []))
+    canonical_types = list(dict.fromkeys(filters.get("canonical_types") or []))
+    if question_types:
+        type_keys = []
+        include_unknown = False
+        for value in question_types:
+            key = _question_type_key(value)
+            if key == _question_type_key("未知题型"):
+                include_unknown = True
+            elif key:
+                type_keys.append(key)
+        type_clauses = []
+        if type_keys:
+            placeholders = ",".join("?" for _ in type_keys)
+            type_clauses.append(
+                "EXISTS (SELECT 1 FROM question_occurrences qo "
+                "JOIN question_versions qv ON qv.version_id = qo.version_id "
+                "WHERE qo.question_id = q.question_id AND "
+                "UPPER(REPLACE(REPLACE(COALESCE(qv.raw_type, ''), ' ', ''), '型题', '')) "
+                f"IN ({placeholders}))"
+            )
+            params.extend(type_keys)
+        if include_unknown:
+            type_clauses.append(
+                "EXISTS (SELECT 1 FROM question_occurrences qo "
+                "JOIN question_versions qv ON qv.version_id = qo.version_id "
+                "WHERE qo.question_id = q.question_id AND "
+                "COALESCE(qv.raw_type, '') = '' AND q.canonical_type = '未知题型')"
+            )
+        if type_clauses:
+            clauses.append("(" + " OR ".join(type_clauses) + ")")
+    elif canonical_types:
+        placeholders = ",".join("?" for _ in canonical_types)
+        clauses.append(f"q.canonical_type IN ({placeholders})")
+        params.extend(canonical_types)
+    elif filters.get("canonical_type"):
         clauses.append("q.canonical_type = ?")
         params.append(filters["canonical_type"])
 
@@ -864,6 +1067,11 @@ def _question_filters(filters: dict[str, Any]) -> tuple[str, list[Any]]:
             + ")"
         )
     return (" AND " + " AND ".join(clauses) if clauses else "", params)
+
+
+def _question_type_key(value: object) -> str:
+    """Return the stable key shared by raw type labels and search chips."""
+    return display_text(value).replace(" ", "").upper().replace("型题", "")
 
 
 def _collection_filters(

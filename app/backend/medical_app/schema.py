@@ -14,7 +14,7 @@ CREATE TABLE schema_meta (
 CREATE TABLE import_runs (
     run_id TEXT PRIMARY KEY,
     snapshot_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL,
+    schema_revision INTEGER NOT NULL,
     source_root TEXT NOT NULL,
     started_at TEXT NOT NULL,
     completed_at TEXT,
@@ -164,11 +164,11 @@ def connect_build_database(path: str) -> sqlite3.Connection:
     return connection
 
 
-def create_schema(connection: sqlite3.Connection, schema_version: int) -> None:
+def create_schema(connection: sqlite3.Connection, schema_revision: int) -> None:
     connection.executescript(SCHEMA_SQL)
     connection.execute(
-        "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-        (str(schema_version),),
+        "INSERT INTO schema_meta(key, value) VALUES ('schema_revision', ?)",
+        (str(schema_revision),),
     )
 
 

@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from medical_v2.models import RawQuestion, SourceFile
-from medical_v2.normalize import infer_question_groups, normalize_question
+from medical_app.models import RawQuestion, SourceFile
+from medical_app.normalize import infer_question_groups, normalize_question
 
 
 def _source() -> SourceFile:

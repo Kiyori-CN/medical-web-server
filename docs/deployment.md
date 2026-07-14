@@ -3,62 +3,108 @@
 ## 权威链路
 
 ```text
-本地 main -> GitHub main -> 服务器部署镜像 -> 发布包 -> projectsctl -> 生产
+本地 main
+  -> 完整测试与浏览器验收
+  -> GitHub main 精确提交
+  -> 服务器 repo 快进到精确 SHA
+  -> 发布包
+  -> projectsctl
+  -> 生产健康与公网验收
 ```
 
-只有已推送到 GitHub 的精确提交可以部署。生产运行目录和持久化数据不能成为源码来源。
+服务器源码不是开发源，运行目录不能直接编辑。所有 SSH、传输、服务和项目操作从 Windows 通过：
 
-## 发布前
+```text
+C:\Users\admin\.codex\skills\tencent-cloud\scripts\tencent-cloud.ps1
+```
 
-本地执行完整验证并记录提交哈希：
+## 正式目录
+
+```text
+/srv/projects/medical-web-server/
+  repo/                  GitHub 部署镜像
+  app/backend/           生产运行代码
+  knowledge-base/        catalog 与向量
+  state/                 账号、练习、设置与密钥
+```
+
+固定接口：
+
+- systemd：`medical-exam.service`；
+- 端口：`8080`；
+- 直接健康：`http://127.0.0.1:8080/api/health`；
+- 公网：`https://medical.newapi.com.cn/`；
+- 环境文件：`/etc/medical-exam.env`，权限 `600`。
+
+## 本次全新重建
+
+用户已明确授权删除 `/srv/projects/medical-web-server` 内的旧代码、旧数据库、旧题库、旧向量和旧状态，并重新部署当前项目；不保留旧项目回滚数据。域名、正式根目录、Nginx 入口和项目名保持不变。
+
+执行顺序：
+
+1. 本地完成自动化、真实数据和浏览器验收；
+2. 精确提交并推送 GitHub `main`，记录完整 SHA；
+3. 使用 `ProjectContext` 读取服务器项目、服务、Nginx、systemd、projectsctl 和磁盘事实；
+4. 证明待删除路径只在正式项目范围内，且没有未知 mount、容器、cron 或其他项目引用；
+5. 停止 `medical-exam.service`；
+6. 清空旧项目内容并重建 `repo`、`app`、`knowledge-base`、`state`；
+7. 从 GitHub 克隆/快进 `repo` 到精确 SHA；
+8. 安装经过校验的 catalog 制品；
+9. 在生产本地创建全新的 `app.sqlite3`、`settings.sqlite3` 和 `settings.key`；
+10. 从精确提交生成发布包并执行 `projectsctl update`；
+11. 验证直接健康、域名、catalog、账号初始化和刷题；
+12. 用户通过 HTTPS 一次性初始化正式管理员；
+13. 用户轮换模型密钥并通过管理设置页录入；
+14. 向量完成后单独安装并验收 semantic/hybrid。
+
+聊天中出现过的管理员密码或模型密钥不得写入命令、Git、部署包、环境文件或日志。
+
+## 发布前检查
 
 ```powershell
 git status --short --branch
 git diff --check
-python -m py_compile app\backend\config.py app\backend\gunicorn_config.py app\backend\ikbs_pysearch.py app\backend\main.py app\backend\incremental_index.py app\backend\update_index.py
+python -m py_compile app\backend\config.py app\backend\gunicorn_config.py app\backend\main.py
+python -m compileall -q app\backend\medical_app scripts
+node --check public\app.js
+python -m pytest
 git rev-parse HEAD
 ```
 
-确认 `data/`、数据库、向量、状态、日志和 `.env` 没有进入提交。
+确认 `data/`、`knowledge-base/`、`state/`、日志和 `.env` 未进入提交。
 
-若本次包含设置或语义功能，还要确认生产环境准备了：
+## 生产环境
 
-- 长随机 `ADMIN_TOKEN`；
-- `SETTINGS_DB=/srv/projects/medical-web-server/state/settings.sqlite3`；
-- `SETTINGS_KEY_PATH=/srv/projects/medical-web-server/state/settings.key`；
-- `OPENBLAS_NUM_THREADS=1`、`OMP_NUM_THREADS=1`、`MKL_NUM_THREADS=1`、`NUMEXPR_NUM_THREADS=1`。
+建议环境变量：
 
-真实供应商密钥不得进入 `/etc/medical-exam.env` 变更补丁、命令输出、发布包或 Git；代码上线后由管理员通过 HTTPS 设置页录入。
-
-## 服务器预检
-
-所有服务器操作使用：
-
-```powershell
-C:\Users\admin\.codex\skills\tencent-cloud\scripts\tencent-cloud.ps1
+```text
+FLASK_ENV=production
+KNOWLEDGE_BASE_ROOT=/srv/projects/medical-web-server/knowledge-base
+APP_DB=/srv/projects/medical-web-server/state/app.sqlite3
+SETTINGS_DB=/srv/projects/medical-web-server/state/settings.sqlite3
+SETTINGS_KEY_PATH=/srv/projects/medical-web-server/state/settings.key
+SECURE_COOKIES=true
+OPENBLAS_NUM_THREADS=1
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+NUMEXPR_NUM_THREADS=1
 ```
 
-部署前记录：
-
-- 服务器部署镜像分支、HEAD、上游和工作区状态；
-- `medical-exam.service` 状态和当前 runtime；
-- `/api/health` 结果；
-- 磁盘空间；
-- `/srv/projects/medical-web-server/knowledge-base` 与 `state` 存在且未被发布包包含；
-- 当前可回滚 release。
-
-部署镜像必须干净，只能执行 fetch 和 fast-forward 到指定 GitHub 提交。若服务器存在未知改动，停止部署并报告，不得覆盖。
+API 密钥不放在环境文件中，由管理员设置页写入加密设置数据库。
 
 ## 发布包
 
-从服务器部署镜像的精确提交生成独立 tar.gz。发布包至少必须包含：
+发布包必须来自服务器部署镜像的精确提交，至少包含：
 
 ```text
 app/backend/main.py
+app/backend/medical_app/
 public/index.html
+public/style.css
+public/app.js
 ```
 
-发布包不得包含：
+必须排除：
 
 ```text
 data/
@@ -69,73 +115,82 @@ state/
 日志、数据库、索引、缓存、证书和备份
 ```
 
-检查归档内容后只能通过以下命令部署：
+检查归档内容后执行：
 
 ```bash
 projectsctl update medical-web-server <artifact.tar.gz>
 ```
 
-不得直接覆盖 `app/current`，不得手工复制单个生产文件。
+## Catalog 安装
+
+只传输已验证 build 的：
+
+- `catalog.sqlite3`；
+- `manifest.json`；
+- `import-report.json`；
+- `conflict-report.json`。
+
+不得上传原始 `data/`。安装后核对文件 SHA-256、SQLite integrity、外键、FTS 和真实统计，再写入 `knowledge-base/current.json`。
+
+统计基线：2,127 collections、123,564 occurrences、64,078 questions/FTS、67,650 content versions、1,443 groups、3,732 members、4 conflicts、完整性 `ok`、外键 0。
+
+## 状态初始化
+
+生产不得接收本地 state。运行：
+
+```bash
+python scripts/init_app.py \
+  --knowledge-base-root /srv/projects/medical-web-server/knowledge-base \
+  --app-db /srv/projects/medical-web-server/state/app.sqlite3 \
+  --settings-db /srv/projects/medical-web-server/state/settings.sqlite3 \
+  --settings-key-path /srv/projects/medical-web-server/state/settings.key
+```
+
+确认 state 归属正确，`settings.key` 权限 `600`。全新 state 的 `/api/auth/setup` 应显示 `setup_required=true`，正式管理员只能通过 HTTPS 初始化页创建。
+
+## 向量安装
+
+向量是独立数据制品，不随代码包或 catalog 包发布。等待用户轮换密钥并完成真实构建后：
+
+1. 核对 64,078 × 1024、float32、有限值和单位范数；
+2. 核对 vector manifest 与 catalog、API URL、模型、维度；
+3. 上传 `vector-indexes/<vector_id>`；
+4. 服务器复核哈希和矩阵；
+5. 原子写入 `vector-current.json`；
+6. 验证 keyword、semantic、hybrid、延迟、RSS 和日志。
 
 ## 部署后验收
 
 ```bash
 projectsctl health medical-web-server
 curl -fsS http://127.0.0.1:8080/api/health
-curl -fsS -X POST http://127.0.0.1:8080/api/v2/search \
+```
+
+登录后验证：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/search \
   -H 'Content-Type: application/json' \
   --data '{"query":"2026N1A 属于神经-体液调节的是","limit":3,"include_solution":false}'
 ```
 
-随后验证：
+最终检查：
 
-- `https://medical.newapi.com.cn/` 可访问；
-- 题库统计与部署前一致；
-- 至少一次精确搜题和一次无结果搜索；
-- 至少一次随机/指定题集刷题、提交答案和结果展示；
-- 至少一次按目录进入具体文件、从指定原题号开始和刷新恢复；
-- 答题前响应未泄露答案；
-- 设置公共接口不含明文密钥、无 token 的管理接口返回 401；
-- 服务日志没有新增错误。
+- 公网 HTTPS 正常；
+- 首次管理员初始化只有一次；
+- 普通用户无管理权限；
+- 真实统计与本地一致；
+- 精确查询和零结果；
+- 2026 文件 165 题及题型目录；
+- 练习、快刷、测试、背题四种模式；
+- 测试交卷前无答案泄露；
+- 未答交卷、计时、刷新恢复；
+- 收藏和错题路径与删除；
+- 管理设置密钥掩码；
+- `390×844` 和桌面布局；
+- 服务日志无新增错误；
+- 3 worker、preload、单线程 BLAS、内存与延迟符合预算。
 
-## 数据发布
+## 后续常规部署
 
-题库快照和 build 不是普通代码发布的一部分。数据迁移需要单独授权、校验、备份和回滚方案，并写入 `/srv/projects/medical-web-server/knowledge-base/v2` 的新版本目录。不得通过 GitHub 发布真实题库。
-
-### v2 数据迁移顺序
-
-1. 在本地从只读原始数据构建并激活目标 build，记录 snapshot、build ID、文件 SHA-256、统计、冲突报告和完整性结果。schema v4 应为 2,127 collections、64,078 questions/FTS、123,564 occurrences、67,650 versions、1,443 groups、3,732 members、4 conflicts、完整性 `ok`、外键 0。
-2. 只打包目标 build 的 `catalog.sqlite3`、`manifest.json`、`import-report.json` 和 `conflict-report.json`；不得打包原始 `data/`。
-3. 在服务器记录磁盘空间、旧 v1 知识库、现有 `knowledge-base/v2/current.json`、`state` 和当前 release；若存在状态库先做一致性备份。
-4. 通过 Tencent Cloud wrapper 上传到临时路径，核对归档和数据库哈希后，安装到新的 `knowledge-base/v2/builds/<build_id>`；不得覆盖同名未知目录。
-5. 停止可能写入状态库的服务，先用 SQLite online backup 备份 `/srv/projects/medical-web-server/state/practice.sqlite3`，再初始化或升级到 practice schema v2；保持状态库与题库分库并核对会话/答题计数。
-6. 对服务器上的新数据库执行完整性、外键、题量、题组、FTS、代表性搜索和答案隐藏检查。
-7. 原子写入 `knowledge-base/v2/current.json`，再部署读取该 build 的精确代码提交并重启服务。
-8. 完成直接端口和公网的搜题/刷题验收；在回滚窗口内保留旧 build、v1 知识库和状态备份。
-
-数据包约 500 MB，必须先确认服务器空间足够容纳临时上传、解包、新 build、旧 build 和代码 release。数据包只进入持久化题库目录，不得进入 Git 仓库或代码发布包。
-
-### 设置初始化
-
-代码首次启动会在持久化 `state` 下创建 `settings.sqlite3` 和 `settings.key`。部署前备份已存在的 settings DB/key；部署后核对目录归属以及 key 权限 `600`。生产管理员通过 HTTPS 设置页录入已轮换的嵌入/大模型密钥，公共接口只能显示配置状态和掩码。
-
-不得把本地 `state/settings.sqlite3` 或 `settings.key` 上传到生产：这会混淆环境、复制秘密并破坏独立加密边界。
-
-### 向量索引迁移
-
-向量数据是独立迁移，不随 catalog 包或代码包发布：
-
-1. 本地使用目标 catalog 和最终 API URL/模型/维度执行 `scripts/build_vectors.py --activate`。
-2. 核对 vector manifest、题目 ID 哈希、64,078 行矩阵、1024 维、单位范数和约 250 MiB 文件大小。
-3. 记录服务器旧 `vector-current.json` 并确认磁盘；只上传目标 `vector-indexes/<vec_build_id>` 的 manifest、ID 和矩阵，不上传 raw data、settings 或密钥。
-4. 在服务器临时目录复核每个文件哈希、matrix shape、有限值和单位范数，再安装到新的不可变 vector build 目录。
-5. 生产设置页配置与索引完全相同的 API URL、`Qwen/Qwen3-Embedding-0.6B` 和 1024 维，然后原子切换 `vector-current.json`。
-6. 验证 `keyword`、`semantic`、`hybrid`、零结果、配置不兼容拒绝、延迟、RSS 和日志。
-
-4 核 4G 生产使用 3 个同步 Gunicorn worker、`preload_app`、mmap 和单线程 BLAS；不得额外部署独立向量数据库服务。若内存或延迟不达标，先关闭语义开关并保留 keyword/刷题，再切回旧 vector 指针。
-
-## 回滚
-
-代码回滚使用 `projectsctl` 已记录的上一 release。数据回滚通过 `current.json` 切回已验证 build；用户状态数据库必须先备份且不得随代码回滚覆盖。
-
-如果 v2 首次上线失败，优先回滚代码 release，并恢复迁移前的 catalog `current.json` 与 vector `vector-current.json`；旧 `/knowledge-base/西医题库` 和 v1 索引保持原状，因此无需反向转换数据。若只发生代码故障，不回滚或覆盖 `practice.sqlite3`、`settings.sqlite3` 或 `settings.key`。
+全新重建完成后，常规代码部署不得删除 `knowledge-base` 或 `state`。每次部署前记录服务、健康、磁盘和当前提交；只能快进部署镜像、生成排除持久化数据的发布包并通过 `projectsctl` 更新。

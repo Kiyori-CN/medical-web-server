@@ -13,7 +13,7 @@ from .readers import discover_sources, read_questions
 from .schema import connect_build_database, create_schema, rebuild_fts, validate_database
 
 
-BUILD_SCHEMA_VERSION = 4
+CATALOG_SCHEMA_REVISION = 1
 
 
 def _utc_now() -> str:
@@ -311,7 +311,11 @@ def build_catalog(source_root: str | Path, builds_root: str | Path, force: bool 
     if not sources:
         raise ValueError(f"No supported source files found under {source_root}")
     snapshot_id = _snapshot_id(sources)
-    build_id = f"v{BUILD_SCHEMA_VERSION}_{snapshot_id.removeprefix('snap_')[:20]}"
+    build_id = _stable_id(
+        "catalog",
+        {"schema_revision": CATALOG_SCHEMA_REVISION, "snapshot_id": snapshot_id},
+        length=24,
+    )
     build_dir = builds_root / build_id
     database_path = build_dir / "catalog.sqlite3"
     manifest_path = build_dir / "manifest.json"
@@ -339,15 +343,15 @@ def build_catalog(source_root: str | Path, builds_root: str | Path, force: bool 
 
     connection = connect_build_database(str(temporary_database))
     try:
-        create_schema(connection, BUILD_SCHEMA_VERSION)
+        create_schema(connection, CATALOG_SCHEMA_REVISION)
         connection.execute(
             """
             INSERT INTO import_runs(
-                run_id, snapshot_id, schema_version, source_root,
+                run_id, snapshot_id, schema_revision, source_root,
                 started_at, status, stats_json
             ) VALUES (?, ?, ?, ?, ?, 'building', '{}')
             """,
-            (run_id, snapshot_id, BUILD_SCHEMA_VERSION, str(source_root), started_at),
+            (run_id, snapshot_id, CATALOG_SCHEMA_REVISION, str(source_root), started_at),
         )
 
         with connection:
@@ -467,7 +471,7 @@ def build_catalog(source_root: str | Path, builds_root: str | Path, force: bool 
     report = {
         "build_id": build_id,
         "snapshot_id": snapshot_id,
-        "schema_version": BUILD_SCHEMA_VERSION,
+        "schema_revision": CATALOG_SCHEMA_REVISION,
         "started_at": started_at,
         "completed_at": completed_at,
         "stats": stats.as_dict(),
@@ -480,7 +484,7 @@ def build_catalog(source_root: str | Path, builds_root: str | Path, force: bool 
     manifest = {
         "build_id": build_id,
         "snapshot_id": snapshot_id,
-        "schema_version": BUILD_SCHEMA_VERSION,
+        "schema_revision": CATALOG_SCHEMA_REVISION,
         "created_at": completed_at,
         "source_root": str(source_root),
         "database": "catalog.sqlite3",
@@ -518,7 +522,7 @@ def activate_build(knowledge_base_root: str | Path, build_id: str) -> dict:
     pointer = {
         "build_id": build_id,
         "snapshot_id": manifest["snapshot_id"],
-        "schema_version": manifest["schema_version"],
+        "schema_revision": manifest["schema_revision"],
         "activated_at": _utc_now(),
     }
     root.mkdir(parents=True, exist_ok=True)

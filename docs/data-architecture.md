@@ -1,158 +1,188 @@
 # 数据与索引架构
 
-## 已盘点的数据事实
+## 目标
 
-2026-07-14 的本地数据快照包含：
+数据设计同时满足：
 
-- 2126 个 Excel 和 1 个 Word；
-- 123,564 条题目来源记录；
-- schema v4 规范化后为 64,078 道题、67,650 个内容版本；
-- 约 48.1% 的来源记录是不同题集组织方式造成的重复；
-- 识别出 1,443 个 A3/A4 病例题组和 3,732 个题组成员；
-- A3/A4 版本涉及的 3,792 个规范题 ID 中，高置信成组覆盖 98.42%，显式结构覆盖 100%；
-- 4 个真实答案冲突已记录，未静默覆盖；
-- 2,127 个源文件分别对应 2,127 个精确文件题集；同名 `.xlsx` 与 `.docx` 不合并；
-- 文件结构覆盖三基考试、306 专硕、699 学硕和执业医师；
-- 题型包含选择、判断、填空、名词解释、简答和论述；字段允许合理缺失。
-
-旧生产库由 100 个大 TXT 和 66,096 个文本块构成。旧索引可以用于回滚，但不再作为 v2 数据模型。
+1. 能从原始 Excel/Word 完整重建；
+2. 能按原文件路径和原题号精确刷题；
+3. 能跨文件去重并快速搜题；
+4. 能保留来源答案冲突；
+5. 能在 4 核 4G 服务器上稳定运行；
+6. catalog、向量和用户状态互相独立。
 
 ## 数据分层
 
 ```text
-原始快照 source
-  -> 导入与校验 staging
-  -> 规范题库 catalog.sqlite3
-  -> FTS5 / 题目向量 / 知识向量
-  -> 搜题与刷题 API
+data/                            原始只读输入
+  <考试>/<组织方式>/<学科>/<文件>
+
+knowledge-base/
+  current.json                  当前 catalog 指针
+  builds/<catalog_id>/
+    catalog.sqlite3             只读题库与 FTS
+    manifest.json               来源哈希、统计和构建信息
+    import-report.json          导入报告
+    conflict-report.json        来源冲突报告
+  vector-current.json           当前向量指针
+  vector-indexes/<vector_id>/
+    embeddings.npy              float32 归一化矩阵
+    question_ids.json           行号到 question_id
+    manifest.json               catalog/模型/维度/哈希
+    build-state.json            可恢复构建进度
+
+state/
+  app.sqlite3                   账号、会话、文件刷题状态、收藏、错题、评论
+  settings.sqlite3              网站与模型设置
+  settings.key                  设置加密密钥
 ```
 
-### 原始快照
+原始数据、派生制品和运行状态均不进入 Git。
 
-原始 Excel/Word 保持目录、文件名和内容不变。每次导入对应一个不可变 snapshot，manifest 至少记录：
+## 实体关系
 
-- snapshot ID、schema 版本和创建时间；
-- 相对路径、字节数、SHA-256；
-- 工作表、行数、表头签名；
-- 解析成功、警告和失败数量。
-
-### 规范题库
-
-推荐使用只读发布型 `catalog.sqlite3`：构建完成后由服务读取，新构建不得在生产查询期间原地修改旧库。
-
-核心实体：
-
-| 实体 | 用途 |
-| --- | --- |
-| `questions` | 规范题干、题型、答案、解析、考点和内容指纹 |
-| `question_options` | 有序选项及稳定选项 ID |
-| `question_groups` | A3/A4 等共享病例题干 |
-| `question_group_members` | 子题、组内顺序和子题题干 |
-| `source_files` | 原始文件、工作表、哈希和目录元数据 |
-| `question_occurrences` | 题目在源文件中的行号、题号和原始版本 |
-| `collections` | 一个具体源文件一个题集，保留完整相对路径、扩展名和目录元数据 |
-| `collection_questions` | occurrence 与精确文件题集的关系、原文件顺序和显示元数据 |
-| `import_runs` | 导入参数、版本、统计和结果 |
-| `data_conflicts` | 同题不同答案、解析、题型或选项的冲突 |
-
-用户、练习会话、答题、收藏、错题和复习计划放入独立 `practice.sqlite3`，不能写入只读题库。
-
-刷题以 `question_occurrences` 为出题和判分单位：同一规范题在不同源文件中可以有不同题号、文本版本或冲突答案，必须展示并按当前 occurrence 对应的 `question_versions` 判分。跨文件错题统计仍按规范 `question_id` 聚合，但文件题号目录的正确/错误/未做状态必须按 occurrence 隔离。
-
-### A3/A4 题组
-
-题组关系不改变题目 ID，也不把多个子题合并成一条搜索记录：
-
-- 显式 `共用题干: ... 问题: ...` 结构直接拆为共享题干和子题；
-- 旧文件中连续 A3/A4 行只有在共享至少 40 个规范字符、且公共前缀以标点结束时才自动成组；
-- 每道子题仍保留完整原始题干、独立选项、答案、解析和来源；
-- 一个题组按来源顺序保存成员，搜索与向量索引仍以子题 question ID 为基本单位；
-- 无法高置信成组的题保持独立，不做模糊强合并。
-
-## 规范化与去重
-
-显示文本和规范化文本必须同时保存。规范化可统一 Unicode、空白和标点，但不得改变原文。
-
-安全自动去重键：
-
-```text
-规范题型 + 规范题干 + 按原顺序排列的规范选项
+```mermaid
+erDiagram
+  SOURCE_FILES ||--|| COLLECTIONS : defines
+  SOURCE_FILES ||--o{ QUESTION_OCCURRENCES : contains
+  QUESTIONS ||--o{ QUESTION_VERSIONS : has
+  QUESTIONS ||--o{ QUESTION_OCCURRENCES : appears_as
+  QUESTION_VERSIONS ||--o{ QUESTION_OCCURRENCES : renders
+  COLLECTIONS ||--o{ COLLECTION_QUESTIONS : orders
+  QUESTION_OCCURRENCES ||--|| COLLECTION_QUESTIONS : placed_at
+  QUESTION_GROUPS ||--o{ QUESTION_GROUP_MEMBERS : contains
+  QUESTIONS ||--o{ QUESTION_GROUP_MEMBERS : participates
 ```
 
-来源题号和年份编号从去重文本剥离并保存为 occurrence 元数据。答案和解析不进入第一层身份键，否则同题答案冲突会被错误拆成两题。
+### 规范题 `questions`
 
-处理规则：
+用于去重、关键词检索、语义向量和跨来源统计。题干及选项归一化后生成稳定 fingerprint。同一道题出现在多个文件时只构建一个向量。
 
-- 同键同内容：合并为一个 question，保留多个 occurrence 和 collection 关系；
-- 同键不同答案/解析：记录冲突，不静默覆盖；
-- 同题干、同选项集合但顺序不同：作为疑似同题，映射选项答案后再决定；
-- 只做模糊相似的题：建立 family 关系，不自动合并；
-- 主观题无选项时以题型和题干为基础，保留所有来源版本。
+### 内容版本 `question_versions`
 
-## 搜题索引
+保留每个来源文件中的题干、选项、答案、考点和解析。出现答案或内容冲突时不覆盖来源，而是保留多个内容版本并写入冲突报告。
+
+### 原题记录 `question_occurrences`
+
+连接规范题、内容版本和源文件，保存工作表、行号和原位置。文件刷题必须由 occurrence 读取内容版本和答案。
+
+### 文件题集 `collections`
+
+一个物理文件对应一个 collection，完整相对路径包含扩展名并保持唯一。同名 `.xlsx` 与 `.docx` 不能合并。
+
+### 病例题组
+
+`question_groups` 保存 A3/A4 共享病例题干，`question_group_members` 保存子题顺序和子题干。搜索结果可展示题组关系，但向量仍按子题构建，绝不跨题拼成一个 chunk。
+
+## 固定排序
+
+目录排序由 `medical_app/ordering.py` 决定：
+
+- 顶层考试按学习与使用顺序；
+- 306 学科为生理学、病理学、内科学、外科学、生物化学、人文精神；
+- 人体系统使用显式医学顺序；
+- 中文篇章和括号序号按数值；
+- 历年真题按年份从新到旧；
+- 未命中显式规则的条目稳定排在已知条目之后。
+
+禁止把操作系统、SQLite 或普通字符串排序直接暴露为题库顺序。
+
+## Catalog 构建
+
+```powershell
+python scripts\build_catalog.py --activate
+```
+
+构建过程：
+
+1. 只读扫描 `data/`；
+2. 记录相对路径、扩展名、大小和 SHA-256；
+3. 解析 Excel/Word 并标准化题型、题干、选项和答案；
+4. 生成规范题、来源版本、occurrence 和 collection；
+5. 识别病例题组；
+6. 构建 FTS5；
+7. 输出导入与冲突报告；
+8. 执行完整性、外键和统计校验；
+9. 写入不可变 build；
+10. `--activate` 原子更新 `current.json`。
+
+任何失败都不能覆盖已激活 build。
+
+## 搜索索引
 
 ### FTS5
 
-FTS5 是默认搜索入口，索引规范题干、选项、考点和解析，并为题干和选项设置更高权重。目录字段通过结构化列过滤，不把完整路径重复写入搜索文本。
+FTS 记录与规范题一一对应，包含题干、选项、考点和解析，用于题号、精确片段和关键词召回。中文片段使用 trigram 召回，拉丁字母、希腊字母与数字医学术语保持完整检索，避免不存在的编号被拆成数字片段后误召回无关题目。返回结果再通过结构化表恢复来源路径和 occurrence。
 
-中文搜索可使用 trigram 或导入时生成的分词/n-gram 字段。短查询必须有受限降级策略，禁止重新退化为每次遍历全库并计算 IDF。
+搜题 API 的 `search_fields` 支持 `stem`、`answer`、`point`、`explanation`，`question_types` 支持多个 catalog 实际来源题型标签。题型标签由 `raw_type` 与规范化显示规则共同生成，搜索与结果徽标共用同一标签；后端按规范化 raw type 精确过滤，不会把 A1/A2 等细分题型误归入仅勾选的普通题型。空题型数组表示不限制。题干、考点和解析通过 FTS5 列范围检索，答案通过结构化 `questions.answer` 检索；至少选择一个字段。语义向量只包含题型、题干和有序选项，因此 semantic / hybrid 必须包含 `stem` 范围，其他范围只参与 hybrid 的关键词召回。
 
-### 题目向量
-
-一道规范题目对应一个向量。嵌入文本包含题型、题干和有序选项；不包含答案、考点和完整长解析。A3/A4 子题保留完整病例题干，但仍保持一子题一个向量。
-
-向量索引是可选语义召回层：关闭后精确搜索和刷题必须仍可运行。当前规模使用版本化 NumPy mmap 索引，不引入独立向量数据库服务。默认 `Qwen/Qwen3-Embedding-0.6B`、1024 维；64,078 条 `float32` 向量约 250 MiB。矩阵行预归一化，查询执行精确余弦扫描，Gunicorn worker 共享操作系统页缓存并各限 1 个 BLAS 线程。
-
-### 知识向量
-
-知识问答使用独立索引，内容来自考点和解析。切分不得跨题：
-
-- 约 800 个汉字以内保持一块；
-- 更长内容按段落和句子切成约 400–800 字；
-- 相邻块只保留少量重叠；
-- 每块携带 question ID、科目、章节、来源和内容哈希。
-
-## 查询流程
-
-1. 规范化输入并识别题号、题型和选项片段。
-2. 先做内容哈希、精确、前缀和 FTS5 检索。
-3. 高置信精确结果直接返回。
-4. 需要语义召回时查询题目向量。
-5. 使用 RRF 合并候选并按考试、年份、科目、章节和题型过滤。
-6. 按 question ID 去重，返回结构化题目。
-
-答案必须由题目详情或答题提交阶段控制；练习出题接口默认不能提前返回答案和解析。
-
-## 构建与发布
-
-每次构建写入独立目录：
+### 语义向量
 
 ```text
-knowledge-base/v2/builds/<build_id>/
-  catalog.sqlite3
-  manifest.json
-  import-report.json
-  conflict-report.json
-
-knowledge-base/v2/vector-indexes/<vec_build_id>/
-  embeddings.npy
-  question_ids.json
-  build-state.json
-  manifest.json
-
-knowledge-base/v2/vector-current.json
+单位：一道规范题
+文本：题型 + 题干 + 有序选项
+排除：答案 + 考点 + 解析
+模型：Qwen/Qwen3-Embedding-0.6B
+维度：1024
+格式：float32 单位向量
 ```
 
-`current.json` 只在以下检查全部通过后切换：
+64,078 × 1024 的矩阵约 250 MiB。生产通过 NumPy mmap 加载并由操作系统页缓存共享，不部署独立向量服务。查询使用归一化点积，hybrid 通过 RRF 融合关键词与语义候选。
 
-- 文件与题目统计对账；
-- 数据库完整性和外键检查；
-- 同一 snapshot 重复导入结果一致；
-- FTS 和可选向量 ID 与 question ID 一致；
-- 固定搜索回归集和刷题闭环通过。
+向量 manifest 必须同时匹配：
 
-当前 build schema 版本为 4。build ID 同时绑定 schema 版本和完整源文件 snapshot；改变规范化/schema 会产生新目录，不覆盖旧 build。schema v4 在 v3 基础上要求 `collections.source_file_id` 唯一、保存扩展名，并按包含扩展名的完整相对路径生成 collection ID，因此同名不同格式文件和每个原始文件都能被精确选择。
+- 当前 catalog ID；
+- 规范题 ID 哈希与行数；
+- API URL；
+- 模型；
+- 维度；
+- 矩阵文件哈希、有限值和单位范数。
 
-向量 build ID 绑定 catalog build、snapshot、API URL、模型、维度、文本版本和题目 ID 哈希。运行时只有 catalog build、API URL、模型、维度与激活索引全部一致时才允许 semantic/hybrid 查询。详细安全和构建流程见 `docs/settings-and-semantic-search.md`。
+不兼容时 semantic/hybrid 明确不可用，keyword 继续工作。
 
-旧 build、旧生产知识库和数据库备份在回滚窗口内保持不变。
+## 用户状态
+
+`state/app.sqlite3` 包含：
+
+- `users` 与登录会话；
+- `practice_sessions`；
+- `practice_session_questions`；
+- `question_progress`；
+- `collection_question_progress` 文件维度刷题状态投影；
+- `study_items` 收藏和错题。
+- `question_comments` 原题评论。
+
+catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和错题保存 occurrence、collection 和相对路径，从而按原题库目录浏览。
+
+收藏切换以 `(profile_id, kind, item_key)` 唯一键为事实源，重复操作不能生成重复记录。删除收藏或错题只修改当前账号的 `study_items`，不修改题库、历史答题记录或其他账号数据。密码修改与管理员密码重置会删除该用户的全部登录会话。
+
+`collection_question_progress` 以 `(profile_id, collection_id, occurrence_id)` 唯一定位题号目录状态。提交答案时同步更新该投影；点击题库重置只删除当前账号在当前 collection 的投影行。`practice_sessions` 和 `practice_session_questions` 仍保留为历史试卷，`question_progress`、`study_items` 和 `question_comments` 均不随文件重置删除。同一道规范题出现在其他文件时也不会被连带重置。
+
+`question_comments` 绑定具体 `occurrence_id`，同时保存 `question_id`、作者账号 ID、作者名快照、正文和时间。评论不写入 catalog、不依赖用户外键；所有登录用户可查看和发表，只有作者本人或管理员可以删除，正文去除首尾空白且最长 2000 字。
+
+## 四种刷题模式
+
+| 模式 | 作答 | 即时反馈 | 自动切题 | 交卷前答案 |
+| --- | --- | --- | --- | --- |
+| 练习 | 选择后手动提交 | 当前题 | 否 | 隐藏 |
+| 快刷 | 选择后自动提交 | 正确自动前进，错误展开解析 | 选对时 | 当前已答题可见 |
+| 测试 | 选择后自动提交 | 无 | 是 | 服务端隐藏 |
+| 背题 | 无需作答 | 全部答案解析 | 手动/滑动 | 直接可见 |
+
+测试模式处于 active 时，即使题目已经提交，API 也只能返回用户答案和已答状态，不返回 `is_correct`、正确答案、考点、解析和正确/错误计数。会话完成后才解锁整卷结果。
+
+上一题、下一题、题号跳转和手机左右滑动共用同一前端导航规则。未提交时允许离开当前题并保留本地草稿，但不得写入答题记录或改变题号目录的已答状态。
+
+## 真实数据验收基线
+
+- source/collection：2,127；
+- occurrences：123,564；
+- questions/FTS：64,078；
+- content versions：67,650；
+- groups：1,443；
+- group members：3,732；
+- conflicts：4；
+- SQLite integrity：`ok`；
+- foreign key errors：0。
+
+还必须抽查 `专硕考研（306临床医学综合能力）/历年真题/2026/2026.xlsx`：165 题、A1/A2/A3-A4/B/X 题型目录、指定题号起始、原 occurrence 判分和四种模式。

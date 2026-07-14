@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .catalog import Catalog
+from .catalog import Catalog, normalize_search_fields
 from .normalize import display_text
 from .providers import EmbeddingClient, ProviderError
 from .settings import SettingsStore
@@ -59,19 +59,24 @@ class SemanticSearchService:
         limit: int,
         include_solution: bool,
         filters: dict[str, Any],
+        search_fields: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         mode = display_text(mode).lower() or "keyword"
         limit = max(1, min(int(limit), 50))
+        search_fields = normalize_search_fields(search_fields)
         if mode == "keyword":
             results = self.catalog.search(
                 query,
                 limit=limit,
                 include_solution=include_solution,
+                search_fields=search_fields,
                 **_catalog_filters(filters),
             )
             return results, {"mode": "keyword"}
         if mode not in {"semantic", "hybrid"}:
             raise ValueError("mode must be keyword, semantic, or hybrid")
+        if "stem" not in search_fields:
+            raise ValueError("semantic and hybrid search require the stem search field")
 
         semantic_candidates, vector_meta = self._semantic_candidates(
             query, top_k=max(200, limit * 20)
@@ -86,6 +91,7 @@ class SemanticSearchService:
                 query,
                 limit=max(40, limit * 4),
                 include_solution=False,
+                search_fields=search_fields,
                 **_catalog_filters(filters),
             )
             candidates = _fuse_hybrid(keyword_results, semantic_candidates)
@@ -159,6 +165,7 @@ class SemanticSearchService:
 def _catalog_filters(filters: dict[str, Any]) -> dict[str, Any]:
     return {
         "canonical_type": filters.get("question_type", ""),
+        "question_types": filters.get("question_types", []),
         "exam": filters.get("exam", ""),
         "collection_kind": filters.get("collection_kind", ""),
         "subject": filters.get("subject", ""),
