@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="本地医学题库搜题与刷题">
+  <meta name="description" content="本地医学题库搜题与按文件刷题">
   <title>医学题库</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230b4639'/%3E%3Cpath d='M28 14h8v14h14v8H36v14h-8V36H14v-8h14z' fill='%23fffdf6'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/style.css">
@@ -13,33 +13,32 @@
     <header class="topbar">
       <a class="brand" href="/" aria-label="医学题库首页">
         <span class="brand-mark" aria-hidden="true">M</span>
-        <span>
-          <strong>医学题库</strong>
-          <small>本地搜题与刷题</small>
-        </span>
+        <span><strong>医学题库</strong><small>搜题 · 按文件刷题</small></span>
       </a>
       <div class="status-pill" id="catalogStatus" aria-live="polite">
-        <span class="status-dot"></span>
-        <span>连接题库中</span>
+        <span class="status-dot"></span><span>连接题库中</span>
       </div>
     </header>
 
     <main>
-      <section class="hero">
-        <p class="eyebrow">STRUCTURED MEDICAL BANK</p>
-        <h1>找到原题，也真正练会它。</h1>
-        <p class="hero-copy">结构化题库、毫秒级全文检索与本地练习进度，数据不离开服务器。</p>
+      <section class="hero" id="heroSection">
+        <div>
+          <p class="eyebrow">LOCAL-FIRST MEDICAL BANK</p>
+          <h1>找到原题，沿原题库路径练会它。</h1>
+          <p class="hero-copy">结构化全文检索、原文件题号目录和本地练习进度，核心数据不离开服务器。</p>
+        </div>
         <div class="metric-row" id="metricRow" aria-label="题库统计">
           <div><strong>—</strong><span>规范题目</span></div>
-          <div><strong>—</strong><span>题集</span></div>
+          <div><strong>—</strong><span>题库文件</span></div>
           <div><strong>—</strong><span>来源记录</span></div>
         </div>
       </section>
 
       <nav class="mode-tabs" aria-label="功能切换">
         <button class="mode-tab active" type="button" data-view="search">搜题</button>
-        <button class="mode-tab" type="button" data-view="practice">刷题</button>
+        <button class="mode-tab" type="button" data-view="library">题库</button>
         <button class="mode-tab" type="button" data-view="wrong">错题</button>
+        <button class="mode-tab" type="button" data-view="settings">设置</button>
       </nav>
 
       <section class="view active" id="searchView" data-view-panel="search">
@@ -48,15 +47,21 @@
             <label class="search-field">
               <span class="sr-only">题目关键词</span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
-              <input id="searchInput" name="query" maxlength="500" autocomplete="off" placeholder="粘贴题干，或输入疾病、症状、考点……">
+              <input id="searchInput" name="query" maxlength="500" autocomplete="off" placeholder="粘贴题干、输入题号或描述考点……">
             </label>
             <button class="primary-button" type="submit">搜索</button>
           </form>
           <div class="filter-row">
+            <label>搜索方式
+              <select id="searchMode">
+                <option value="keyword">关键词</option>
+                <option value="hybrid">混合语义</option>
+                <option value="semantic">纯语义</option>
+              </select>
+            </label>
             <label>考试
               <select id="searchExam">
-                <option value="">全部考试</option>
-                <option value="三基考试">三基考试</option>
+                <option value="">全部考试</option><option value="三基考试">三基考试</option>
                 <option value="专硕考研(306临床医学综合能力)">专硕 306</option>
                 <option value="学硕考研(699联考西医综合)">学硕 699</option>
                 <option value="执业医师">执业医师</option>
@@ -64,68 +69,72 @@
             </label>
             <label>题型
               <select id="searchType">
-                <option value="">全部题型</option>
-                <option>单选题</option><option>多选题</option><option>判断题</option>
-                <option>填空题</option><option>名词解释</option><option>简答题</option><option>论述题</option>
+                <option value="">全部题型</option><option>单选题</option><option>多选题</option>
+                <option>判断题</option><option>填空题</option><option>名词解释</option>
+                <option>简答题</option><option>论述题</option>
               </select>
             </label>
             <label class="check-label"><input id="includeSolution" type="checkbox" checked> 显示答案与解析</label>
           </div>
+          <p class="inline-notice" id="semanticNotice" hidden></p>
         </div>
         <div class="section-heading">
           <div><p class="eyebrow">SEARCH RESULTS</p><h2 id="searchHeading">输入题干开始搜索</h2></div>
           <span id="searchMeta"></span>
         </div>
         <div id="searchResults" class="card-list empty-state">
-          <div class="empty-icon" aria-hidden="true">⌕</div>
-          <p>支持完整题干、关键词和短查询。</p>
+          <div class="empty-icon" aria-hidden="true">⌕</div><p>支持完整题干、题号、关键词与可选语义搜索。</p>
         </div>
       </section>
 
-      <section class="view" id="practiceView" data-view-panel="practice" hidden>
-        <div class="panel practice-setup" id="practiceSetup">
-          <div>
-            <p class="eyebrow">NEW SESSION</p>
-            <h2>开始一组本地练习</h2>
-            <p>题目下发时隐藏答案，提交后再显示判定与解析。</p>
+      <section class="view" id="libraryView" data-view-panel="library" hidden>
+        <div id="libraryBrowser">
+          <div class="section-heading">
+            <div><p class="eyebrow">SOURCE LIBRARY</p><h2>按原始文件路径刷题</h2></div>
+            <button class="secondary-button" id="refreshLibrary" type="button">刷新</button>
           </div>
-          <div class="setup-grid">
-            <label>考试
-              <select id="practiceExam">
-                <option value="">全部考试</option>
-                <option value="三基考试">三基考试</option>
-                <option value="专硕考研(306临床医学综合能力)">专硕 306</option>
-                <option value="学硕考研(699联考西医综合)">学硕 699</option>
-                <option value="执业医师">执业医师</option>
-              </select>
-            </label>
-            <label>题型
-              <select id="practiceType">
-                <option value="单选题">单选题</option>
-                <option value="多选题">多选题</option>
-                <option value="判断题">判断题</option>
-                <option value="填空题">填空题</option>
-              </select>
-            </label>
-            <label>年份
-              <input id="practiceYear" type="number" min="1980" max="2100" placeholder="可选，如 2026">
-            </label>
-            <label>题量
-              <select id="practiceCount"><option>5</option><option selected>10</option><option>20</option><option>50</option></select>
-            </label>
+          <nav class="breadcrumbs" id="libraryBreadcrumbs" aria-label="题库路径"></nav>
+          <div class="library-list" id="libraryEntries"><p>正在读取目录…</p></div>
+        </div>
+
+        <div id="collectionView" hidden>
+          <button class="back-button" id="backToLibrary" type="button">← 返回目录</button>
+          <div class="collection-header">
+            <div><p class="eyebrow">QUESTION FILE</p><h2 id="collectionTitle">题库文件</h2><p id="collectionPath"></p></div>
+            <div class="collection-actions">
+              <button class="secondary-button" id="quickPractice" type="button">随机 20 题</button>
+              <button class="primary-button" id="continuePractice" type="button">从未做题开始</button>
+            </div>
           </div>
-          <button class="primary-button" id="startPractice" type="button">开始刷题</button>
+          <div class="panel outline-filters">
+            <div class="chip-group" aria-label="状态筛选">
+              <span>状态</span>
+              <button class="filter-chip active" type="button" data-outline-status="all">全部</button>
+              <button class="filter-chip" type="button" data-outline-status="unanswered">未做</button>
+              <button class="filter-chip" type="button" data-outline-status="correct">做对</button>
+              <button class="filter-chip" type="button" data-outline-status="wrong">做错</button>
+            </div>
+            <label>题型 <select id="outlineType"><option value="">全部题型</option></select></label>
+          </div>
+          <div class="question-directory" id="questionDirectory" aria-label="题号目录"></div>
+          <div class="outline-summary" id="outlineSummary"></div>
         </div>
 
         <div id="practiceWorkspace" hidden>
           <div class="practice-toolbar">
-            <div>
-              <span id="practiceProgress">第 1 / 10 题</span>
+            <button class="back-button" id="exitPractice" type="button">← 题号目录</button>
+            <div class="practice-progress-wrap">
+              <strong id="practiceProgress">第 1 / 10 题</strong>
               <div class="progress-track"><span id="practiceProgressBar"></span></div>
             </div>
-            <button class="text-button" id="newPractice" type="button">结束并新建</button>
           </div>
-          <article class="question-card practice-card" id="practiceCard"></article>
+          <div class="practice-layout">
+            <article class="question-card practice-card" id="practiceCard"></article>
+            <aside class="practice-navigator">
+              <div class="section-heading compact"><h3>题号</h3><span id="practiceScore"></span></div>
+              <div class="session-grid" id="sessionGrid"></div>
+            </aside>
+          </div>
         </div>
       </section>
 
@@ -136,14 +145,59 @@
         </div>
         <div id="wrongResults" class="card-list empty-state"><p>进入此页后加载错题。</p></div>
       </section>
+
+      <section class="view" id="settingsView" data-view-panel="settings" hidden>
+        <div class="section-heading"><div><p class="eyebrow">SETTINGS</p><h2>网站与模型设置</h2></div></div>
+        <div class="settings-grid">
+          <section class="panel settings-card">
+            <h3>浏览器偏好</h3>
+            <p>只保存在当前浏览器，不包含任何密钥。</p>
+            <label>默认搜索方式
+              <select id="preferenceSearchMode"><option value="keyword">关键词</option><option value="hybrid">混合语义</option><option value="semantic">纯语义</option></select>
+            </label>
+            <label>默认结果数
+              <select id="preferenceResultLimit"><option>10</option><option>20</option><option>30</option><option>50</option></select>
+            </label>
+            <label class="check-label"><input id="preferenceShowSolution" type="checkbox"> 搜题默认显示答案与解析</label>
+            <button class="secondary-button" id="savePreferences" type="button">保存浏览器偏好</button>
+          </section>
+
+          <section class="panel settings-card">
+            <h3>服务器模型设置</h3>
+            <p>需要管理员口令。口令和 API 密钥只保留在当前输入/服务器，不写入浏览器存储。</p>
+            <div class="admin-unlock" id="adminUnlock">
+              <label>管理员口令<input id="adminToken" type="password" autocomplete="off" placeholder="输入 ADMIN_TOKEN"></label>
+              <button class="primary-button" id="unlockAdmin" type="button">解锁设置</button>
+            </div>
+            <p class="inline-notice" id="settingsStatus">正在读取语义搜索状态…</p>
+          </section>
+        </div>
+
+        <form class="panel provider-settings" id="providerSettings" hidden>
+          <div class="provider-heading"><div><p class="eyebrow">SEMANTIC SEARCH</p><h3>嵌入模型</h3></div><button class="secondary-button" type="button" data-test-provider="embedding">测试连接</button></div>
+          <div class="form-grid">
+            <label>API URL<input id="embeddingApiUrl" type="url" required></label>
+            <label>模型<input id="embeddingModel" required></label>
+            <label>向量维度<select id="embeddingDimensions"><option>64</option><option>128</option><option>256</option><option>512</option><option>768</option><option>1024</option></select></label>
+            <label>新 API 密钥<input id="embeddingApiKey" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"></label>
+          </div>
+          <label class="check-label"><input id="semanticEnabled" type="checkbox"> 启用语义/混合搜索</label>
+          <p class="secret-state" id="embeddingKeyState"></p>
+
+          <div class="provider-heading divided"><div><p class="eyebrow">LARGE MODEL</p><h3>第三方大模型</h3></div><button class="secondary-button" type="button" data-test-provider="llm">测试连接</button></div>
+          <div class="form-grid">
+            <label>API URL<input id="llmApiUrl" type="url" required></label>
+            <label>模型<input id="llmModel" required></label>
+            <label>新 API 密钥<input id="llmApiKey" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"></label>
+          </div>
+          <p class="secret-state" id="llmKeyState"></p>
+          <div class="form-actions"><button class="primary-button" type="submit">保存服务器设置</button></div>
+        </form>
+      </section>
     </main>
 
-    <footer>
-      <span>medical-web-server v2</span>
-      <span>SQLite · FTS5 · Local-first</span>
-    </footer>
+    <footer><span>medical-web-server v2</span><span>SQLite · FTS5 · mmap vectors</span></footer>
   </div>
-
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <script src="/app.js" defer></script>
 </body>
