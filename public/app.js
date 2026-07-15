@@ -15,6 +15,7 @@ const state = {
   libraryViewMode: "folders",
   libraryGuideExam: "",
   libraryGuideKind: "",
+  libraryGuideTagsExpanded: { exam: true, kind: true },
   libraryGuideExpanded: new Set(),
   libraryGuideCache: {},
   libraryGuideLoading: new Set(),
@@ -422,7 +423,8 @@ async function renderGuidedLibrary() {
 
 function renderGuideRail(label, items, activePath, level) {
   if (!items.length) return "";
-  return `<div class="guide-rail-row"><strong>${label}</strong><div class="guide-rail" role="tablist" aria-label="${label}">${items.map((item) => `<button class="${item.path === activePath ? "active" : ""}" type="button" role="tab" aria-selected="${item.path === activePath}" data-action="guide-select" data-level="${level}" data-path="${escapeAttr(item.path)}"><span>${escapeHtml(item.name)}</span><small>${formatNumber(item.collection_count || 0)}</small></button>`).join("")}</div></div>`;
+  const expanded = state.libraryGuideTagsExpanded[level] !== false;
+  return `<div class="guide-tag-row"><div class="guide-tag-head"><strong>${label}</strong><button type="button" data-action="toggle-guide-tags" data-level="${level}" aria-expanded="${expanded}" aria-label="${expanded ? "收起" : "展开"}${label}标签">${expanded ? "收起" : "展开"}<span aria-hidden="true">${expanded ? "⌃" : "⌄"}</span></button></div><div class="guide-tags ${expanded ? "expanded" : "collapsed"}" role="tablist" aria-label="${label}">${items.map((item) => `<button class="guide-tag ${item.path === activePath ? "active" : ""}" type="button" role="tab" aria-selected="${item.path === activePath}" data-action="guide-select" data-level="${level}" data-path="${escapeAttr(item.path)}" title="${escapeAttr(item.name)}"><span class="guide-tag-check" aria-hidden="true"></span><span class="guide-tag-label">${escapeHtml(item.name)}</span><small>${formatNumber(item.collection_count || 0)}</small></button>`).join("")}</div></div>`;
 }
 
 function renderGuideBranches(payload) {
@@ -1969,6 +1971,19 @@ async function handleClick(event) {
     return renderLibrary("library");
   }
   if (action === "guide-select") return selectGuideLevel(target.dataset.level, target.dataset.path);
+  if (action === "toggle-guide-tags") {
+    const level = target.dataset.level;
+    if (!Object.prototype.hasOwnProperty.call(state.libraryGuideTagsExpanded, level)) return;
+    const expanded = !state.libraryGuideTagsExpanded[level];
+    state.libraryGuideTagsExpanded[level] = expanded;
+    target.setAttribute("aria-expanded", String(expanded));
+    target.setAttribute("aria-label", `${expanded ? "收起" : "展开"}${level === "exam" ? "考试" : "题库"}标签`);
+    target.innerHTML = `${expanded ? "收起" : "展开"}<span aria-hidden="true">${expanded ? "⌃" : "⌄"}</span>`;
+    const tags = target.closest(".guide-tag-row")?.querySelector(".guide-tags");
+    tags?.classList.toggle("expanded", expanded);
+    tags?.classList.toggle("collapsed", !expanded);
+    return;
+  }
   if (action === "toggle-guide-branch") return toggleGuideBranch(target.dataset.path);
   if (action === "open-directory") {
     state.libraryPath[target.dataset.kind] = target.dataset.path;
