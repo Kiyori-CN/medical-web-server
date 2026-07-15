@@ -2338,10 +2338,16 @@ function renderForumTopic(payload, descriptor = parseRouteHash()) {
     topicId: topic.topic_id,
     authorName: replyTarget.author_name,
   } : null;
-  container.innerHTML = `<div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back" data-return="${escapeAttr(returnHash)}">‹ 返回${descriptor.returnHash ? "个人主页" : "论坛"}</button>${topic.can_manage ? `<div class="forum-manage-actions"><button class="text-button" type="button" data-action="forum-edit-topic" data-topic="${escapeAttr(topic.topic_id)}">编辑主题</button><button class="text-button danger" type="button" data-action="forum-delete-topic" data-topic="${escapeAttr(topic.topic_id)}">删除主题</button></div>` : ""}</div>
-    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span><time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(topic.author_id)}" aria-label="查看${escapeAttr(topic.author_name)}的个人资料">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主 · 查看主页</small></span></button><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div>${topic.status === "open" ? forumReactionMarkup(topic, "topic", topic.topic_id, topic.topic_id) : ""}</article>
+  const replyForm = topic.status === "open"
+    ? `<form id="forum-reply-form" class="card forum-reply-form" data-form="forum-reply" data-topic="${escapeAttr(topic.topic_id)}">${replyContext ? `<div class="forum-reply-context"><span>回复 @${escapeHtml(replyContext.authorName)}</span><button class="text-button" type="button" data-action="forum-reply-cancel">取消</button><input type="hidden" name="parent_reply_id" value="${escapeAttr(replyContext.replyId)}"></div>` : ""}<label><span>${replyContext ? `回复 @${escapeHtml(replyContext.authorName)}` : "参与讨论"}</span><textarea name="body" rows="4" minlength="2" maxlength="5000" required placeholder="写下你的观点、解题思路或补充；可使用 @用户名 提及其他用户"></textarea></label><div><small>回复对所有登录用户可见</small><button class="button button-primary" type="submit">发表回复</button></div></form>`
+    : `<div class="card forum-moderated-notice"><strong>${topic.status === "hidden" ? "主题已被管理员隐藏" : "主题已删除"}</strong><span>当前主题不可编辑、回复或互动。</span></div>`;
+  const topicManageActions = topic.can_manage && topic.status !== "deleted"
+    ? `<div class="forum-manage-actions">${topic.status === "open" ? `<button class="text-button" type="button" data-action="forum-edit-topic" data-topic="${escapeAttr(topic.topic_id)}">编辑主题</button>` : ""}<button class="text-button danger" type="button" data-action="forum-delete-topic" data-topic="${escapeAttr(topic.topic_id)}">删除主题</button></div>`
+    : "";
+  container.innerHTML = `<div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back" data-return="${escapeAttr(returnHash)}">‹ 返回${descriptor.returnHash ? "个人主页" : "论坛"}</button>${topicManageActions}</div>
+    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span>${topic.status !== "open" ? `<span class="status-pill ${topic.status === "hidden" ? "pending" : "disabled"}">${topic.status === "hidden" ? "已隐藏" : "已删除"}</span>` : ""}<time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(topic.author_id)}" aria-label="查看${escapeAttr(topic.author_name)}的个人资料">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主 · 查看主页</small></span></button><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div>${topic.status === "open" ? forumReactionMarkup(topic, "topic", topic.topic_id, topic.topic_id) : ""}</article>
     <section class="forum-replies"><div class="forum-replies-head"><h2>全部回复</h2><span>${formatNumber(topic.reply_count || replies.length)}</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(reply.author_id)}" aria-label="查看${escapeAttr(reply.author_name)}的个人资料">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${index + 1} 楼 · ${escapeHtml(formatDate(reply.created_at))}</small></span></button>${forumReplyActions(reply, topic.topic_id)}</div>${reply.parent_author_name ? `<div class="forum-reply-parent">回复 @${escapeHtml(reply.parent_author_name)}</div>` : ""}<p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p>${reply.status === "visible" ? forumReactionMarkup(reply, "reply", reply.reply_id, topic.topic_id) : ""}</article>`).join("") : `<div class="forum-reply-empty">还没有回复，来说说你的看法。</div>`}</section>
-    <form id="forum-reply-form" class="card forum-reply-form" data-form="forum-reply" data-topic="${escapeAttr(topic.topic_id)}">${replyContext ? `<div class="forum-reply-context"><span>回复 @${escapeHtml(replyContext.authorName)}</span><button class="text-button" type="button" data-action="forum-reply-cancel">取消</button><input type="hidden" name="parent_reply_id" value="${escapeAttr(replyContext.replyId)}"></div>` : ""}<label><span>${replyContext ? `回复 @${escapeHtml(replyContext.authorName)}` : "参与讨论"}</span><textarea name="body" rows="4" minlength="2" maxlength="5000" required placeholder="写下你的观点、解题思路或补充；可使用 @用户名 提及其他用户"></textarea></label><div><small>回复对所有登录用户可见</small><button class="button button-primary" type="submit">发表回复</button></div></form>`;
+    ${replyForm}`;
 }
 
 async function submitForumTopic(form) {
@@ -2654,15 +2660,16 @@ async function renderAdminPage() {
   const container = $("#page-admin");
   container.innerHTML = `${adminHeaderMarkup()}${loadingMarkup("正在读取系统状态")}`;
   try {
-    const [dashboard, settings, users, comments, vectors, imports] = await Promise.all([
+    const [dashboard, settings, users, comments, forum, vectors, imports] = await Promise.all([
       api("/admin/dashboard"),
       api("/admin/settings"),
       api("/admin/users"),
       api("/admin/comments?limit=100"),
+      api("/admin/forum/content?limit=100"),
       api("/admin/vectors"),
       api("/admin/catalog/imports"),
     ]);
-    state.adminData = { dashboard, settings, users: users.users || [], comments, vectors, imports: imports.imports || [] };
+    state.adminData = { dashboard, settings, users: users.users || [], comments, forum, vectors, imports: imports.imports || [] };
     if (state.catalogImportPreview && !state.adminData.imports.some((item) => item.import_id === state.catalogImportPreview.import_id)) state.catalogImportPreview = null;
     renderAdminContent();
     if (["queued", "running"].includes(vectors.operation?.status)) scheduleVectorPoll();
@@ -2678,14 +2685,14 @@ function renderAdminContent() {
     ${adminHeaderMarkup()}
     <div class="admin-layout">
       <nav class="card admin-nav" aria-label="管理导航">
-        ${adminTabButton("overview", "运行概览")}${adminTabButton("catalog", "题库管理")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
+        ${adminTabButton("overview", "运行概览")}${adminTabButton("catalog", "题库管理")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("forum", "论坛管理")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
       </nav>
       <div class="admin-content">${renderAdminTab()}</div>
     </div>`;
 }
 
 function adminHeaderMarkup() {
-  return `<div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">账号、模型、检索能力与运行状态集中管理。</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-admin">‹ 返回</button></div></div>`;
+  return `<div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">题库、账号、社区、模型与运行状态集中管理。</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-admin">‹ 返回</button></div></div>`;
 }
 
 function adminTabButton(tab, label) {
@@ -2693,10 +2700,11 @@ function adminTabButton(tab, label) {
 }
 
 function renderAdminTab() {
-  const { dashboard, settings, users, comments } = state.adminData;
+  const { dashboard, settings, users, comments, forum } = state.adminData;
   if (state.adminTab === "catalog") return renderCatalogManagement(dashboard.catalog, state.adminData.imports || []);
   if (state.adminTab === "users") return renderUsers(users);
   if (state.adminTab === "comments") return renderAdminComments(comments);
+  if (state.adminTab === "forum") return renderAdminForum(forum);
   if (state.adminTab === "models") return renderModelSettings(settings);
   if (state.adminTab === "site") return renderSiteSettings(settings);
   const vector = dashboard.vector_index || {};
@@ -2848,6 +2856,40 @@ function renderAdminComments(payload = {}) {
         <button class="button button-danger button-small" type="button" data-action="admin-delete-comment" data-comment-id="${escapeAttr(item.comment_id)}">删除</button>
       </article>`;
     }).join("")}</div>` : emptyMarkup("没有匹配的评论", "调整筛选条件后重试。", "◌")}
+  </section>`;
+}
+
+function forumModerationStatus(item) {
+  if (item.status === "deleted") return ["已删除", "disabled"];
+  if (item.status === "hidden") return [item.raw_status === "hidden" ? "已隐藏" : "随主题隐藏", "pending"];
+  return ["公开", "complete"];
+}
+
+function forumModerationActions(item) {
+  if (item.raw_status === "deleted" || item.topic_status === "deleted" && item.target_type === "reply") return "";
+  const buttons = [];
+  const liveStatus = item.target_type === "topic" ? "open" : "visible";
+  if (item.raw_status === liveStatus) buttons.push(`<button class="button button-secondary button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="hide">隐藏</button>`);
+  if (item.can_restore) buttons.push(`<button class="button button-secondary button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="restore">恢复</button>`);
+  buttons.push(`<button class="button button-danger button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="delete">删除</button>`);
+  return buttons.join("");
+}
+
+function renderAdminForum(payload = {}) {
+  const items = payload.items || [];
+  const audit = payload.audit || [];
+  const stats = payload.stats || {};
+  const actionLabels = { edit: "编辑", hide: "隐藏", restore: "恢复", delete: "删除" };
+  return `<section class="card admin-section">
+    <div class="section-heading"><div><h2>论坛管理</h2><p>筛选主题与回复，执行隐藏、恢复或软删除，并保留管理员审计记录。</p></div></div>
+    <div class="admin-mini-stats"><span><strong>${formatNumber(stats.total || 0)}</strong>全部内容</span><span><strong>${formatNumber(stats.visible || 0)}</strong>公开</span><span><strong>${formatNumber(stats.hidden || 0)}</strong>隐藏</span><span><strong>${formatNumber(stats.deleted || 0)}</strong>删除</span></div>
+    <form id="admin-forum-search" class="admin-forum-search"><label class="field"><span>关键词</span><input name="query" value="${escapeAttr(payload.query || "")}" maxlength="200" placeholder="主题、正文或作者"></label><label class="field"><span>内容类型</span><select name="target_type"><option value="">全部</option><option value="topic" ${payload.target_type === "topic" ? "selected" : ""}>主题</option><option value="reply" ${payload.target_type === "reply" ? "selected" : ""}>回复</option></select></label><label class="field"><span>状态</span><select name="status"><option value="">全部</option><option value="visible" ${payload.status === "visible" ? "selected" : ""}>公开</option><option value="hidden" ${payload.status === "hidden" ? "selected" : ""}>隐藏</option><option value="deleted" ${payload.status === "deleted" ? "selected" : ""}>删除</option></select></label><button class="button button-secondary" type="submit">筛选</button></form>
+    <div class="admin-forum-summary">当前显示 ${formatNumber(items.length)} / ${formatNumber(payload.total || 0)}</div>
+    ${items.length ? `<div class="admin-forum-list">${items.map((item) => {
+      const [statusLabel, statusClass] = forumModerationStatus(item);
+      return `<article class="admin-forum-item"><div class="admin-forum-item-head"><div><span class="status-pill ${statusClass}">${statusLabel}</span><strong>${item.target_type === "topic" ? "论坛主题" : "论坛回复"}</strong><time>${escapeHtml(formatDate(item.updated_at))}</time></div><button class="text-button" type="button" data-action="open-forum-dynamic" data-topic="${escapeAttr(item.topic_id)}">查看主题</button></div><h3>${escapeHtml(item.topic_title)}</h3><p>${escapeHtml(item.preview || "")}</p><div class="admin-forum-item-foot"><span>${escapeHtml(item.author_name || "用户")} · ${escapeHtml(item.section_name || "论坛")}</span><div class="table-actions">${forumModerationActions(item)}</div></div></article>`;
+    }).join("")}</div>` : emptyMarkup("没有匹配的论坛内容", "调整关键词、类型或状态后重试。", "◌")}
+    <div class="admin-forum-audit"><div class="section-heading"><div><h3>审核记录</h3><p>最近 ${formatNumber(audit.length)} 条管理员操作，仅记录目标、状态、原因与操作者。</p></div></div>${audit.length ? `<div class="admin-forum-audit-list">${audit.map((item) => `<article><div><strong>${escapeHtml(item.moderator_name || "管理员")} · ${actionLabels[item.action] || escapeHtml(item.action)}</strong><time>${escapeHtml(formatDate(item.created_at))}</time></div><p>${escapeHtml(item.reason)}</p><small>${item.target_type === "topic" ? "主题" : "回复"} · ${escapeHtml(item.previous_status)} → ${escapeHtml(item.new_status)} · ${escapeHtml(item.target_id)}</small></article>`).join("")}</div>` : `<p class="message-empty">暂无审核记录</p>`}</div>
   </section>`;
 }
 
@@ -3120,6 +3162,7 @@ async function handleClick(event) {
   if (action === "build-vectors") return buildVectors();
   if (action === "delete-vectors") return deleteVectors();
   if (action === "admin-delete-comment") return adminDeleteComment(target.dataset.commentId);
+  if (action === "admin-forum-moderate") return moderateAdminForum(target);
   if (action === "open-personal-source") return openPersonalSource(target);
   if (action === "catalog-import-select") {
     state.catalogImportPreview = (state.adminData.imports || []).find((item) => item.import_id === target.dataset.importId) || null;
@@ -3194,6 +3237,7 @@ async function handleSubmit(event) {
   if (event.target.id === "admin-catalog-import") return submitCatalogImport(event.target);
   if (event.target.id === "admin-catalog-import-mapping") return analyzeCatalogImport(event.target);
   if (event.target.id === "admin-comment-search") return searchAdminComments(event.target);
+  if (event.target.id === "admin-forum-search") return searchAdminForum(event.target);
   if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);
   if (event.target.dataset.form === "question-note") return submitQuestionNote(event.target);
@@ -3805,6 +3849,63 @@ async function searchAdminComments(form) {
     renderAdminContent();
   } catch (error) {
     showToast(error.message, "error");
+  }
+}
+
+function adminForumQuery(payload = state.adminData?.forum || {}) {
+  const params = new URLSearchParams({ limit: "100", offset: "0" });
+  if (payload.query) params.set("query", payload.query);
+  if (payload.target_type) params.set("target_type", payload.target_type);
+  if (payload.status) params.set("status", payload.status);
+  return params;
+}
+
+async function refreshAdminForum() {
+  state.adminData.forum = await api(`/admin/forum/content?${adminForumQuery()}`);
+  renderAdminContent();
+}
+
+async function searchAdminForum(form) {
+  const values = Object.fromEntries(new FormData(form));
+  const params = adminForumQuery({
+    query: String(values.query || "").trim(),
+    target_type: String(values.target_type || ""),
+    status: String(values.status || ""),
+  });
+  try {
+    state.adminData.forum = await api(`/admin/forum/content?${params}`);
+    renderAdminContent();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function moderateAdminForum(button) {
+  const action = button.dataset.moderationAction;
+  const labels = { hide: "隐藏", restore: "恢复", delete: "删除" };
+  if (!labels[action]) return;
+  const reason = await textEditorModal(
+    `${labels[action]}论坛${button.dataset.targetType === "topic" ? "主题" : "回复"}`,
+    "",
+    500,
+    `确认${labels[action]}`
+  );
+  if (reason === null) return;
+  if (reason.length < 2) return showToast("请填写至少 2 个字符的审核原因", "error");
+  setButtonBusy(button, true, "处理中");
+  try {
+    await api(`/admin/forum/content/${encodeURIComponent(button.dataset.targetType)}/${encodeURIComponent(button.dataset.targetId)}`, {
+      method: "PATCH",
+      body: { action, reason },
+    });
+    await refreshAdminForum();
+    state.forum.sections = null;
+    state.forum.topics = null;
+    state.forum.topic = null;
+    showToast(`论坛内容已${labels[action]}`);
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
   }
 }
 

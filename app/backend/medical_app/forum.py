@@ -55,6 +55,20 @@ CREATE TABLE IF NOT EXISTS forum_reactions (
     PRIMARY KEY (target_type, target_id, profile_id)
 );
 
+CREATE TABLE IF NOT EXISTS forum_moderation_log (
+    audit_id TEXT PRIMARY KEY,
+    target_type TEXT NOT NULL CHECK (target_type IN ('topic', 'reply')),
+    target_id TEXT NOT NULL,
+    topic_id TEXT NOT NULL,
+    moderator_id TEXT NOT NULL,
+    moderator_name TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('edit', 'hide', 'restore', 'delete')),
+    previous_status TEXT NOT NULL,
+    new_status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_forum_topics_listing
 ON forum_topics(section_id, status, updated_at DESC, topic_id);
 
@@ -63,6 +77,18 @@ ON forum_replies(topic_id, status, created_at, reply_id);
 
 CREATE INDEX IF NOT EXISTS idx_forum_reactions_target
 ON forum_reactions(target_type, target_id, reaction);
+
+CREATE INDEX IF NOT EXISTS idx_forum_topics_admin
+ON forum_topics(status, updated_at DESC, topic_id);
+
+CREATE INDEX IF NOT EXISTS idx_forum_replies_admin
+ON forum_replies(status, updated_at DESC, reply_id);
+
+CREATE INDEX IF NOT EXISTS idx_forum_moderation_created
+ON forum_moderation_log(created_at DESC, audit_id);
+
+CREATE INDEX IF NOT EXISTS idx_forum_moderation_target
+ON forum_moderation_log(target_type, target_id, created_at DESC);
 """
 
 DEFAULT_SECTIONS = (
@@ -265,7 +291,16 @@ class ForumStore:
             ).fetchall()
         return {"topic": self._topic_detail(row, viewer_is_admin), "replies": [self._reply(row, viewer_is_admin) for row in replies]}
 
-    def update_topic(self, topic_id: str, *, title: object, body: object, viewer_is_admin: bool = False) -> dict[str, Any]:
+    def update_topic(
+        self,
+        topic_id: str,
+        *,
+        title: object,
+        body: object,
+        viewer_is_admin: bool = False,
+        moderator_name: object = "管理员",
+        moderation_reason: object = "管理员从主题详情编辑",
+    ) -> dict[str, Any]:
         title = _text(title, field="标题", minimum=4, maximum=120)
         body = _text(body, field="正文", minimum=4, maximum=20000)
         with self._connect() as connection:
@@ -278,17 +313,51 @@ class ForumStore:
                 "UPDATE forum_topics SET title = ?, body = ?, updated_at = ? WHERE topic_id = ?",
                 (title, body, now, topic_id),
             )
+            if viewer_is_admin and row["author_id"] != self.profile_id:
+                self._record_moderation(
+                    connection,
+                    target_type="topic",
+                    target_id=topic_id,
+                    topic_id=topic_id,
+                    moderator_name=moderator_name,
+                    action="edit",
+                    previous_status=row["status"],
+                    new_status=row["status"],
+                    reason=moderation_reason,
+                    created_at=now,
+                )
             connection.commit()
         return self.get_topic(topic_id, viewer_is_admin=viewer_is_admin)["topic"]
 
-    def delete_topic(self, topic_id: str, *, viewer_is_admin: bool = False) -> bool:
+    def delete_topic(
+        self,
+        topic_id: str,
+        *,
+        viewer_is_admin: bool = False,
+        moderator_name: object = "管理员",
+        moderation_reason: object = "管理员从主题详情删除",
+    ) -> bool:
         with self._connect() as connection:
             row = self._topic_row(connection, topic_id)
             self._require_owner(row["author_id"], viewer_is_admin)
+            now = _utc_now()
             cursor = connection.execute(
                 "UPDATE forum_topics SET status = 'deleted', updated_at = ? WHERE topic_id = ? AND status != 'deleted'",
-                (_utc_now(), topic_id),
+                (now, topic_id),
             )
+            if cursor.rowcount and viewer_is_admin and row["author_id"] != self.profile_id:
+                self._record_moderation(
+                    connection,
+                    target_type="topic",
+                    target_id=topic_id,
+                    topic_id=topic_id,
+                    moderator_name=moderator_name,
+                    action="delete",
+                    previous_status=row["status"],
+                    new_status="deleted",
+                    reason=moderation_reason,
+                    created_at=now,
+                )
             connection.commit()
         return cursor.rowcount > 0
 
@@ -355,7 +424,15 @@ class ForumStore:
             "can_manage": True,
         }
 
-    def update_reply(self, reply_id: str, *, body: object, viewer_is_admin: bool = False) -> dict[str, Any]:
+    def update_reply(
+        self,
+        reply_id: str,
+        *,
+        body: object,
+        viewer_is_admin: bool = False,
+        moderator_name: object = "管理员",
+        moderation_reason: object = "管理员从主题详情编辑",
+    ) -> dict[str, Any]:
         body = _text(body, field="回复", minimum=2, maximum=5000)
         with self._connect() as connection:
             row = self._reply_row(connection, reply_id)
@@ -370,19 +447,53 @@ class ForumStore:
             connection.execute(
                 "UPDATE forum_topics SET updated_at = ? WHERE topic_id = ?", (now, row["topic_id"])
             )
+            if viewer_is_admin and row["author_id"] != self.profile_id:
+                self._record_moderation(
+                    connection,
+                    target_type="reply",
+                    target_id=reply_id,
+                    topic_id=row["topic_id"],
+                    moderator_name=moderator_name,
+                    action="edit",
+                    previous_status=row["status"],
+                    new_status=row["status"],
+                    reason=moderation_reason,
+                    created_at=now,
+                )
             connection.commit()
         payload = dict(row)
         payload.update({"body": body, "updated_at": now, "can_manage": True})
         return payload
 
-    def delete_reply(self, reply_id: str, *, viewer_is_admin: bool = False) -> bool:
+    def delete_reply(
+        self,
+        reply_id: str,
+        *,
+        viewer_is_admin: bool = False,
+        moderator_name: object = "管理员",
+        moderation_reason: object = "管理员从主题详情删除",
+    ) -> bool:
         with self._connect() as connection:
             row = self._reply_row(connection, reply_id)
             self._require_owner(row["author_id"], viewer_is_admin)
+            now = _utc_now()
             cursor = connection.execute(
                 "UPDATE forum_replies SET status = 'deleted', updated_at = ? WHERE reply_id = ? AND status != 'deleted'",
-                (_utc_now(), reply_id),
+                (now, reply_id),
             )
+            if cursor.rowcount and viewer_is_admin and row["author_id"] != self.profile_id:
+                self._record_moderation(
+                    connection,
+                    target_type="reply",
+                    target_id=reply_id,
+                    topic_id=row["topic_id"],
+                    moderator_name=moderator_name,
+                    action="delete",
+                    previous_status=row["status"],
+                    new_status="deleted",
+                    reason=moderation_reason,
+                    created_at=now,
+                )
             connection.commit()
         return cursor.rowcount > 0
 
@@ -427,6 +538,226 @@ class ForumStore:
             )
             connection.commit()
             return self._reaction_payload(connection, target_type, target_id)
+
+    def admin_content(
+        self,
+        *,
+        query: object = "",
+        target_type: object = "",
+        status: object = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        query = display_text(query)[:200]
+        target_type = display_text(target_type).lower()
+        status = display_text(status).lower()
+        if target_type not in {"", "topic", "reply"}:
+            raise ValueError("论坛内容类型无效")
+        if status not in {"", "visible", "hidden", "deleted"}:
+            raise ValueError("论坛内容状态无效")
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        content_cte = """
+            WITH content AS (
+                SELECT 'topic' AS target_type, t.topic_id AS target_id,
+                       t.topic_id, t.section_id, s.name AS section_name,
+                       t.title AS topic_title, t.author_id, t.author_name,
+                       substr(t.body, 1, 600) AS preview, t.body AS search_body,
+                       CASE t.status WHEN 'open' THEN 'visible' ELSE t.status END AS status,
+                       t.status AS raw_status, t.status AS topic_status,
+                       t.created_at, t.updated_at
+                FROM forum_topics t
+                JOIN forum_sections s ON s.section_id = t.section_id
+                UNION ALL
+                SELECT 'reply' AS target_type, r.reply_id AS target_id,
+                       r.topic_id, t.section_id, s.name AS section_name,
+                       t.title AS topic_title, r.author_id, r.author_name,
+                       substr(r.body, 1, 600) AS preview, r.body AS search_body,
+                       CASE
+                         WHEN r.status = 'deleted' OR t.status = 'deleted' THEN 'deleted'
+                         WHEN r.status = 'hidden' OR t.status = 'hidden' THEN 'hidden'
+                         ELSE 'visible'
+                       END AS status,
+                       r.status AS raw_status, t.status AS topic_status,
+                       r.created_at, r.updated_at
+                FROM forum_replies r
+                JOIN forum_topics t ON t.topic_id = r.topic_id
+                JOIN forum_sections s ON s.section_id = t.section_id
+            )
+        """
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if target_type:
+            clauses.append("target_type = ?")
+            parameters.append(target_type)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            clauses.append(
+                "(topic_title LIKE ? ESCAPE '\\' OR search_body LIKE ? ESCAPE '\\' OR author_name LIKE ? ESCAPE '\\')"
+            )
+            parameters.extend([like, like, like])
+        where = " AND ".join(clauses) or "1 = 1"
+        with self._connect() as connection:
+            total = connection.execute(
+                f"{content_cte} SELECT COUNT(*) FROM content WHERE {where}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                {content_cte}
+                SELECT * FROM content
+                WHERE {where}
+                ORDER BY updated_at DESC, target_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*parameters, limit, offset],
+            ).fetchall()
+            stat_rows = connection.execute(
+                f"{content_cte} SELECT target_type, status, COUNT(*) AS count FROM content GROUP BY target_type, status"
+            ).fetchall()
+            audit_rows = connection.execute(
+                """
+                SELECT audit_id, target_type, target_id, topic_id,
+                       moderator_id, moderator_name, action,
+                       previous_status, new_status, reason, created_at
+                FROM forum_moderation_log
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 100
+                """
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item.pop("search_body", None)
+            item["can_restore"] = item["raw_status"] == "hidden" and (
+                item["target_type"] == "topic" or item["topic_status"] == "open"
+            )
+            items.append(item)
+        stats = {
+            "total": 0,
+            "topics": 0,
+            "replies": 0,
+            "visible": 0,
+            "hidden": 0,
+            "deleted": 0,
+        }
+        for row in stat_rows:
+            count = int(row["count"])
+            stats["total"] += count
+            stats["topics" if row["target_type"] == "topic" else "replies"] += count
+            stats[row["status"]] += count
+        return {
+            "query": query,
+            "target_type": target_type,
+            "status": status,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+            "stats": stats,
+            "items": items,
+            "audit": [dict(row) for row in audit_rows],
+        }
+
+    def moderate_content(
+        self,
+        target_type: object,
+        target_id: object,
+        *,
+        action: object,
+        reason: object,
+        moderator_name: object,
+    ) -> dict[str, Any]:
+        target_type = _reaction_target(target_type)
+        target_id = display_text(target_id)
+        action = display_text(action).lower()
+        if action not in {"hide", "restore", "delete"}:
+            raise ValueError("论坛审核操作无效")
+        reason = _text(reason, field="审核原因", minimum=2, maximum=500)
+        moderator_name = _text(
+            moderator_name, field="管理员用户名", minimum=1, maximum=32
+        )
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if target_type == "topic":
+                row = self._topic_row(connection, target_id)
+                topic_id = target_id
+                current = row["status"]
+                transitions = {
+                    "hide": ("open", "hidden"),
+                    "restore": ("hidden", "open"),
+                }
+                if action == "delete":
+                    if current == "deleted":
+                        raise ForumForbidden("该主题已经删除")
+                    new_status = "deleted"
+                else:
+                    expected, new_status = transitions[action]
+                    if current != expected:
+                        raise ForumForbidden("当前主题状态不允许执行该操作")
+                connection.execute(
+                    "UPDATE forum_topics SET status = ?, updated_at = ? WHERE topic_id = ?",
+                    (new_status, now, target_id),
+                )
+            else:
+                row = connection.execute(
+                    """
+                    SELECT r.*, t.status AS topic_status
+                    FROM forum_replies r
+                    JOIN forum_topics t ON t.topic_id = r.topic_id
+                    WHERE r.reply_id = ?
+                    """,
+                    (target_id,),
+                ).fetchone()
+                if row is None:
+                    raise ForumNotFound("论坛回复不存在")
+                topic_id = row["topic_id"]
+                current = row["status"]
+                if action == "delete":
+                    if current == "deleted":
+                        raise ForumForbidden("该回复已经删除")
+                    new_status = "deleted"
+                elif action == "hide":
+                    if current != "visible":
+                        raise ForumForbidden("当前回复状态不允许隐藏")
+                    new_status = "hidden"
+                else:
+                    if current != "hidden":
+                        raise ForumForbidden("当前回复状态不允许恢复")
+                    if row["topic_status"] != "open":
+                        raise ForumForbidden("请先恢复所属主题")
+                    new_status = "visible"
+                connection.execute(
+                    "UPDATE forum_replies SET status = ?, updated_at = ? WHERE reply_id = ?",
+                    (new_status, now, target_id),
+                )
+            audit_id = self._record_moderation(
+                connection,
+                target_type=target_type,
+                target_id=target_id,
+                topic_id=topic_id,
+                moderator_name=moderator_name,
+                action=action,
+                previous_status=current,
+                new_status=new_status,
+                reason=reason,
+                created_at=now,
+            )
+            connection.commit()
+        return {
+            "audit_id": audit_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "topic_id": topic_id,
+            "action": action,
+            "previous_status": current,
+            "new_status": new_status,
+            "reason": reason,
+            "created_at": now,
+        }
 
     def _topic_row(self, connection: sqlite3.Connection, topic_id: str) -> sqlite3.Row:
         row = connection.execute("SELECT * FROM forum_topics WHERE topic_id = ?", (display_text(topic_id),)).fetchone()
@@ -487,6 +818,47 @@ class ForumStore:
     def _require_owner(self, author_id: str, viewer_is_admin: bool) -> None:
         if author_id != self.profile_id and not viewer_is_admin:
             raise ForumForbidden("只能管理自己的论坛内容")
+
+    def _record_moderation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        target_type: str,
+        target_id: str,
+        topic_id: str,
+        moderator_name: object,
+        action: str,
+        previous_status: str,
+        new_status: str,
+        reason: object,
+        created_at: str,
+    ) -> str:
+        moderator_name = display_text(moderator_name)[:32] or "管理员"
+        reason = display_text(reason)[:500] or "管理员操作"
+        audit_id = f"aud_{secrets.token_hex(12)}"
+        connection.execute(
+            """
+            INSERT INTO forum_moderation_log(
+                audit_id, target_type, target_id, topic_id,
+                moderator_id, moderator_name, action,
+                previous_status, new_status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                audit_id,
+                target_type,
+                target_id,
+                topic_id,
+                self.profile_id,
+                moderator_name,
+                action,
+                previous_status,
+                new_status,
+                reason,
+                created_at,
+            ),
+        )
+        return audit_id
 
     def _notify_reply(
         self,
@@ -632,7 +1004,9 @@ class ForumStore:
 
     def _reply(self, row: sqlite3.Row, viewer_is_admin: bool) -> dict[str, Any]:
         payload = dict(row)
-        if row["status"] != "visible":
+        if row["status"] == "hidden":
+            payload["body"] = "该回复已被管理员隐藏"
+        elif row["status"] == "deleted":
             payload["body"] = "该回复已被删除"
         payload["can_manage"] = row["author_id"] == self.profile_id or viewer_is_admin
         return payload

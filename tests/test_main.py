@@ -181,6 +181,10 @@ def test_main_auth_roles_health_assets_and_practice(
             "body": "验证论坛互动 API 的鉴权与计数。",
         },
     ).get_json()
+    forum_admin = client.get("/api/admin/forum/content?limit=100")
+    assert forum_admin.status_code == 200
+    assert forum_admin.get_json()["stats"]["topics"] == 1
+    assert forum_admin.get_json()["items"][0]["target_id"] == forum_topic["topic_id"]
     search = client.post(
         "/api/search",
         json={"query": "细胞膜运输", "include_solution": False},
@@ -208,6 +212,12 @@ def test_main_auth_roles_health_assets_and_practice(
     assert ordinary.get("/api/admin/vectors").status_code == 403
     assert ordinary.get("/api/admin/catalog/export?format=jsonl").status_code == 403
     assert ordinary.get("/api/admin/catalog/imports").status_code == 403
+    assert ordinary.get("/api/admin/forum/content").status_code == 403
+    assert ordinary.patch(
+        f"/api/admin/forum/content/topic/{forum_topic['topic_id']}",
+        headers=_csrf(ordinary),
+        json={"action": "hide", "reason": "普通用户不能审核"},
+    ).status_code == 403
     assert ordinary.put(
         f"/api/forum/topics/{forum_topic['topic_id']}/reaction",
         json={"reaction": "agree"},
@@ -223,6 +233,34 @@ def test_main_auth_roles_health_assets_and_practice(
         f"/api/forum/topics/{forum_topic['topic_id']}"
     ).get_json()
     assert forum_detail["topic"]["agree_count"] == 1
+    assert client.patch(
+        f"/api/admin/forum/content/topic/{forum_topic['topic_id']}",
+        json={"action": "hide", "reason": "缺少 CSRF"},
+    ).status_code == 403
+    hidden_forum = client.patch(
+        f"/api/admin/forum/content/topic/{forum_topic['topic_id']}",
+        headers=_csrf(client),
+        json={"action": "hide", "reason": "集成测试隐藏主题"},
+    )
+    assert hidden_forum.status_code == 200
+    assert hidden_forum.get_json()["new_status"] == "hidden"
+    assert ordinary.get(
+        f"/api/forum/topics/{forum_topic['topic_id']}"
+    ).status_code == 404
+    restored_forum = client.patch(
+        f"/api/admin/forum/content/topic/{forum_topic['topic_id']}",
+        headers=_csrf(client),
+        json={"action": "restore", "reason": "集成测试恢复主题"},
+    )
+    assert restored_forum.status_code == 200
+    moderated_forum = client.get(
+        "/api/admin/forum/content?target_type=topic&status=visible"
+    ).get_json()
+    assert moderated_forum["total"] == 1
+    assert [item["action"] for item in moderated_forum["audit"][:2]] == [
+        "restore",
+        "hide",
+    ]
     assert ordinary.get("/api/settings").status_code == 200
     wrong_password = ordinary.post(
         "/api/auth/password",

@@ -219,3 +219,121 @@ def test_forum_nested_replies_and_mentions_are_deduplicated(tmp_path: Path):
             author_name="CharlieUser",
             parent_reply_id=parent["reply_id"],
         )
+
+
+def test_forum_admin_moderation_filters_and_audit(tmp_path: Path):
+    alice, bob, alice_store, bob_store = _forum_services(tmp_path)
+    charlie = AuthStore(alice_store.database_path).register(
+        "CharlieUser", "StrongPass3!"
+    )
+    charlie_store = ForumStore(alice_store.database_path, charlie["user_id"])
+    topic = bob_store.create_topic(
+        section_id="questions",
+        title="需要管理员审核的讨论",
+        body="这是一条用于验证隐藏、恢复和审计记录的论坛主题。",
+        author_name="BobUser",
+    )
+    reply = bob_store.create_reply(
+        topic["topic_id"],
+        body="这是一条需要审核的回复。",
+        author_name="BobUser",
+    )
+
+    content = alice_store.admin_content(
+        query="管理员审核", target_type="topic", limit=10
+    )
+    assert content["total"] == 1
+    assert content["items"][0]["target_type"] == "topic"
+    assert content["stats"] == {
+        "total": 2,
+        "topics": 1,
+        "replies": 1,
+        "visible": 2,
+        "hidden": 0,
+        "deleted": 0,
+    }
+    with pytest.raises(ValueError, match="审核原因"):
+        alice_store.moderate_content(
+            "topic",
+            topic["topic_id"],
+            action="hide",
+            reason="短",
+            moderator_name="Alice",
+        )
+
+    hidden_topic = alice_store.moderate_content(
+        "topic",
+        topic["topic_id"],
+        action="hide",
+        reason="等待管理员复核主题内容",
+        moderator_name="Alice",
+    )
+    assert hidden_topic["new_status"] == "hidden"
+    assert bob_store.list_topics()["total"] == 0
+    assert bob_store.get_topic(topic["topic_id"])["topic"]["status"] == "hidden"
+    with pytest.raises(ForumNotFound):
+        charlie_store.get_topic(topic["topic_id"])
+    with pytest.raises(ForumForbidden, match="不可回复"):
+        bob_store.create_reply(
+            topic["topic_id"], body="隐藏后不能回复。", author_name="BobUser"
+        )
+
+    alice_store.moderate_content(
+        "reply",
+        reply["reply_id"],
+        action="hide",
+        reason="随主题一起复核回复",
+        moderator_name="Alice",
+    )
+    with pytest.raises(ForumForbidden, match="先恢复所属主题"):
+        alice_store.moderate_content(
+            "reply",
+            reply["reply_id"],
+            action="restore",
+            reason="尝试提前恢复回复",
+            moderator_name="Alice",
+        )
+    alice_store.moderate_content(
+        "topic",
+        topic["topic_id"],
+        action="restore",
+        reason="主题复核通过",
+        moderator_name="Alice",
+    )
+    alice_store.moderate_content(
+        "reply",
+        reply["reply_id"],
+        action="restore",
+        reason="回复复核通过",
+        moderator_name="Alice",
+    )
+    updated = alice_store.update_reply(
+        reply["reply_id"],
+        body="管理员修正了这条回复。",
+        viewer_is_admin=True,
+        moderator_name="Alice",
+        moderation_reason="移除不合适的表述",
+    )
+    assert updated["body"] == "管理员修正了这条回复。"
+    assert alice_store.delete_reply(
+        reply["reply_id"], viewer_is_admin=True, moderator_name="Alice"
+    ) is True
+    with pytest.raises(ForumForbidden, match="已经删除"):
+        alice_store.moderate_content(
+            "reply",
+            reply["reply_id"],
+            action="delete",
+            reason="不能重复删除",
+            moderator_name="Alice",
+        )
+
+    deleted = alice_store.admin_content(
+        target_type="reply", status="deleted", limit=10
+    )
+    assert deleted["total"] == 1
+    assert deleted["items"][0]["target_id"] == reply["reply_id"]
+    assert deleted["items"][0]["raw_status"] == "deleted"
+    actions = [item["action"] for item in deleted["audit"]]
+    assert actions[:6] == ["delete", "edit", "restore", "restore", "hide", "hide"]
+    assert deleted["audit"][0]["moderator_id"] == alice["user_id"]
+    assert deleted["audit"][0]["moderator_name"] == "Alice"
