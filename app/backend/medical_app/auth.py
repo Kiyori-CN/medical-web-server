@@ -19,6 +19,9 @@ SESSION_COOKIE = "medical_session"
 CSRF_COOKIE = "medical_csrf"
 SESSION_TTL_SECONDS = 14 * 24 * 60 * 60
 _USERNAME_RE = re.compile(r"^[\w.-]{3,32}$", re.UNICODE)
+_AVATAR_OPTIONS = {
+    "", "医", "学", "知", "🩺", "🧬", "🧠", "🫀", "🫁", "📚", "⭐", "🌿",
+}
 
 
 class AuthenticationError(RuntimeError):
@@ -63,6 +66,13 @@ def validate_password(value: str) -> str:
     return password
 
 
+def validate_avatar(value: str) -> str:
+    avatar = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if avatar not in _AVATAR_OPTIONS:
+        raise ValueError("请选择系统提供的头像")
+    return avatar
+
+
 class AuthStore:
     def __init__(self, database_path: str | Path):
         self.database_path = Path(database_path).resolve()
@@ -79,6 +89,7 @@ class AuthStore:
                     user_id TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
                     normalized_username TEXT NOT NULL UNIQUE,
+                    avatar TEXT NOT NULL DEFAULT '',
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
                     status TEXT NOT NULL DEFAULT 'active'
@@ -104,6 +115,13 @@ class AuthStore:
                 ON users(role, status);
                 """
             )
+            user_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(users)")
+            }
+            if "avatar" not in user_columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN avatar TEXT NOT NULL DEFAULT ''"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -236,6 +254,40 @@ class AuthStore:
             connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
             connection.commit()
 
+    def update_profile(self, user_id: str, username: str, avatar: str) -> dict[str, Any]:
+        display_name = validate_username(username)
+        avatar = validate_avatar(avatar)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone() is None:
+                connection.rollback()
+                raise AuthenticationError("用户不存在")
+            try:
+                connection.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, normalized_username = ?, avatar = ?, updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (
+                        display_name,
+                        _normalized_username(display_name),
+                        avatar,
+                        _utc_now(),
+                        user_id,
+                    ),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                connection.rollback()
+                raise AuthenticationError("用户名已存在") from error
+            updated = connection.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return self._public_user(updated)
+
     def create_session(
         self, user_id: str, *, user_agent: str = "", remote_address: str = ""
     ) -> tuple[str, int]:
@@ -300,7 +352,7 @@ class AuthStore:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT user_id, username, role, status, created_at, updated_at, last_login_at
+                SELECT user_id, username, avatar, role, status, created_at, updated_at, last_login_at
                 FROM users
                 ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, created_at, username
                 LIMIT ? OFFSET ?
@@ -373,6 +425,7 @@ class AuthStore:
         return {
             "user_id": row["user_id"],
             "username": row["username"],
+            "avatar": row["avatar"],
             "role": row["role"],
             "status": row["status"],
             "created_at": row["created_at"],
@@ -529,6 +582,18 @@ def create_auth_blueprint(
         response.delete_cookie(SESSION_COOKIE, path="/")
         response.delete_cookie(CSRF_COOKIE, path="/")
         return response
+
+    @blueprint.put("/profile")
+    @login_required
+    @csrf_required
+    def update_profile():
+        data = _json_object()
+        user = store.update_profile(
+            g.current_user["user_id"],
+            data.get("username", g.current_user["username"]),
+            data.get("avatar", g.current_user.get("avatar", "")),
+        )
+        return jsonify({"user": user})
 
     return blueprint
 

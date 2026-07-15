@@ -70,13 +70,13 @@
         <div class="topbar-actions">
           <button id="admin-entry" class="button button-quiet admin-only" type="button" data-action="open-admin" hidden>管理系统</button>
           <button class="profile-button" type="button" data-action="toggle-profile" aria-haspopup="menu" aria-expanded="false">
-            <span id="profile-avatar" class="profile-avatar">K</span>
+            <span id="profile-avatar" class="profile-avatar"><span id="profile-avatar-glyph">U</span></span>
             <span class="profile-copy"><strong id="profile-name">用户</strong><small id="profile-role">普通用户</small></span>
             <span aria-hidden="true">⌄</span>
           </button>
           <div id="profile-menu" class="profile-menu" role="menu" hidden>
-            <button id="admin-menu-entry" type="button" role="menuitem" data-action="open-admin" hidden>管理系统</button>
-            <button type="button" role="menuitem" data-action="change-password">修改密码</button>
+            <button type="button" role="menuitem" data-action="open-profile">个人中心</button>
+            <button type="button" role="menuitem" data-action="open-messages">我的消息</button>
             <button type="button" role="menuitem" data-action="logout">退出登录</button>
           </div>
         </div>
@@ -89,6 +89,8 @@
       <section id="page-favorites" class="page" hidden></section>
       <section id="page-wrong" class="page" hidden></section>
       <section id="page-practice" class="page page-practice" hidden></section>
+      <section id="page-profile" class="page" hidden></section>
+      <section id="page-messages" class="page" hidden></section>
       <section id="page-admin" class="page" hidden></section>
     </main>
 

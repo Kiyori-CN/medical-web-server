@@ -21,9 +21,13 @@ def test_local_accounts_hash_passwords_sessions_and_last_admin_guard(tmp_path):
 
     with pytest.raises(AuthenticationError, match="当前密码不正确"):
         store.change_password(user["user_id"], "WrongPass1!", "ChangedPass2!")
+    profile = store.update_profile(user["user_id"], "StudentNew", "🩺")
+    assert profile["username"] == "StudentNew"
+    assert profile["avatar"] == "🩺"
+    assert store.authenticate("studentnew", "StudentPass1!")["avatar"] == "🩺"
     store.change_password(user["user_id"], "StudentPass1!", "ChangedPass2!")
     assert store.resolve_session(token) is None
-    assert store.authenticate("student", "ChangedPass2!")["username"] == "Student"
+    assert store.authenticate("studentnew", "ChangedPass2!")["username"] == "StudentNew"
 
     with pytest.raises(AuthorizationError, match="最后一个"):
         store.update_user(admin["user_id"], {"status": "disabled"})

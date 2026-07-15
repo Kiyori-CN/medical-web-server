@@ -58,6 +58,14 @@ def test_main_auth_roles_health_assets_and_practice(
         json={"username": "again", "password": "StrongPass1!"},
     ).status_code == 409
 
+    profile = client.put(
+        "/api/auth/profile",
+        headers=_csrf(client),
+        json={"username": "test-admin-updated", "avatar": "🩺"},
+    )
+    assert profile.status_code == 200
+    assert profile.get_json()["user"]["avatar"] == "🩺"
+
     assert client.get("/api/settings").status_code == 200
     assert client.get("/api/admin/dashboard").status_code == 200
     stats = client.get("/api/stats").get_json()

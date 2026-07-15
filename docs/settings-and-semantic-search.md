@@ -11,7 +11,8 @@
 - 管理写接口：管理员登录会话 + CSRF；
 - 公共设置接口：只返回非秘密配置、配置状态与掩码；
 - 普通用户：不能看到管理入口，调用管理 API 返回 403；
-- 管理员入口：桌面显示在顶栏，手机显示在头像菜单；首次管理员创建并进入应用后立即按响应中的 `admin` 角色同步两个入口；
+- 管理员入口：桌面显示在顶栏，手机固定在头像左侧；头像菜单不重复显示管理入口，固定排列个人中心、我的消息、退出登录；首次管理员创建并进入应用后立即按响应中的 `admin` 角色同步入口；
+- 个人中心：修改用户名使用当前账号的唯一约束，头像只能选择系统预设标识，密码修改必须验证当前密码并撤销既有会话；菜单点击外部区域或 Escape 关闭。
 - 本地 state 不上传生产，生产独立创建数据库和 key。
 
 API URL 不允许包含用户名、密码、query 密钥或 fragment。供应商错误正文不得原样透传。聊天、截图或日志中出现过的密钥必须先在供应商后台轮换，再通过 HTTPS 设置页录入。
@@ -47,11 +48,16 @@ A3/A4 子题各自生成向量，保留完整病例题干，不跨题拼接。�
 ## 构建流程
 
 1. 管理员在设置页保存已轮换的嵌入配置；
-2. 执行连接测试；
-3. 构建并激活索引：
+2. 执行连接测试，确认返回 1024 维有限向量；
+3. 在服务器部署镜像中构建并激活索引：
 
-```powershell
-.\.venv\Scripts\python.exe scripts\build_vectors.py --activate
+```bash
+cd /srv/projects/medical-web-server/repo
+PYTHONPATH=app/backend OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+python3 scripts/build_vectors.py \
+  --knowledge-base-root /srv/projects/medical-web-server/knowledge-base \
+  --settings-db /srv/projects/medical-web-server/state/settings.sqlite3 \
+  --batch-size 32 --timeout 120 --max-retries 8 --activate
 ```
 
 产物：
@@ -106,4 +112,4 @@ knowledge-base/
 - 查询延迟、Gunicorn RSS、并发查询和日志；
 - 管理读取始终只显示密钥掩码。
 
-当前聊天中出现过的 SiliconFlow 密钥不得使用。真实构建必须等待用户轮换后从设置页录入。
+当前聊天中出现过的 SiliconFlow 密钥不得使用。真实构建必须等待用户轮换后从设置页录入；构建时只读取加密设置库，不在命令、日志或 manifest 中输出密钥。

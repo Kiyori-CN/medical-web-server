@@ -17,6 +17,7 @@ const state = {
   sessionIndex: 0,
   sessionReturnTarget: null,
   adminReturnHash: "#library",
+  accountReturnHash: "#library",
   drafts: {},
   timerHandle: null,
   selectionTimer: null,
@@ -33,6 +34,7 @@ const state = {
   lastSearchQuery: "",
   adminTab: "overview",
   adminData: null,
+  profileAvatarDraft: null,
   comments: {},
 };
 
@@ -181,7 +183,7 @@ async function route() {
     return;
   }
   document.body.classList.remove("in-session", "outline-open");
-  const allowed = ["library", "search", "favorites", "wrong", "admin"];
+  const allowed = ["library", "search", "favorites", "wrong", "profile", "messages", "admin"];
   if (!allowed.includes(target)) {
     await navigateHash("#library", { replace: true });
     return;
@@ -205,6 +207,10 @@ async function route() {
     }
   } else if (page === "search") {
     renderSearchPage();
+  } else if (page === "profile") {
+    renderProfilePage();
+  } else if (page === "messages") {
+    renderMessagesPage();
   } else if (page === "admin") {
     await renderAdminPage();
   }
@@ -225,10 +231,9 @@ function setActiveNav(name) {
 function syncUserChrome(user) {
   $("#profile-name").textContent = user.username;
   $("#profile-role").textContent = user.role === "admin" ? "管理员" : "普通用户";
-  $("#profile-avatar").textContent = [...user.username][0]?.toUpperCase() || "U";
-  [$("#admin-entry"), $("#admin-menu-entry")].filter(Boolean).forEach((entry) => {
-    entry.hidden = user.role !== "admin";
-  });
+  const glyph = user.avatar || [...user.username][0]?.toUpperCase() || "U";
+  $("#profile-avatar-glyph").textContent = glyph;
+  $("#admin-entry").hidden = user.role !== "admin";
 }
 
 function parseRouteHash() {
@@ -1165,6 +1170,93 @@ function updateTimerText() {
   if (timer) timer.textContent = `◷ ${sessionDuration()}`;
 }
 
+const PROFILE_AVATARS = ["", "医", "学", "知", "🩺", "🧬", "🧠", "🫀", "🫁", "📚", "⭐", "🌿"];
+
+function renderProfilePage() {
+  const user = state.user || {};
+  const selectedAvatar = state.profileAvatarDraft ?? user.avatar ?? "";
+  const glyph = selectedAvatar || [...String(user.username || "U")][0] || "U";
+  $("#page-profile").innerHTML = `
+    <div class="page-header account-page-header">
+      <div class="page-title"><p class="eyebrow">个人中心</p><h1>账号与个人资料</h1><p class="section-copy">管理你的显示信息与登录安全。</p></div>
+      <div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div>
+    </div>
+    <div class="profile-layout">
+      <section class="card profile-card">
+        <div class="profile-card-head"><div><h2>个人资料</h2><p>用户名会显示在练习记录和评论区。</p></div><span class="badge badge-neutral">${user.role === "admin" ? "管理员" : "普通用户"}</span></div>
+        <form id="profile-form" class="profile-form">
+          <div class="profile-avatar-editor">
+            <span class="profile-avatar profile-avatar-large"><span id="profile-preview-glyph">${escapeHtml(glyph)}</span></span>
+            <div><strong>选择头像</strong><small>使用简洁的医学主题标识</small><div class="avatar-picker" role="radiogroup" aria-label="头像">
+              ${PROFILE_AVATARS.map((avatar) => `<button class="avatar-choice ${avatar === selectedAvatar ? "active" : ""}" type="button" role="radio" aria-checked="${avatar === selectedAvatar}" data-action="select-avatar" data-avatar="${escapeAttr(avatar)}">${escapeHtml(avatar || (String(user.username || "U")[0] || "U"))}</button>`).join("")}
+            </div></div>
+          </div>
+          <label class="field"><span>用户名</span><input name="username" minlength="3" maxlength="32" value="${escapeAttr(user.username || "")}" required></label>
+          <div class="question-actions"><button class="button button-primary" type="submit">保存个人资料</button></div>
+        </form>
+      </section>
+      <section class="card profile-card">
+        <div class="profile-card-head"><div><h2>登录安全</h2><p>修改密码后，其他设备会立即退出登录。</p></div></div>
+        <form id="profile-password-form" class="stack-form">
+          <label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label>
+          <label class="field"><span>新密码</span><input name="new_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required placeholder="至少 10 位，包含三类字符"></label>
+          <label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label>
+          <p class="form-error" data-profile-password-error></p>
+          <div class="question-actions"><button class="button button-secondary" type="submit">修改密码</button></div>
+        </form>
+      </section>
+    </div>`;
+}
+
+function renderMessagesPage() {
+  $("#page-messages").innerHTML = `
+    <div class="page-header account-page-header">
+      <div class="page-title"><p class="eyebrow">我的消息</p><h1>消息中心</h1><p class="section-copy">系统通知与学习互动消息会集中显示在这里。</p></div>
+      <div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div>
+    </div>
+    ${emptyMarkup("暂无消息", "目前没有新的系统通知或互动消息。", "·")}`;
+}
+
+async function saveProfile(form) {
+  const username = String(new FormData(form).get("username") || "").trim();
+  try {
+    const result = await api("/auth/profile", {
+      method: "PUT",
+      body: { username, avatar: state.profileAvatarDraft ?? state.user.avatar ?? "" },
+    });
+    state.user = result.user;
+    state.profileAvatarDraft = null;
+    syncUserChrome(state.user);
+    renderProfilePage();
+    showToast("个人资料已保存");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function saveProfilePassword(form) {
+  const values = Object.fromEntries(new FormData(form));
+  const errorElement = $("[data-profile-password-error]", form);
+  if (values.new_password !== values.confirm_password) {
+    errorElement.textContent = "两次输入的新密码不一致";
+    return;
+  }
+  try {
+    await api("/auth/password", {
+      method: "POST",
+      body: { current_password: values.current_password, new_password: values.new_password },
+    });
+    state.user = null;
+    state.session = null;
+    state.comments = {};
+    location.hash = "";
+    showAuth("login");
+    showToast("密码已修改，请重新登录");
+  } catch (error) {
+    errorElement.textContent = error.message;
+  }
+}
+
 async function renderAdminPage() {
   const container = $("#page-admin");
   container.innerHTML = `${adminHeaderMarkup()}${loadingMarkup("正在读取系统状态")}`;
@@ -1286,6 +1378,7 @@ function renderSiteSettings(settings) {
 
 async function handleClick(event) {
   if (Date.now() < state.suppressClickUntil) return;
+  if (!event.target.closest(".profile-button, .profile-menu")) closeProfileMenu();
   const target = event.target.closest("[data-action]");
   if (!target) return;
   const action = target.dataset.action;
@@ -1302,7 +1395,22 @@ async function handleClick(event) {
     target.setAttribute("aria-expanded", String(!menu.hidden));
     return;
   }
-  if (action === "change-password") return changeOwnPassword();
+  if (action === "open-profile") {
+    if (!location.hash.startsWith("#profile")) state.accountReturnHash = location.hash || "#library";
+    closeProfileMenu();
+    return navigateHash("#profile");
+  }
+  if (action === "open-messages") {
+    if (!location.hash.startsWith("#messages")) state.accountReturnHash = location.hash || "#library";
+    closeProfileMenu();
+    return navigateHash("#messages");
+  }
+  if (action === "return-from-account") return navigateHash(state.accountReturnHash || "#library");
+  if (action === "select-avatar") {
+    state.profileAvatarDraft = target.dataset.avatar || "";
+    renderProfilePage();
+    return;
+  }
   if (action === "logout") return logout();
   if (action === "open-admin") {
     if (!location.hash.startsWith("#admin")) state.adminReturnHash = location.hash || "#library";
@@ -1399,10 +1507,19 @@ async function handleClick(event) {
   if (action === "test-provider") return testProvider(target.dataset.provider, target);
 }
 
+function closeProfileMenu() {
+  const menu = $("#profile-menu");
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  $('[data-action="toggle-profile"]')?.setAttribute("aria-expanded", "false");
+}
+
 async function handleSubmit(event) {
   event.preventDefault();
   if (event.target.id === "auth-form") return submitAuth(event.target);
   if (event.target.id === "search-form") return submitSearch(event.target);
+  if (event.target.id === "profile-form") return saveProfile(event.target);
+  if (event.target.id === "profile-password-form") return saveProfilePassword(event.target);
   if (event.target.id === "model-settings-form") return saveModelSettings(event.target);
   if (event.target.id === "site-settings-form") return saveSiteSettings(event.target);
   if (event.target.id === "create-user-form") return createUser(event.target);
@@ -1587,11 +1704,13 @@ function clearPracticeGesture() {
 }
 
 function handlePracticeKeydown(event) {
-  if (!document.body.classList.contains("in-session")) return;
   if (event.key === "Escape") {
+    closeProfileMenu();
+    if (!document.body.classList.contains("in-session")) return;
     setPracticeOutline(false);
     return;
   }
+  if (!document.body.classList.contains("in-session")) return;
   if (event.target.matches("input, textarea, select")) return;
   if (event.key === "ArrowLeft") moveSession(-1);
   if (event.key === "ArrowRight") moveSession(1);
