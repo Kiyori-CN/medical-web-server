@@ -58,6 +58,8 @@ def test_vector_build_resume_contract_and_semantic_search(
     assert reused["reused"] is True
     assert built["count"] == 5
     assert built["validation"]["shape"] == [5, 64]
+    assert len(built["validation"]["matrix_sha256"]) == 64
+    assert len(built["validation"]["question_ids_file_sha256"]) == 64
     assert "sk-vector-test-secret" not in json.dumps(built)
 
     settings = SettingsStore(tmp_path / "state" / "settings.sqlite3")

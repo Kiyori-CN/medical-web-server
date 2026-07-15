@@ -206,6 +206,11 @@ async function route() {
       await renderLibrary(page);
     }
   } else if (page === "search") {
+    try {
+      state.settings = await api("/settings");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
     renderSearchPage();
   } else if (page === "profile") {
     renderProfilePage();

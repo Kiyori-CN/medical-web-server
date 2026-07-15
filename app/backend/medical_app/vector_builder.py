@@ -34,6 +34,14 @@ def _write_json_atomic(path: Path, payload: object) -> None:
     os.replace(temporary, path)
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _catalog_items(database_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     import sqlite3
 
@@ -131,7 +139,8 @@ def build_vector_index(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("build_id") != vector_id:
             raise ValueError("Existing vector manifest build ID does not match its directory")
-        validate_vector_build(build_dir)
+        manifest["validation"] = validate_vector_build(build_dir)
+        _write_json_atomic(manifest_path, manifest)
         manifest["reused"] = True
         return manifest
     if force:
@@ -265,6 +274,8 @@ def validate_vector_build(build_dir: str | Path) -> dict[str, Any]:
         "minimum_norm": round(minimum_norm, 6) if matrix.shape[0] else None,
         "maximum_norm": round(maximum_norm, 6) if matrix.shape[0] else None,
         "file_size_bytes": (build_dir / "embeddings.npy").stat().st_size,
+        "matrix_sha256": _file_sha256(build_dir / "embeddings.npy"),
+        "question_ids_file_sha256": _file_sha256(build_dir / "question_ids.json"),
     }
 
 
