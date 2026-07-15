@@ -543,14 +543,16 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
   body.in-session .workspace { width: 100%; min-height: 100dvh; padding: 0; }
   body.in-session .page { min-height: 100dvh; }
   body.in-session .page-practice { width: 100%; margin: 0; transform: none; }
-  body.in-session .practice-top { position: fixed; z-index: 70; top: 0; left: 0; right: 0; min-height: 62px; margin: 0; padding: 8px 14px; padding-top: calc(8px + env(safe-area-inset-top)); border-bottom: 1px solid rgb(230 232 236 / 94%); background: rgb(255 255 255 / 94%); backdrop-filter: blur(18px); }
-  body.in-session .practice-top .button-secondary { width: 34px; min-width: 34px; min-height: 34px; padding: 0; border: 0; background: transparent; font-size: 22px; }
+  body.in-session .practice-top { position: fixed; z-index: 70; top: 0; left: 0; right: 0; width: 100%; min-height: 62px; display: grid; grid-template-columns: 34px minmax(0, 1fr) 72px 52px; align-items: center; gap: 6px; overflow: hidden; contain: layout paint; margin: 0; padding: 8px 14px; padding-top: calc(8px + env(safe-area-inset-top)); border-bottom: 1px solid rgb(230 232 236 / 94%); background: rgb(255 255 255 / 94%); backdrop-filter: blur(18px); }
+  body.in-session .practice-top .button-secondary { grid-column: 1; width: 34px; min-width: 34px; min-height: 34px; padding: 0; border: 0; background: transparent; font-size: 22px; }
   body.in-session .practice-top .button-secondary span { display: none; }
+  body.in-session .practice-top-main { grid-column: 2; overflow: hidden; }
   body.in-session .practice-top-main h1 { font-size: 14px; }
   body.in-session .practice-top-main p { margin-top: 2px; font-size: 10px; }
-  body.in-session .timer-pill { min-width: 66px; min-height: 32px; border: 0; background: #f7f8fa; font-size: 10px; }
-  body.in-session .practice-top .button-danger { min-height: 32px; padding: 0 9px; border-radius: 8px; font-size: 11px; }
-  body.in-session .practice-layout { display: block; padding-top: 68px; }
+  body.in-session .timer-pill { grid-column: 3; width: 72px; min-width: 72px; min-height: 32px; border: 0; background: #f7f8fa; font-size: 10px; }
+  body.in-session .practice-top:not(.has-finish) .timer-pill { grid-column: 3 / 5; justify-self: end; }
+  body.in-session .practice-top .button-danger { grid-column: 4; width: 52px; min-width: 52px; min-height: 32px; padding: 0 5px; border-radius: 8px; font-size: 11px; }
+  body.in-session .practice-layout { display: block; overflow-x: clip; padding-top: 68px; }
   body.in-session .practice-question { min-height: calc(100dvh - 68px); margin: 0; padding: 18px 17px calc(102px + env(safe-area-inset-bottom)); border: 0; border-radius: 0; box-shadow: none; touch-action: pan-y; }
   body.in-session .practice-progress { margin-bottom: 20px; }
   body.in-session .practice-progress strong { font-size: 12px; }

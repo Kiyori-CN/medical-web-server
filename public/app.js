@@ -16,6 +16,7 @@ const state = {
   session: null,
   sessionIndex: 0,
   sessionReturnTarget: null,
+  adminReturnHash: "#library",
   drafts: {},
   timerHandle: null,
   selectionTimer: null,
@@ -147,10 +148,7 @@ async function enterApp(user) {
   state.comments = {};
   $("#auth-page").hidden = true;
   $("#app-shell").hidden = false;
-  $("#profile-name").textContent = user.username;
-  $("#profile-role").textContent = user.role === "admin" ? "管理员" : "普通用户";
-  $("#profile-avatar").textContent = [...user.username][0]?.toUpperCase() || "U";
-  $("#admin-entry").hidden = user.role !== "admin";
+  syncUserChrome(user);
   try {
     [state.settings, state.stats] = await Promise.all([api("/settings"), api("/stats")]);
     $("#site-brand-name").textContent = state.settings.site_name || "医考知库";
@@ -158,13 +156,17 @@ async function enterApp(user) {
   } catch (error) {
     showToast(error.message, "error");
   }
-  if (!location.hash) location.hash = "#library";
+  if (!location.hash) {
+    await navigateHash("#library", { replace: true });
+    return;
+  }
   await route();
 }
 
 async function route() {
   if (!state.user) return;
-  const target = location.hash.replace(/^#/, "") || "library";
+  const descriptor = parseRouteHash();
+  const target = descriptor.target;
   if (target.startsWith("session/")) {
     document.body.classList.add("in-session");
     showPage("practice");
@@ -180,20 +182,24 @@ async function route() {
   }
   document.body.classList.remove("in-session", "outline-open");
   const allowed = ["library", "search", "favorites", "wrong", "admin"];
-  const page = allowed.includes(target) ? target : "library";
+  if (!allowed.includes(target)) {
+    await navigateHash("#library", { replace: true });
+    return;
+  }
+  const page = target;
   if (page === "admin" && state.user.role !== "admin") {
-    location.hash = "#library";
+    await navigateHash("#library", { replace: true });
     return;
   }
   stopTimer();
   showPage(page);
   setActiveNav(page);
   if (page === "library" || page === "favorites" || page === "wrong") {
-    const returnTarget = state.sessionReturnTarget;
     state.sessionReturnTarget = null;
-    if (returnTarget?.kind === page && returnTarget.collectionId) {
+    state.libraryPath[page] = descriptor.path;
+    if (descriptor.collectionId) {
       renderLibraryShell(page);
-      await openCollection(page, returnTarget.collectionId);
+      await openCollection(page, descriptor.collectionId, descriptor.path);
     } else {
       await renderLibrary(page);
     }
@@ -216,6 +222,55 @@ function setActiveNav(name) {
   $$('[data-nav]').forEach((item) => item.classList.toggle("active", item.dataset.nav === name));
 }
 
+function syncUserChrome(user) {
+  $("#profile-name").textContent = user.username;
+  $("#profile-role").textContent = user.role === "admin" ? "管理员" : "普通用户";
+  $("#profile-avatar").textContent = [...user.username][0]?.toUpperCase() || "U";
+  [$("#admin-entry"), $("#admin-menu-entry")].filter(Boolean).forEach((entry) => {
+    entry.hidden = user.role !== "admin";
+  });
+}
+
+function parseRouteHash() {
+  const raw = location.hash.replace(/^#/, "") || "library";
+  const separator = raw.indexOf("?");
+  const target = separator >= 0 ? raw.slice(0, separator) : raw;
+  const params = new URLSearchParams(separator >= 0 ? raw.slice(separator + 1) : "");
+  return {
+    target,
+    path: params.get("path") || "",
+    collectionId: params.get("collection") || "",
+  };
+}
+
+function libraryRouteHash(kind, path = "", collectionId = "") {
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (collectionId) params.set("collection", collectionId);
+  const query = params.toString();
+  return `#${kind}${query ? `?${query}` : ""}`;
+}
+
+async function navigateHash(hash, { replace = false } = {}) {
+  const normalized = hash.startsWith("#") ? hash : `#${hash}`;
+  if (location.hash === normalized) {
+    await route();
+    return;
+  }
+  if (replace) {
+    history.replaceState(null, "", normalized);
+    await route();
+    return;
+  }
+  location.hash = normalized;
+}
+
+function collectionParentPath(relativePath) {
+  const normalized = String(relativePath || "").replace(/\\/g, "/");
+  const separator = normalized.lastIndexOf("/");
+  return separator >= 0 ? normalized.slice(0, separator) : "";
+}
+
 function loadingMarkup(label = "正在加载") {
   return `<div class="card loading-state"><span class="loading-spinner" aria-hidden="true"></span><span>${escapeHtml(label)}</span></div>`;
 }
@@ -225,6 +280,7 @@ function emptyMarkup(title, copy, icon = "·") {
 }
 
 async function renderLibrary(kind) {
+  state.outline = null;
   renderLibraryShell(kind);
   const container = $(`#page-${kind}`);
   const parent = state.libraryPath[kind] || "";
@@ -302,7 +358,8 @@ function libraryItem(item, kind, type) {
   </button>`;
 }
 
-async function openCollection(kind, collectionId) {
+async function openCollection(kind, collectionId, parentPath = state.libraryPath[kind] || "") {
+  state.outline = null;
   const content = $(`#${kind}-content`);
   content.innerHTML = loadingMarkup("正在读取题号目录");
   try {
@@ -310,8 +367,9 @@ async function openCollection(kind, collectionId) {
       ? `/practice/collections/${encodeURIComponent(collectionId)}/outline`
       : `/study/${kind}/collections/${encodeURIComponent(collectionId)}/outline`;
     const payload = await api(path);
+    state.libraryPath[kind] = parentPath || collectionParentPath(payload.collection?.relative_path);
     state.outline = { kind, payload };
-  state.outlineMode = "practice";
+    state.outlineMode = "practice";
     renderOutline();
   } catch (error) {
     content.innerHTML = emptyMarkup("题号目录读取失败", error.message, "!");
@@ -577,7 +635,6 @@ async function toggleSearchAll(group) {
   savePreferences();
   renderSearchPage();
   if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
-  $("#search-input")?.focus();
 }
 
 async function toggleSearchQuestionType(type) {
@@ -595,7 +652,6 @@ async function toggleSearchQuestionType(type) {
   savePreferences();
   renderSearchPage();
   if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
-  $("#search-input")?.focus();
 }
 
 async function toggleSearchField(field) {
@@ -618,7 +674,6 @@ async function toggleSearchField(field) {
   savePreferences();
   renderSearchPage();
   if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
-  $("#search-input")?.focus();
 }
 
 async function toggleSearchSolution(field) {
@@ -632,7 +687,6 @@ async function toggleSearchSolution(field) {
   savePreferences();
   renderSearchPage();
   if (field !== "stem" && state.lastSearchQuery) await runSearch(state.lastSearchQuery);
-  $("#search-input")?.focus();
 }
 
 function toggleSearchSettings() {
@@ -651,7 +705,6 @@ async function resetSearchSettings() {
   renderSearchPage();
   showToast("搜索标签已重置");
   if (state.lastSearchQuery) await runSearch(state.lastSearchQuery);
-  $("#search-input")?.focus();
 }
 
 function renderSearchResults(results, metadata = {}) {
@@ -718,6 +771,8 @@ function renderSolutionSection(kind, label, content, textRenderer = escapeHtml) 
 }
 
 async function startSession({ collectionId, position = 1, kind = "library", mode = state.outlineMode }) {
+  const returnPath = state.libraryPath[kind]
+    || collectionParentPath(state.outline?.payload?.collection?.relative_path);
   const body = {
     collection_id: collectionId,
     start_position: Number(position) || 1,
@@ -731,8 +786,13 @@ async function startSession({ collectionId, position = 1, kind = "library", mode
     state.session = session;
     state.sessionIndex = 0;
     state.drafts = {};
-    location.hash = `#session/${session.session_id}`;
-    await route();
+    state.sessionReturnTarget = {
+      kind,
+      collectionId,
+      path: returnPath,
+      hash: libraryRouteHash(kind, returnPath, collectionId),
+    };
+    await navigateHash(`#session/${session.session_id}`);
   } catch (error) {
     showToast(error.message, "error");
   }
@@ -748,6 +808,19 @@ async function loadSession(sessionId) {
       state.session.items.findIndex((item) => !item.submission)
     );
     state.drafts = {};
+    if (!state.sessionReturnTarget) {
+      const kind = state.session.saved_kind === "favorite"
+        ? "favorites"
+        : state.session.saved_kind === "wrong" ? "wrong" : "library";
+      const source = state.session.items[0]?.question?.sources?.[0] || {};
+      const path = collectionParentPath(source.relative_path);
+      state.sessionReturnTarget = {
+        kind,
+        collectionId: state.session.collection_id,
+        path,
+        hash: libraryRouteHash(kind, path, state.session.collection_id),
+      };
+    }
     renderPractice();
     startTimer();
   } catch (error) {
@@ -780,6 +853,9 @@ function renderPractice() {
   const finishButton = ["practice", "test"].includes(mode)
     ? `<button class="button button-danger button-small" type="button" data-action="finish-session" ${isComplete ? "disabled" : ""}>${isComplete ? "已交卷" : "交卷"}</button>`
     : "";
+  const returnKind = session.saved_kind === "favorite"
+    ? "收藏"
+    : session.saved_kind === "wrong" ? "错题" : "题库";
   const statusNote = mode === "speed" && submitted && submitted.is_correct === false
     ? `<p class="practice-feedback-note wrong">未选中正确答案，答案与解析已展开；确认后可继续下一题。</p>`
     : mode === "test" && !isComplete
@@ -796,8 +872,8 @@ function renderPractice() {
     ? `${summary.answered || 0} 已答 · ${Math.max(0, (summary.total || 0) - (summary.answered || 0))} 未答`
     : `${summary.correct || 0} 对 · ${summary.wrong || 0} 错 · ${Math.max(0, (summary.total || 0) - (summary.answered || 0))} 未答`;
   $("#page-practice").innerHTML = `
-    <div class="practice-top practice-top-immersive">
-      <button class="button button-secondary" type="button" data-action="leave-session">‹ <span>返回题库</span></button>
+    <div class="practice-top practice-top-immersive ${finishButton ? "has-finish" : ""}">
+      <button class="button button-secondary" type="button" data-action="leave-session" aria-label="返回${returnKind}">‹ <span>返回${returnKind}</span></button>
       <div class="practice-top-main"><h1>${escapeHtml(title)}</h1><p><span class="mode-chip mode-${mode}">${meta.label}</span> · ${summary.answered || 0}/${summary.total || session.items.length} 已完成</p></div>
       <span class="timer-pill" id="practice-timer" aria-label="本次练习用时">◷ ${sessionDuration()}</span>
       ${finishButton}
@@ -1090,7 +1166,7 @@ function updateTimerText() {
 
 async function renderAdminPage() {
   const container = $("#page-admin");
-  container.innerHTML = `<div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">账号、模型、检索能力与运行状态集中管理。</p></div></div>${loadingMarkup("正在读取系统状态")}`;
+  container.innerHTML = `${adminHeaderMarkup()}${loadingMarkup("正在读取系统状态")}`;
   try {
     const [dashboard, settings, users] = await Promise.all([
       api("/admin/dashboard"),
@@ -1108,13 +1184,17 @@ function renderAdminContent() {
   const data = state.adminData;
   if (!data) return;
   $("#page-admin").innerHTML = `
-    <div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">账号、模型、检索能力与运行状态集中管理。</p></div></div>
+    ${adminHeaderMarkup()}
     <div class="admin-layout">
       <nav class="card admin-nav" aria-label="管理导航">
         ${adminTabButton("overview", "运行概览")}${adminTabButton("users", "账号管理")}${adminTabButton("models", "模型与检索")}${adminTabButton("site", "网站设置")}
       </nav>
       <div class="admin-content">${renderAdminTab()}</div>
     </div>`;
+}
+
+function adminHeaderMarkup() {
+  return `<div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">账号、模型、检索能力与运行状态集中管理。</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-admin">‹ 返回</button></div></div>`;
 }
 
 function adminTabButton(tab, label) {
@@ -1223,26 +1303,36 @@ async function handleClick(event) {
   }
   if (action === "change-password") return changeOwnPassword();
   if (action === "logout") return logout();
-  if (action === "open-admin") { location.hash = "#admin"; return; }
+  if (action === "open-admin") {
+    if (!location.hash.startsWith("#admin")) state.adminReturnHash = location.hash || "#library";
+    $("#profile-menu").hidden = true;
+    $('[data-action="toggle-profile"]')?.setAttribute("aria-expanded", "false");
+    return navigateHash("#admin");
+  }
+  if (action === "return-from-admin") return navigateHash(state.adminReturnHash || "#library");
   if (action === "library-home") {
     event.preventDefault();
     state.libraryPath.library = "";
     state.outline = null;
     setPracticeOutline(false);
-    if (location.hash === "#library") return renderLibrary("library");
-    location.hash = "#library";
-    return;
+    return navigateHash("#library");
   }
   if (action === "open-directory") {
     state.libraryPath[target.dataset.kind] = target.dataset.path;
-    return renderLibrary(target.dataset.kind);
+    return navigateHash(libraryRouteHash(target.dataset.kind, target.dataset.path));
   }
   if (action === "library-breadcrumb") {
     state.libraryPath[target.dataset.kind] = target.dataset.path;
-    return renderLibrary(target.dataset.kind);
+    return navigateHash(libraryRouteHash(target.dataset.kind, target.dataset.path));
   }
-  if (action === "open-collection") return openCollection(target.dataset.kind, target.dataset.id);
-  if (action === "close-outline") return renderLibrary(target.dataset.kind);
+  if (action === "open-collection") {
+    const kind = target.dataset.kind;
+    return navigateHash(libraryRouteHash(kind, state.libraryPath[kind], target.dataset.id));
+  }
+  if (action === "close-outline") {
+    const kind = target.dataset.kind;
+    return navigateHash(libraryRouteHash(kind, state.libraryPath[kind]));
+  }
   if (action === "outline-mode") {
     state.outlineMode = target.dataset.mode;
     renderOutline();
@@ -1259,7 +1349,6 @@ async function handleClick(event) {
     state.searchMode = target.dataset.mode;
     savePreferences();
     renderSearchPage();
-    $("#search-input")?.focus();
     return;
   }
   if (action === "search-solution-toggle") return toggleSearchSolution(target.dataset.field);
@@ -1272,14 +1361,10 @@ async function handleClick(event) {
     clearSelectionTimer();
     setPracticeOutline(false);
     const kind = state.session?.saved_kind === "favorite" ? "favorites" : state.session?.saved_kind === "wrong" ? "wrong" : "library";
-    if (state.session?.collection_id) {
-      state.sessionReturnTarget = {
-        kind,
-        collectionId: state.session.collection_id,
-      };
-    }
-    location.hash = `#${kind}`;
-    return;
+    const collectionId = state.session?.collection_id || "";
+    const returnHash = state.sessionReturnTarget?.hash
+      || libraryRouteHash(kind, state.libraryPath[kind], collectionId);
+    return navigateHash(returnHash);
   }
   if (action === "session-prev") return moveSession(-1);
   if (action === "session-next") return moveSession(1);
@@ -1598,7 +1683,7 @@ async function removeCurrentWrong(itemKey) {
     showToast("已从错题中移除");
     state.session.items.splice(state.sessionIndex, 1);
     if (!state.session.items.length) {
-      location.hash = "#wrong";
+      await navigateHash("#wrong");
       return;
     }
     state.sessionIndex = Math.min(state.sessionIndex, state.session.items.length - 1);
