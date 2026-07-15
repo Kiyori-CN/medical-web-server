@@ -723,7 +723,7 @@ function searchResultCard(item) {
     <p class="source-path">${escapeHtml(source.relative_path ? displaySourcePath(source.relative_path) : "来源路径未记录")}</p>
     <div class="question-actions">
       <button class="button button-secondary button-small favorite-button" type="button" data-action="toggle-favorite" data-occurrence="${source.occurrence_id || ""}" data-question="${escapeAttr(item.question_id)}" data-favorited="false" aria-pressed="false"><span class="favorite-icon" aria-hidden="true">☆</span><span class="favorite-label">收藏</span></button>
-      ${source.collection_id ? `<button class="button button-quiet button-small" type="button" data-action="practice-source" data-id="${escapeAttr(source.collection_id)}" data-position="${source.position || 1}">练习此文件</button>` : ""}
+      ${source.collection_id ? `<button class="button button-quiet button-small" type="button" data-action="practice-source" data-id="${escapeAttr(source.collection_id)}" data-path="${escapeAttr(collectionParentPath(source.relative_path))}" data-position="${source.position || 1}">练习此文件</button>` : ""}
     </div>
   </article>`;
 }
@@ -770,8 +770,9 @@ function renderSolutionSection(kind, label, content, textRenderer = escapeHtml) 
   </section>`;
 }
 
-async function startSession({ collectionId, position = 1, kind = "library", mode = state.outlineMode }) {
-  const returnPath = state.libraryPath[kind]
+async function startSession({ collectionId, position = 1, kind = "library", mode = state.outlineMode, path = "" }) {
+  const returnPath = path
+    || state.libraryPath[kind]
     || collectionParentPath(state.outline?.payload?.collection?.relative_path);
   const body = {
     collection_id: collectionId,
@@ -1343,7 +1344,7 @@ async function handleClick(event) {
     return startSession({ collectionId: target.dataset.id, position: target.dataset.position, kind: target.dataset.kind, mode: state.outlineMode });
   }
   if (action === "practice-source") {
-    return startSession({ collectionId: target.dataset.id, position: target.dataset.position, kind: "library", mode: "practice" });
+    return startSession({ collectionId: target.dataset.id, path: target.dataset.path, position: target.dataset.position, kind: "library", mode: "practice" });
   }
   if (action === "search-mode") {
     state.searchMode = target.dataset.mode;
