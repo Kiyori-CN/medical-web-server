@@ -7,7 +7,7 @@
   <meta name="description" content="医考知库：按原始题库目录精确检索、刷题与复习。">
   <title>医考知库</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='17' fill='%235a5bd7'/%3E%3Cpath d='M18 19h20c5 0 8 3 8 8v19H26c-5 0-8-3-8-8V19zm8 8v5h12v-5H26zm0 10v4h8v-4h-8z' fill='white'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/style.css?rev=792cdcd">
+  <link rel="stylesheet" href="/style.css?rev=2ed50e3">
 </head>
 <body>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
@@ -64,8 +64,9 @@
         <nav class="desktop-nav" aria-label="主导航">
           <a href="#library" data-nav="library">题库</a>
           <a href="#search" data-nav="search">搜题</a>
-          <a href="#favorites" data-nav="favorites">收藏</a>
-          <a href="#wrong" data-nav="wrong">错题</a>
+          <a href="#ai" data-nav="ai">AI</a>
+          <a href="#forum" data-nav="forum">论坛</a>
+          <a href="#profile" data-nav="profile">我的</a>
         </nav>
         <div class="topbar-actions">
           <button id="admin-entry" class="button button-quiet admin-only" type="button" data-action="open-admin" hidden>系统管理</button>
@@ -93,18 +94,22 @@
       <section id="page-messages" class="page" hidden></section>
       <section id="page-my-comments" class="page" hidden></section>
       <section id="page-notes" class="page" hidden></section>
+      <section id="page-my-likes" class="page" hidden></section>
+      <section id="page-ai" class="page" hidden></section>
+      <section id="page-forum" class="page" hidden></section>
       <section id="page-admin" class="page" hidden></section>
     </main>
 
     <nav class="mobile-nav" aria-label="移动端主导航">
       <a href="#library" data-nav="library"><span aria-hidden="true">▦</span><small>题库</small></a>
       <a href="#search" data-nav="search"><span aria-hidden="true">⌕</span><small>搜题</small></a>
-      <a href="#favorites" data-nav="favorites"><span aria-hidden="true">☆</span><small>收藏</small></a>
-      <a href="#wrong" data-nav="wrong"><span aria-hidden="true">!</span><small>错题</small></a>
+      <a href="#ai" data-nav="ai"><span aria-hidden="true">✦</span><small>AI</small></a>
+      <a href="#forum" data-nav="forum"><span aria-hidden="true">◌</span><small>论坛</small></a>
+      <a href="#profile" data-nav="profile"><span aria-hidden="true">◎</span><small>我的</small></a>
     </nav>
   </div>
 
   <div id="modal-root"></div>
-  <script src="/app.js?rev=792cdcd" defer></script>
+  <script src="/app.js?rev=2ed50e3" defer></script>
 </body>
 </html>

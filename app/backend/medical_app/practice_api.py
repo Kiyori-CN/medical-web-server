@@ -176,6 +176,7 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
             data.get("occurrence_id"),
             author_name=g.current_user.get("username", ""),
             body=data.get("body"),
+            parent_comment_id=data.get("parent_comment_id", ""),
         )
         return jsonify(item), 201
 
@@ -245,6 +246,53 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
     @csrf_required
     def delete_note(occurrence_id: int):
         return jsonify({"removed": store().delete_note(occurrence_id)})
+
+    @blueprint.get("/study/today-summary")
+    @login_required
+    def today_summary():
+        return jsonify(store().today_summary())
+
+    @blueprint.post("/study/comments/<comment_id>/reaction")
+    @login_required
+    @csrf_required
+    def react_comment(comment_id: str):
+        data = _json_object()
+        return jsonify(store().react_comment(comment_id, data.get("reaction", "")))
+
+    @blueprint.get("/study/comments/likes/mine")
+    @login_required
+    def my_likes():
+        return jsonify(store().my_likes(limit=request.args.get("limit", 100), offset=request.args.get("offset", 0)))
+
+    @blueprint.get("/friends")
+    @login_required
+    def friends():
+        return jsonify({"items": store().list_friends()})
+
+    @blueprint.post("/friends")
+    @login_required
+    @csrf_required
+    def add_friend():
+        data = _json_object()
+        return jsonify(store().add_friend(data.get("username", ""))), 201
+
+    @blueprint.delete("/friends/<friend_id>")
+    @login_required
+    @csrf_required
+    def remove_friend(friend_id: str):
+        return jsonify({"removed": store().remove_friend(friend_id)})
+
+    @blueprint.get("/messages")
+    @login_required
+    def messages():
+        return jsonify(store().list_messages(request.args.get("category", "all")))
+
+    @blueprint.post("/messages")
+    @login_required
+    @csrf_required
+    def send_message():
+        data = _json_object()
+        return jsonify(store().send_message(data.get("receiver_id", ""), data.get("body", ""))), 201
 
     return blueprint
 

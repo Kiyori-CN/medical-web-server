@@ -12,7 +12,7 @@ from .catalog import Catalog
 from .normalize import display_text, normalize_answer
 
 
-APP_SCHEMA_REVISION = 2
+APP_SCHEMA_REVISION = 3
 COMMENT_MAX_LENGTH = 2000
 NOTE_MAX_LENGTH = 10000
 
@@ -119,8 +119,45 @@ CREATE TABLE IF NOT EXISTS question_comments (
     author_id TEXT NOT NULL,
     author_name TEXT NOT NULL,
     body TEXT NOT NULL,
+    parent_comment_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS comment_reactions (
+    comment_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    reaction TEXT NOT NULL CHECK (reaction IN ('agree', 'disagree')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (comment_id, profile_id)
+);
+
+CREATE TABLE IF NOT EXISTS friendships (
+    profile_id TEXT NOT NULL,
+    friend_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'accepted' CHECK (status IN ('accepted', 'blocked')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, friend_id)
+);
+
+CREATE TABLE IF NOT EXISTS direct_messages (
+    message_id TEXT PRIMARY KEY,
+    sender_id TEXT NOT NULL,
+    receiver_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    read_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    notification_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor_id TEXT NOT NULL DEFAULT '',
+    comment_id TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    read_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS question_notes (
@@ -150,6 +187,18 @@ ON question_comments(occurrence_id, created_at, comment_id);
 
 CREATE INDEX IF NOT EXISTS idx_question_comments_author
 ON question_comments(author_id, updated_at DESC, comment_id);
+
+CREATE INDEX IF NOT EXISTS idx_comment_reactions_comment
+ON comment_reactions(comment_id, reaction);
+
+CREATE INDEX IF NOT EXISTS idx_friendships_profile
+ON friendships(profile_id, status, friend_id);
+
+CREATE INDEX IF NOT EXISTS idx_direct_messages_receiver
+ON direct_messages(receiver_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_profile
+ON notifications(profile_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_question_notes_profile
 ON question_notes(profile_id, updated_at DESC, occurrence_id);
@@ -210,6 +259,13 @@ class PracticeStore:
                 connection.execute(
                     f"ALTER TABLE practice_session_questions ADD COLUMN {name} {declaration}"
                 )
+        comment_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(question_comments)")
+        }
+        if "parent_comment_id" not in comment_columns:
+            connection.execute(
+                "ALTER TABLE question_comments ADD COLUMN parent_comment_id TEXT"
+            )
 
     @staticmethod
     def _backfill_collection_progress(connection: sqlite3.Connection) -> None:
@@ -656,7 +712,7 @@ class PracticeStore:
             rows = connection.execute(
                 """
                 SELECT comment_id, occurrence_id, question_id, author_id,
-                       author_name, body, created_at, updated_at
+                       author_name, body, parent_comment_id, created_at, updated_at
                 FROM question_comments
                 WHERE occurrence_id = ?
                 ORDER BY created_at, comment_id
@@ -675,11 +731,25 @@ class PracticeStore:
         }
 
     def create_comment(
-        self, occurrence_id: int, *, author_name: str, body: object
+        self,
+        occurrence_id: int,
+        *,
+        author_name: str,
+        body: object,
+        parent_comment_id: str = "",
     ) -> dict[str, Any]:
         question = self._resolve_occurrence_question(occurrence_id)
         normalized_body = _comment_body(body)
+        parent_comment_id = display_text(parent_comment_id)
         now = _utc_now()
+        if parent_comment_id:
+            with self.connect() as check_connection:
+                parent = check_connection.execute(
+                    "SELECT occurrence_id, author_id FROM question_comments WHERE comment_id = ?",
+                    (parent_comment_id,),
+                ).fetchone()
+            if parent is None or int(parent["occurrence_id"]) != int(occurrence_id):
+                raise PracticeNotFound("Parent comment not found")
         item = {
             "comment_id": f"cmt_{secrets.token_hex(12)}",
             "occurrence_id": int(occurrence_id),
@@ -687,9 +757,16 @@ class PracticeStore:
             "author_id": self.profile_id,
             "author_name": display_text(author_name) or "用户",
             "body": normalized_body,
+            "parent_comment_id": parent_comment_id or None,
             "created_at": now,
             "updated_at": now,
+            "can_edit": True,
             "can_delete": True,
+            "edited": False,
+            "agree_count": 0,
+            "disagree_count": 0,
+            "reply_count": 0,
+            "my_reaction": "",
         }
         connection = self.connect()
         try:
@@ -698,8 +775,8 @@ class PracticeStore:
                     """
                     INSERT INTO question_comments(
                         comment_id, occurrence_id, question_id, author_id,
-                        author_name, body, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        author_name, body, parent_comment_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         item["comment_id"],
@@ -708,10 +785,62 @@ class PracticeStore:
                         item["author_id"],
                         item["author_name"],
                         item["body"],
+                        item["parent_comment_id"],
                         item["created_at"],
                         item["updated_at"],
                     ),
                 )
+                if parent_comment_id:
+                    parent_author = connection.execute(
+                        "SELECT author_id FROM question_comments WHERE comment_id = ?",
+                        (parent_comment_id,),
+                    ).fetchone()
+                    if parent_author and parent_author["author_id"] != self.profile_id:
+                        connection.execute(
+                            """
+                            INSERT INTO notifications(
+                                notification_id, profile_id, kind, actor_id, comment_id, body, created_at
+                            ) VALUES (?, ?, 'reply', ?, ?, ?, ?)
+                            """,
+                            (
+                                f"ntf_{secrets.token_hex(10)}",
+                                parent_author["author_id"],
+                                self.profile_id,
+                                item["comment_id"],
+                                normalized_body[:200],
+                                now,
+                            ),
+                        )
+                has_users = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+                ).fetchone()
+                if has_users:
+                    mentioned_ids: set[str] = set()
+                    for friend in connection.execute(
+                        """
+                        SELECT u.user_id, u.username FROM friendships f
+                        JOIN users u ON u.user_id = f.friend_id
+                        WHERE f.profile_id = ? AND f.status = 'accepted'
+                        """,
+                        (self.profile_id,),
+                    ):
+                        if f"@{friend['username']}" in normalized_body and friend["user_id"] not in mentioned_ids:
+                            mentioned_ids.add(friend["user_id"])
+                            connection.execute(
+                                """
+                                INSERT INTO notifications(
+                                    notification_id, profile_id, kind, actor_id, comment_id, body, created_at
+                                ) VALUES (?, ?, 'mention', ?, ?, ?, ?)
+                                """,
+                                (
+                                    f"ntf_{secrets.token_hex(10)}",
+                                    friend["user_id"],
+                                    self.profile_id,
+                                    item["comment_id"],
+                                    normalized_body[:200],
+                                    now,
+                                ),
+                            )
         finally:
             connection.close()
         return item
@@ -731,6 +860,16 @@ class PracticeStore:
                 raise PracticeNotFound("Comment not found")
             if row["author_id"] != self.profile_id and not is_admin:
                 raise PracticeForbidden("You cannot delete this comment")
+            connection.execute(
+                "DELETE FROM comment_reactions WHERE comment_id = ?", (comment_id,)
+            )
+            connection.execute(
+                "DELETE FROM notifications WHERE comment_id = ?", (comment_id,)
+            )
+            connection.execute(
+                "UPDATE question_comments SET parent_comment_id = NULL WHERE parent_comment_id = ?",
+                (comment_id,),
+            )
             cursor = connection.execute(
                 "DELETE FROM question_comments WHERE comment_id = ?", (comment_id,)
             )
@@ -827,7 +966,7 @@ class PracticeStore:
             rows = connection.execute(
                 f"""
                 SELECT comment_id, occurrence_id, question_id, author_id,
-                       author_name, body, created_at, updated_at
+                       author_name, body, parent_comment_id, created_at, updated_at
                 FROM question_comments {where}
                 ORDER BY updated_at DESC, comment_id DESC
                 LIMIT ? OFFSET ?
@@ -885,6 +1024,25 @@ class PracticeStore:
                 )
             }
         items: list[dict[str, Any]] = []
+        reaction_counts: dict[str, dict[str, int]] = {}
+        own_reactions: dict[str, str] = {}
+        if rows:
+            comment_ids = [row["comment_id"] for row in rows]
+            placeholders = ",".join("?" for _ in comment_ids)
+            connection = self.connect()
+            try:
+                for reaction in connection.execute(
+                    f"SELECT comment_id, reaction, COUNT(*) AS count FROM comment_reactions WHERE comment_id IN ({placeholders}) GROUP BY comment_id, reaction",
+                    comment_ids,
+                ):
+                    reaction_counts.setdefault(reaction["comment_id"], {})[reaction["reaction"]] = int(reaction["count"])
+                for reaction in connection.execute(
+                    f"SELECT comment_id, reaction FROM comment_reactions WHERE profile_id = ? AND comment_id IN ({placeholders})",
+                    [self.profile_id, *comment_ids],
+                ):
+                    own_reactions[reaction["comment_id"]] = reaction["reaction"]
+            finally:
+                connection.close()
         for row in rows:
             item = dict(row)
             item.update(avatar_by_author.get(row["author_id"], {}))
@@ -893,11 +1051,31 @@ class PracticeStore:
                 viewer_is_admin or row["author_id"] == self.profile_id
             )
             item["edited"] = row["updated_at"] != row["created_at"]
+            counts = reaction_counts.get(row["comment_id"], {})
+            item["agree_count"] = counts.get("agree", 0)
+            item["disagree_count"] = counts.get("disagree", 0)
+            item["my_reaction"] = own_reactions.get(row["comment_id"], "")
+            item["reply_count"] = 0
             if include_question:
                 item["question"] = _question_reference(
                     questions.get(int(row["occurrence_id"]))
                 )
             items.append(item)
+        reply_counts: dict[str, int] = {}
+        if rows:
+            connection = self.connect()
+            try:
+                comment_ids = [row["comment_id"] for row in rows]
+                placeholders = ",".join("?" for _ in comment_ids)
+                for child in connection.execute(
+                    f"SELECT parent_comment_id, COUNT(*) AS count FROM question_comments WHERE parent_comment_id IN ({placeholders}) GROUP BY parent_comment_id",
+                    comment_ids,
+                ):
+                    reply_counts[child["parent_comment_id"]] = int(child["count"])
+            finally:
+                connection.close()
+        for item in items:
+            item["reply_count"] = reply_counts.get(item["comment_id"], 0)
         return items
 
     def get_note(self, occurrence_id: int) -> dict[str, Any]:
@@ -1016,6 +1194,252 @@ class PracticeStore:
             for row in rows
         ]
         return {"count": len(items), "total": int(total), "offset": offset, "items": items}
+
+    def today_summary(self) -> dict[str, Any]:
+        day = datetime.now(UTC).date().isoformat()
+        like_day = f"{day}%"
+        connection = self.connect()
+        try:
+            answered = connection.execute(
+                """
+                SELECT COUNT(*) FROM practice_session_questions q
+                JOIN practice_sessions s ON s.session_id = q.session_id
+                WHERE s.profile_id = ? AND q.answered_at LIKE ?
+                """,
+                (self.profile_id, like_day),
+            ).fetchone()[0]
+            correct = connection.execute(
+                """
+                SELECT COUNT(*) FROM practice_session_questions q
+                JOIN practice_sessions s ON s.session_id = q.session_id
+                WHERE s.profile_id = ? AND q.answered_at LIKE ? AND q.is_correct = 1
+                """,
+                (self.profile_id, like_day),
+            ).fetchone()[0]
+            duration_ms = connection.execute(
+                """
+                SELECT COALESCE(SUM(session_elapsed), 0) FROM (
+                    SELECT MAX(COALESCE(q.elapsed_ms, 0)) AS session_elapsed
+                    FROM practice_session_questions q JOIN practice_sessions s ON s.session_id = q.session_id
+                    WHERE s.profile_id = ? AND q.answered_at LIKE ?
+                    GROUP BY q.session_id
+                )
+                """,
+                (self.profile_id, like_day),
+            ).fetchone()[0]
+            totals = {
+                "wrong": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'wrong'", (self.profile_id,)).fetchone()[0],
+                "favorites": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'favorite'", (self.profile_id,)).fetchone()[0],
+                "notes": connection.execute("SELECT COUNT(*) FROM question_notes WHERE profile_id = ?", (self.profile_id,)).fetchone()[0],
+                "comments": connection.execute("SELECT COUNT(*) FROM question_comments WHERE author_id = ?", (self.profile_id,)).fetchone()[0],
+                "likes": connection.execute("SELECT COUNT(*) FROM comment_reactions WHERE profile_id = ? AND reaction = 'agree'", (self.profile_id,)).fetchone()[0],
+            }
+            daily = {
+                "wrong": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'wrong' AND updated_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
+                "favorites": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'favorite' AND updated_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
+                "notes": connection.execute("SELECT COUNT(*) FROM question_notes WHERE profile_id = ? AND updated_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
+                "comments": connection.execute("SELECT COUNT(*) FROM question_comments WHERE author_id = ? AND created_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
+                "likes": connection.execute("SELECT COUNT(*) FROM comment_reactions WHERE profile_id = ? AND reaction = 'agree' AND created_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
+            }
+        finally:
+            connection.close()
+        accuracy = round((int(correct) / int(answered)) * 100) if answered else 0
+        return {
+            "date": day,
+            "updated_at": _utc_now(),
+            "score": accuracy,
+            "duration_minutes": round(int(duration_ms or 0) / 60000, 1),
+            "questions": int(answered),
+            "accuracy": accuracy,
+            "rank_label": "未上榜",
+            "totals": {key: int(value) for key, value in totals.items()},
+            "daily": {key: int(value) for key, value in daily.items()},
+        }
+
+    def react_comment(self, comment_id: str, reaction: str) -> dict[str, Any]:
+        comment_id = display_text(comment_id)
+        reaction = display_text(reaction).lower()
+        if reaction not in {"agree", "disagree"}:
+            raise ValueError("reaction must be agree or disagree")
+        connection = self.connect()
+        try:
+            with connection:
+                comment = connection.execute(
+                    "SELECT author_id FROM question_comments WHERE comment_id = ?",
+                    (comment_id,),
+                ).fetchone()
+                if comment is None:
+                    raise PracticeNotFound("Comment not found")
+                current = connection.execute(
+                    "SELECT reaction FROM comment_reactions WHERE comment_id = ? AND profile_id = ?",
+                    (comment_id, self.profile_id),
+                ).fetchone()
+                if current and current["reaction"] == reaction:
+                    connection.execute(
+                        "DELETE FROM comment_reactions WHERE comment_id = ? AND profile_id = ?",
+                        (comment_id, self.profile_id),
+                    )
+                    selected = ""
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO comment_reactions(comment_id, profile_id, reaction, created_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(comment_id, profile_id) DO UPDATE SET reaction = excluded.reaction, created_at = excluded.created_at
+                        """,
+                        (comment_id, self.profile_id, reaction, _utc_now()),
+                    )
+                    selected = reaction
+                    if comment["author_id"] != self.profile_id and reaction == "agree":
+                        connection.execute(
+                            """
+                            INSERT INTO notifications(notification_id, profile_id, kind, actor_id, comment_id, body, created_at)
+                            VALUES (?, ?, 'agree', ?, ?, '', ?)
+                            """,
+                            (f"ntf_{secrets.token_hex(10)}", comment["author_id"], self.profile_id, comment_id, _utc_now()),
+                        )
+                counts = connection.execute(
+                    "SELECT reaction, COUNT(*) AS count FROM comment_reactions WHERE comment_id = ? GROUP BY reaction",
+                    (comment_id,),
+                ).fetchall()
+        finally:
+            connection.close()
+        result = {"comment_id": comment_id, "my_reaction": selected, "agree_count": 0, "disagree_count": 0}
+        for row in counts:
+            result[f"{row['reaction']}_count"] = int(row["count"])
+        return result
+
+    def my_likes(self, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT c.comment_id, c.occurrence_id, c.question_id, c.author_id, c.author_name,
+                       c.body, c.parent_comment_id, c.created_at, c.updated_at, r.created_at AS liked_at
+                FROM comment_reactions r JOIN question_comments c ON c.comment_id = r.comment_id
+                WHERE r.profile_id = ? AND r.reaction = 'agree'
+                ORDER BY r.created_at DESC LIMIT ? OFFSET ?
+                """,
+                (self.profile_id, limit, offset),
+            ).fetchall()
+            total = connection.execute(
+                "SELECT COUNT(*) FROM comment_reactions WHERE profile_id = ? AND reaction = 'agree'",
+                (self.profile_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        items = self._decorate_comments(rows, viewer_is_admin=False, include_question=True)
+        for item, row in zip(items, rows):
+            item["liked_at"] = row["liked_at"]
+        return {"count": len(items), "total": int(total), "offset": offset, "items": items}
+
+    def list_friends(self) -> list[dict[str, Any]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT u.user_id, u.username, u.avatar, u.updated_at
+                FROM friendships f JOIN users u ON u.user_id = f.friend_id
+                WHERE f.profile_id = ? AND f.status = 'accepted' AND u.status = 'active'
+                ORDER BY u.username
+                """,
+                (self.profile_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [
+            {"user_id": row["user_id"], "username": row["username"], "avatar": row["avatar"], "avatar_url": public_avatar_url(row["user_id"], row["avatar"], row["updated_at"])}
+            for row in rows
+        ]
+
+    def add_friend(self, username: str) -> dict[str, Any]:
+        normalized = display_text(username).casefold()
+        if not normalized:
+            raise ValueError("username is required")
+        connection = self.connect()
+        try:
+            with connection:
+                friend = connection.execute(
+                    "SELECT user_id, username, avatar, updated_at FROM users WHERE normalized_username = ? AND status = 'active'",
+                    (normalized,),
+                ).fetchone()
+                if friend is None:
+                    raise PracticeNotFound("用户不存在")
+                if friend["user_id"] == self.profile_id:
+                    raise ValueError("不能添加自己")
+                now = _utc_now()
+                connection.execute(
+                    "INSERT OR REPLACE INTO friendships(profile_id, friend_id, status, created_at) VALUES (?, ?, 'accepted', ?)",
+                    (self.profile_id, friend["user_id"], now),
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO friendships(profile_id, friend_id, status, created_at) VALUES (?, ?, 'accepted', ?)",
+                    (friend["user_id"], self.profile_id, now),
+                )
+        finally:
+            connection.close()
+        return {"user_id": friend["user_id"], "username": friend["username"], "avatar": friend["avatar"], "avatar_url": public_avatar_url(friend["user_id"], friend["avatar"], friend["updated_at"])}
+
+    def remove_friend(self, friend_id: str) -> bool:
+        connection = self.connect()
+        try:
+            with connection:
+                cursor = connection.execute(
+                    "DELETE FROM friendships WHERE (profile_id = ? AND friend_id = ?) OR (profile_id = ? AND friend_id = ?)",
+                    (self.profile_id, friend_id, friend_id, self.profile_id),
+                )
+        finally:
+            connection.close()
+        return cursor.rowcount > 0
+
+    def list_messages(self, category: str = "all") -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            has_users = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'").fetchone()
+            if has_users:
+                notifications = connection.execute(
+                    """
+                    SELECT n.notification_id, n.kind, n.actor_id, n.comment_id, n.body, n.created_at, n.read_at,
+                           COALESCE(u.username, '') AS actor_name
+                    FROM notifications n LEFT JOIN users u ON u.user_id = n.actor_id
+                    WHERE n.profile_id = ? ORDER BY n.created_at DESC LIMIT 100
+                    """,
+                    (self.profile_id,),
+                ).fetchall()
+                direct = connection.execute(
+                    """
+                    SELECT m.message_id, m.sender_id, m.receiver_id, m.body, m.created_at, m.read_at, u.username AS sender_name
+                    FROM direct_messages m JOIN users u ON u.user_id = m.sender_id
+                    WHERE m.receiver_id = ? OR m.sender_id = ? ORDER BY m.created_at DESC LIMIT 100
+                    """,
+                    (self.profile_id, self.profile_id),
+                ).fetchall()
+            else:
+                notifications = connection.execute("SELECT notification_id, kind, actor_id, comment_id, body, created_at, read_at, '' AS actor_name FROM notifications WHERE profile_id = ? ORDER BY created_at DESC LIMIT 100", (self.profile_id,)).fetchall()
+                direct = connection.execute("SELECT message_id, sender_id, receiver_id, body, created_at, read_at, '' AS sender_name FROM direct_messages WHERE receiver_id = ? OR sender_id = ? ORDER BY created_at DESC LIMIT 100", (self.profile_id, self.profile_id)).fetchall()
+        finally:
+            connection.close()
+        return {"category": category, "notifications": [dict(row) for row in notifications], "messages": [dict(row) for row in direct]}
+
+    def send_message(self, receiver_id: str, body: object) -> dict[str, Any]:
+        normalized_body = _comment_body(body)
+        receiver_id = display_text(receiver_id)
+        now = _utc_now()
+        connection = self.connect()
+        try:
+            with connection:
+                if connection.execute("SELECT 1 FROM users WHERE user_id = ? AND status = 'active'", (receiver_id,)).fetchone() is None:
+                    raise PracticeNotFound("用户不存在")
+                message = {"message_id": f"msg_{secrets.token_hex(12)}", "sender_id": self.profile_id, "receiver_id": receiver_id, "body": normalized_body, "created_at": now, "read_at": None}
+                connection.execute(
+                    "INSERT INTO direct_messages(message_id, sender_id, receiver_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (message["message_id"], self.profile_id, receiver_id, normalized_body, now),
+                )
+        finally:
+            connection.close()
+        return message
 
     def _resolve_occurrence_question(self, occurrence_id: int) -> dict[str, Any]:
         try:

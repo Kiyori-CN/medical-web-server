@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import secrets
 import sqlite3
@@ -137,6 +138,11 @@ class AuthStore:
                     role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
                     status TEXT NOT NULL DEFAULT 'active'
                         CHECK (status IN ('active', 'disabled')),
+                    birthday TEXT NOT NULL DEFAULT '',
+                    gender TEXT NOT NULL DEFAULT '',
+                    school TEXT NOT NULL DEFAULT '',
+                    major TEXT NOT NULL DEFAULT '',
+                    privacy_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_login_at TEXT
@@ -173,6 +179,15 @@ class AuthStore:
                 connection.execute(
                     "ALTER TABLE users ADD COLUMN avatar TEXT NOT NULL DEFAULT ''"
                 )
+            for name, declaration in (
+                ("birthday", "TEXT NOT NULL DEFAULT ''"),
+                ("gender", "TEXT NOT NULL DEFAULT ''"),
+                ("school", "TEXT NOT NULL DEFAULT ''"),
+                ("major", "TEXT NOT NULL DEFAULT ''"),
+                ("privacy_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if name not in user_columns:
+                    connection.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
             connection.commit()
         finally:
             connection.close()
@@ -238,8 +253,9 @@ class AuthStore:
             """
             INSERT INTO users(
                 user_id, username, normalized_username, avatar, password_hash,
-                role, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                role, status, birthday, gender, school, major, privacy_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'active', '', '', '', '', '{}', ?, ?)
             """,
             (
                 user_id,
@@ -308,9 +324,22 @@ class AuthStore:
             connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
             connection.commit()
 
-    def update_profile(self, user_id: str, username: str, avatar: str) -> dict[str, Any]:
+    def update_profile(
+        self,
+        user_id: str,
+        username: str,
+        avatar: str,
+        profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         display_name = validate_username(username)
         avatar = validate_avatar(avatar)
+        profile = profile if isinstance(profile, dict) else {}
+        birthday = str(profile.get("birthday", "") or "").strip()[:20]
+        gender = str(profile.get("gender", "") or "").strip()[:20]
+        school = str(profile.get("school", "") or "").strip()[:120]
+        major = str(profile.get("major", "") or "").strip()[:120]
+        privacy = profile.get("privacy") if isinstance(profile.get("privacy"), dict) else {}
+        privacy = {key: bool(privacy.get(key)) for key in ("birthday", "gender", "school", "major")}
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if connection.execute(
@@ -327,13 +356,19 @@ class AuthStore:
                 connection.execute(
                     """
                     UPDATE users
-                    SET username = ?, normalized_username = ?, avatar = ?, updated_at = ?
+                    SET username = ?, normalized_username = ?, avatar = ?, birthday = ?,
+                        gender = ?, school = ?, major = ?, privacy_json = ?, updated_at = ?
                     WHERE user_id = ?
                     """,
                     (
                         display_name,
                         _normalized_username(display_name),
                         avatar,
+                        birthday,
+                        gender,
+                        school,
+                        major,
+                        json.dumps(privacy, ensure_ascii=False),
                         _utc_now(),
                         user_id,
                     ),
@@ -534,7 +569,15 @@ class AuthStore:
             "status": row["status"],
             "created_at": row["created_at"],
             "last_login_at": row["last_login_at"],
+            "birthday": row["birthday"] if "birthday" in row.keys() else "",
+            "gender": row["gender"] if "gender" in row.keys() else "",
+            "school": row["school"] if "school" in row.keys() else "",
+            "major": row["major"] if "major" in row.keys() else "",
         }
+        try:
+            payload["privacy"] = json.loads(row["privacy_json"] or "{}") if "privacy_json" in row.keys() else {}
+        except (TypeError, ValueError):
+            payload["privacy"] = {}
         payload["avatar_url"] = public_avatar_url(
             row["user_id"], row["avatar"], row["updated_at"]
         )
@@ -700,6 +743,7 @@ def create_auth_blueprint(
             g.current_user["user_id"],
             data.get("username", g.current_user["username"]),
             data.get("avatar", g.current_user.get("avatar", "")),
+            data,
         )
         return jsonify({"user": user})
 
