@@ -186,4 +186,6 @@ curl -fsS -X POST http://127.0.0.1:8080/api/search \
   --data '{"query":"2026N1A 属于神经-体液调节的是","limit":3,"include_solution":false}'
 ```
 
+`medical-exam.service` 必须通过 `/etc/systemd/system/medical-exam.service.d/timeout.conf` 设置 `TimeoutStopSec=45s`，不得短于 Gunicorn 的 30 秒 `graceful_timeout`。每次部署都要确认旧主进程显示 `Deactivated successfully`，不得出现 `stop-sigterm timed out`、`status=9/KILL` 或 `Failed with result 'timeout'`。
+
 还要验证公网域名、首次管理员初始化、普通用户权限、模型密钥掩码、真实搜题、四种刷题模式、服务日志、内存和延迟。

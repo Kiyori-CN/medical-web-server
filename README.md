@@ -202,6 +202,7 @@ python -m pytest
 - GitHub：`https://github.com/Kiyori-CN/medical-web-server.git`
 - 生产站点：`https://medical.newapi.com.cn/`
 - 服务：`medical-exam.service`
+- 服务停止超时：`TimeoutStopSec=45s`（systemd drop-in），确保 Gunicorn 优雅退出；
 - 端口：`8080`
 - 运行目录：`/srv/projects/medical-web-server/app/backend`
 - 题库目录：`/srv/projects/medical-web-server/knowledge-base`

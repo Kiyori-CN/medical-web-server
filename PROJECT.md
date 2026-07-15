@@ -81,6 +81,7 @@
 
 - 3 个同步 Gunicorn worker；
 - `preload_app = True`；
+- `medical-exam.service` 使用 `TimeoutStopSec=45s`，为 Gunicorn 30 秒优雅退出预留缓冲；
 - NumPy mmap 向量矩阵；
 - `OPENBLAS_NUM_THREADS=1`、`OMP_NUM_THREADS=1`、`MKL_NUM_THREADS=1`、`NUMEXPR_NUM_THREADS=1`；
 - 不运行 Milvus、Qdrant、Elasticsearch 等独立检索服务。

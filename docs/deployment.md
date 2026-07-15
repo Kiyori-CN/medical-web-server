@@ -31,6 +31,7 @@ C:\Users\admin\.codex\skills\tencent-cloud\scripts\tencent-cloud.ps1
 固定接口：
 
 - systemd：`medical-exam.service`；
+- systemd drop-in：`/etc/systemd/system/medical-exam.service.d/timeout.conf`，固定设置 `TimeoutStopSec=45s`；
 - 端口：`8080`；
 - 直接健康：`http://127.0.0.1:8080/api/health`；
 - 公网：`https://medical.newapi.com.cn/`；
@@ -189,6 +190,7 @@ curl -fsS -X POST http://127.0.0.1:8080/api/search \
 - 管理设置密钥掩码；
 - `390×844` 和桌面布局；
 - 服务日志无新增错误；
+- 停止旧服务时完成优雅退出，日志没有 `stop-sigterm timed out`、`status=9/KILL` 或 `Failed with result 'timeout'`；
 - 3 worker、preload、单线程 BLAS、内存与延迟符合预算。
 
 ## 后续常规部署
