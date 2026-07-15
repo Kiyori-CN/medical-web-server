@@ -78,6 +78,8 @@ def test_personal_study_export_is_streamed_and_account_scoped(
         "session",
         "session_question",
     }
+    progress = next(record for record in records if record["record_type"] == "progress")
+    assert progress["wrong_count"] == 1
     assert not any(
         record["record_type"] in {"study_item", "note"}
         and record.get("occurrence_id") == other_item["occurrence_id"]

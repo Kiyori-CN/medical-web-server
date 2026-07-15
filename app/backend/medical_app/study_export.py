@@ -27,7 +27,7 @@ EXPORT_COLUMNS = (
     "wrong_count",
     "attempts",
     "correct_count",
-    "wrong_answers",
+    "wrong_count",
     "ungraded_count",
     "streak",
     "last_answer",
@@ -132,7 +132,7 @@ def _iter_records(
         (
             "progress",
             """
-            SELECT question_id, attempts, correct_count, wrong_count AS wrong_answers,
+            SELECT question_id, attempts, correct_count, wrong_count,
                    ungraded_count, streak, last_answer, last_result, last_seen_at
             FROM question_progress
             WHERE profile_id = ?
@@ -143,7 +143,7 @@ def _iter_records(
             "collection_progress",
             """
             SELECT collection_id, occurrence_id, attempts, correct_count,
-                   wrong_count AS wrong_answers, ungraded_count, streak,
+                   wrong_count, ungraded_count, streak,
                    last_answer, last_result, last_seen_at
             FROM collection_question_progress
             WHERE profile_id = ?
