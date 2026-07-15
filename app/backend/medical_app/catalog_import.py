@@ -113,7 +113,9 @@ class CatalogImportPreviewStore:
         self.root = root.resolve()
 
     def initialize(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt":
+            self.root.chmod(0o700)
 
     def create_preview(self, upload: FileStorage) -> dict[str, Any]:
         self._ensure_capacity()
