@@ -901,6 +901,8 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 .ai-composer-foot span { color: var(--muted); font-size: 10px; }
 .ai-no-conversation { display: grid; place-items: center; align-content: center; flex: 1; gap: 4px; padding: 20px; }
 .ai-no-conversation .empty-state { min-height: 220px; background: transparent; box-shadow: none; }
+.practice-ai-action { display: flex; justify-content: flex-end; margin-top: 12px; padding-top: 10px; border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
+.practice-ai-action .button { color: var(--brand-dark); }
 
 @media (max-width: 760px) {
   .ai-page-header { align-items: flex-start; gap: 12px; }

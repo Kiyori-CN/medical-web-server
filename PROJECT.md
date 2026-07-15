@@ -109,4 +109,4 @@
 - 题库页面支持目录浏览与分类导航切换；两种浏览方式互相切换时保留当前内容，目标数据完成后再原子替换，禁止闪现“正在整理分类导航”等中间加载卡。分类导航固定使用“考试多行标签 → 题库类型多行标签 → 学科纵向折叠 → 章节/最终文件”，前两组标签宽度固定、自动换行并可分别展开或收起，学科展开时按需请求子树，不预载全部文件；目录、分类、收藏和错题中的最终题库名称直接左对齐，不显示“卷”等装饰图标；切换标签或展开目录时必须保留当前滚动位置。
 - 收藏、错题、笔记、评论和点赞的增删操作必须使今日统计失效并在下一次进入题库时刷新；个人评论、笔记和点赞列表使用 offset 分批加载，点赞列表允许取消赞同。更新时间紧邻今日统计标题右侧，分类导航不显示解释性说明。
 
-AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conversations/<id>` 和 `GET/POST /api/ai/conversations/<id>/messages`。上下文最多纳入 6 条题库材料；LLM 密钥只在服务端从加密设置库读取，响应不返回密钥或供应商原始错误。所有 AI 写操作要求登录会话和 CSRF。
+AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conversations/<id>` 和 `GET/POST /api/ai/conversations/<id>/messages`。上下文最多纳入 6 条题库材料；刷题答案解析解锁后可以把当前 occurrence/collection 传入 AI；LLM 密钥只在服务端从加密设置库读取，响应不返回密钥或供应商原始错误。所有 AI 写操作要求登录会话和 CSRF。

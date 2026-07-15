@@ -81,6 +81,8 @@ const state = {
     activeId: "",
     messages: {},
     sending: false,
+    contextOccurrence: null,
+    contextCollection: "",
   },
 };
 
@@ -1252,7 +1254,7 @@ function renderPractice() {
           is_correct: submitted.is_correct,
           point: submitted.point,
           explanation: submitted.explanation,
-        } : question)}</div>` : ""}
+        } : question)}<div class="practice-ai-action"><button class="button button-quiet button-small" type="button" data-action="ai-current-question" data-occurrence="${occurrenceId || ""}" data-collection="${escapeAttr(source.collection_id || session.collection_id || "")}">✦ AI 解析这道题</button></div></div>` : ""}
         ${reveal ? `<div class="question-note-slot" data-note-occurrence="${occurrenceId || ""}">${renderQuestionNote(occurrenceId)}</div>` : ""}
         ${reveal ? `<div class="question-comments-slot" data-comments-occurrence="${occurrenceId || ""}">${renderQuestionComments(occurrenceId)}</div>` : ""}
         <div class="practice-footer" data-action-count="${4 + Number(showSubmit) + Number(session.saved_kind === "wrong")}">
@@ -2134,7 +2136,7 @@ function renderAIContent() {
       ${active ? `<div class="ai-chat-head"><div><strong>${escapeHtml(active.title || "新对话")}</strong><small>非流式回答 · 最多保留最近 12 条上下文</small></div><div class="ai-chat-actions"><button class="text-button" type="button" data-action="ai-rename">重命名</button><button class="text-button danger" type="button" data-action="ai-delete">删除</button></div></div>
       <div class="ai-messages" aria-live="polite">${messages.length ? messages.map(aiMessageMarkup).join("") : `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
       <form id="ai-chat-form" class="ai-composer" data-form="ai-chat">
-        <label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog">全题库</option><option value="question"${state.session ? "" : " disabled"}>当前题（从刷题页发起）</option><option value="collection" disabled>当前文件（从刷题页发起）</option></select></label>
+        <label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog"${state.ai.contextOccurrence ? "" : " selected"}>全题库</option><option value="question"${state.ai.contextOccurrence ? " selected" : " disabled"}>当前题（从刷题页发起）</option><option value="collection"${state.ai.contextCollection ? "" : " disabled"}>当前文件（从刷题页发起）</option></select></label>
         <textarea name="content" rows="3" maxlength="8000" placeholder="输入你的问题，按 Ctrl/⌘ + Enter 发送" required></textarea>
         <div class="ai-composer-foot"><span>答案可能需要复核，请以原题和标准解析为准。</span><button class="button button-primary" type="submit"${state.ai.sending ? " disabled" : ""}>${state.ai.sending ? "生成中…" : "发送"}</button></div>
       </form>` : `<div class="ai-no-conversation">${emptyMarkup("创建一个 AI 会话", "会话按账号隔离，回答可引用全题库内容。", "✦")}<button class="button button-primary" type="button" data-action="ai-new">新建会话</button></div>`}
@@ -2220,7 +2222,7 @@ async function sendAIMessage(form) {
   renderAIContent();
   try {
     const scope = String(new FormData(form).get("scope") || "catalog");
-    const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`, { method: "POST", body: { content, context: { scope } } });
+    const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`, { method: "POST", body: { content, context: { scope, occurrence_id: state.ai.contextOccurrence, collection_id: state.ai.contextCollection } } });
     state.ai.messages[state.ai.activeId] = [...(state.ai.messages[state.ai.activeId] || []), payload.user, payload.assistant];
     state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === state.ai.activeId ? { ...item, ...payload.conversation, preview: payload.assistant.content, message_count: (item.message_count || 0) + 2 } : item);
   } catch (error) { showToast(error.message, "error"); }
@@ -2832,6 +2834,12 @@ async function handleClick(event) {
     event.preventDefault();
     const query = target.dataset.query || "";
     if (query) { state.lastSearchQuery = query; return navigateHash("#search"); }
+  }
+  if (action === "ai-current-question") {
+    state.ai.contextOccurrence = Number(target.dataset.occurrence) || null;
+    state.ai.contextCollection = target.dataset.collection || "";
+    state.ai.activeId = state.ai.activeId || state.ai.conversations?.[0]?.conversation_id || "";
+    return navigateHash("#ai");
   }
 }
 
