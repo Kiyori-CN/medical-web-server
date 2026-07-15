@@ -576,6 +576,31 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 .catalog-export-card p { max-width: 700px; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.7; }
 .catalog-export-actions { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .catalog-export-actions > span { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.catalog-import-divider { height: 1px; margin: 20px 0; background: var(--line); }
+.catalog-import-card { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .65fr); align-items: end; gap: 15px; }
+.catalog-import-card h3 { margin-bottom: 6px; }
+.catalog-import-card p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.catalog-import-card input[type="file"] { min-width: 0; width: 100%; padding: 8px; }
+.catalog-import-workspace { min-width: 0; display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 12px; margin-top: 14px; }
+.catalog-import-records { min-width: 0; align-self: start; display: grid; gap: 5px; padding: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
+.catalog-import-records-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 5px 7px; color: var(--muted); font-size: 10px; }
+.catalog-import-record { min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid transparent; border-radius: 9px; padding: 9px; color: var(--ink); text-align: left; background: transparent; cursor: pointer; }
+.catalog-import-record:hover, .catalog-import-record.active { border-color: color-mix(in srgb, var(--brand) 28%, var(--line)); background: var(--brand-soft); }
+.catalog-import-record > span { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.catalog-import-record strong, .catalog-import-record small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.catalog-import-record strong { font-size: 11px; }.catalog-import-record small { color: var(--muted); font-size: 9px; }
+.catalog-import-record em { flex: 0 0 auto; font-style: normal; }
+.catalog-import-detail { min-width: 0; padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.catalog-import-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.catalog-import-detail-head > div { min-width: 0; display: grid; gap: 4px; }
+.catalog-import-detail-head strong, .catalog-import-detail-head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.catalog-import-detail-head strong { font-size: 13px; }.catalog-import-detail-head span { color: var(--muted); font-size: 9px; }
+.catalog-import-mapping { display: grid; gap: 12px; margin: 12px 0; padding: 13px; border-radius: 11px; background: var(--surface-soft); }
+.catalog-import-mapping-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+.catalog-import-preview td:nth-child(3) { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.catalog-import-errors { display: grid; gap: 5px; margin-top: 12px; padding: 12px; border: 1px solid #efd5d7; border-radius: 10px; background: #fff5f5; }
+.catalog-import-errors strong { color: #a13f49; font-size: 11px; }.catalog-import-errors span { color: #574d52; font-size: 10px; line-height: 1.55; }
+.catalog-import-empty { margin-top: 14px; padding: 22px; border: 1px dashed var(--line-strong); border-radius: 12px; color: var(--muted); text-align: center; font-size: 11px; }
 .admin-status-banner { min-width: 0; display: flex; align-items: center; gap: 12px; margin-bottom: 18px; padding: 15px 16px; border: 1px solid #e6d9b8; border-radius: 14px; background: #fffaf0; }
 .admin-status-banner.ready { border-color: #cbe3da; background: #f2faf7; }
 .admin-status-banner > div { min-width: 0; flex: 1; display: grid; gap: 3px; }
@@ -752,6 +777,10 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
   .admin-section { padding: 17px 14px; }
   .catalog-export-card { grid-template-columns: 1fr; }
   .catalog-export-actions { grid-column: auto; align-items: flex-end; }
+  .catalog-import-card, .catalog-import-workspace { grid-template-columns: 1fr; }
+  .catalog-import-records { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .catalog-import-records-head { grid-column: 1 / -1; }
+  .catalog-import-mapping-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-status-banner { align-items: flex-start; }
   .admin-status-banner .badge { display: none; }
   .admin-status-banner small { white-space: normal; }

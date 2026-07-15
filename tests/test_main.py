@@ -141,6 +141,37 @@ def test_main_auth_roles_health_assets_and_practice(
     assert len(csv_rows) == 6
     assert csv_rows[0]["option_a"]
     assert client.get("/api/admin/catalog/export?format=xlsx").status_code == 400
+    app.config["MAX_CONTENT_LENGTH"] = 64
+    oversized = client.post(
+        "/api/admin/catalog/imports",
+        headers=_csrf(client),
+        data={"file": (io.BytesIO(b"x" * 200), "questions.csv")},
+    )
+    assert oversized.status_code == 413
+    assert "18 MB" in oversized.get_json()["error"]
+    app.config["MAX_CONTENT_LENGTH"] = 18 * 1024 * 1024
+    import_preview = client.post(
+        "/api/admin/catalog/imports",
+        headers=_csrf(client),
+        data={
+            "file": (
+                io.BytesIO("题目,答案\n人体最大的器官是,A\n".encode("utf-8")),
+                "questions.csv",
+            )
+        },
+    )
+    assert import_preview.status_code == 201
+    import_payload = import_preview.get_json()
+    assert import_payload["status"] == "ready"
+    assert import_payload["valid_rows"] == 1
+    assert client.get("/api/admin/catalog/imports").get_json()["imports"][0][
+        "import_id"
+    ] == import_payload["import_id"]
+    assert client.delete(
+        f"/api/admin/catalog/imports/{import_payload['import_id']}",
+        headers=_csrf(client),
+        json={},
+    ).status_code == 200
     search = client.post(
         "/api/search",
         json={"query": "细胞膜运输", "include_solution": False},
@@ -167,6 +198,7 @@ def test_main_auth_roles_health_assets_and_practice(
     assert ordinary.get("/api/admin/comments").status_code == 403
     assert ordinary.get("/api/admin/vectors").status_code == 403
     assert ordinary.get("/api/admin/catalog/export?format=jsonl").status_code == 403
+    assert ordinary.get("/api/admin/catalog/imports").status_code == 403
     assert ordinary.get("/api/settings").status_code == 200
     wrong_password = ordinary.post(
         "/api/auth/password",

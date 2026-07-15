@@ -33,6 +33,7 @@ knowledge-base/
 
 state/
   app.sqlite3                   账号、资料隐私、头像、会话、文件刷题状态、收藏、错题、私有笔记、评论、关注、反应、通知、私信、AI 会话消息、论坛主题回复
+  import-staging/               管理员通用题库导入预检源文件与 manifest；不进入 catalog 或 Git
   settings.sqlite3              网站与模型设置
   settings.key                  设置加密密钥
   vector-operation.json         管理员向量构建/删除后台任务状态
@@ -174,6 +175,8 @@ AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` �
 论坛状态补充实体：`forum_sections` 保存本地分区，`forum_topics` 保存作者快照、标题、正文和状态，`forum_replies` 保存楼层回复、可选父回复和状态。列表按分区/关键词/最后活动分页，删除使用软删除状态；任何更新、删除都由服务端验证当前作者或管理员角色，不能只依赖前端按钮。
 
 题库导出不创建新的事实源或状态表。`medical_app.catalog_export` 通过 SQLite `mode=ro` 与 `query_only` 读取当前激活 catalog，按 `collection_questions → question_occurrences → question_versions` 输出原题版本，并携带 collection 路径及位置。JSONL 使用结构化 `options`，CSV 使用 A–H 平铺列并中和电子表格公式前缀；生成器逐行读取，响应不缓存、不经 Nginx 缓冲，也不读取 `state/`。
+
+导入预检由 `medical_app.catalog_import` 管理 `state/import-staging/imp_*/`。目录内只保存随机命名的 `source.csv|jsonl|json` 和原子写入的 `manifest.json`；manifest 记录安全文件名、哈希、大小、字段、映射、行数、有限错误摘要与最多 10 条标准化样例。CSV/JSONL 逐行读取，JSON 受 16 MB 硬上限约束；任何预检都不调用 builder、不写 catalog、不改变激活指针或向量。后续正式导入必须从 staging 构建新的不可变 catalog 并在完整性检查后原子激活。
 
 题库页的紧凑今日统计通过 `/api/study/today-summary` 从当前账号的会话、答题、收藏、错题、笔记、评论和赞同记录实时聚合；目录模式的所有文件夹层级和分类模式共用同一顶部统计与五个入口。更新时间紧邻标题右侧，分类导航只保留标题和分类数量。管理员运行概览继续从 catalog 读取全库统计，普通题库页面不会展示 64,078 等全局数字。
 

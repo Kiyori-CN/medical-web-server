@@ -22,6 +22,7 @@ def guarded_import(name, *args, **kwargs):
 builtins.__import__ = guarded_import
 import medical_app.api
 import medical_app.catalog_export
+import medical_app.catalog_import
 import medical_app.practice_api
 import medical_app.settings_api
 """

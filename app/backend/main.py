@@ -6,6 +6,7 @@ from pathlib import Path
 os.environ.setdefault("FLASK_ENV", "production")
 
 from flask import Flask, jsonify, send_from_directory
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from config import get_config
 from medical_app.api import create_catalog_blueprint
@@ -19,6 +20,7 @@ from medical_app.auth import (
 )
 from medical_app.catalog import Catalog, CatalogUnavailable, resolve_catalog_path
 from medical_app.catalog_export import create_catalog_export_blueprint
+from medical_app.catalog_import import create_catalog_import_blueprint
 from medical_app.forum_api import create_forum_blueprint
 from medical_app.practice import PracticeStore
 from medical_app.practice_api import create_practice_blueprint
@@ -32,7 +34,7 @@ def create_app() -> Flask:
     config = get_config()
     application = Flask(__name__)
     application.config.update(
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+        MAX_CONTENT_LENGTH=18 * 1024 * 1024,
         JSON_AS_ASCII=False,
     )
 
@@ -73,6 +75,9 @@ def create_app() -> Flask:
     application.register_blueprint(create_vector_admin_blueprint(vector_operations))
     application.register_blueprint(create_user_admin_blueprint(auth_store))
     application.register_blueprint(create_catalog_export_blueprint(catalog_path))
+    application.register_blueprint(
+        create_catalog_import_blueprint(Path(config.APP_DB).resolve().parent)
+    )
     application.register_blueprint(create_catalog_blueprint(catalog_path, semantic_service))
     application.register_blueprint(create_forum_blueprint(config.APP_DB))
     application.register_blueprint(
@@ -128,6 +133,10 @@ def create_app() -> Flask:
                 "vector_index": semantic_service.status(),
             }
         )
+
+    @application.errorhandler(RequestEntityTooLarge)
+    def request_too_large(_error):
+        return jsonify({"error": "上传内容不能超过 18 MB"}), 413
 
     @application.get("/api/admin/dashboard")
     @admin_required

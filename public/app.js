@@ -45,6 +45,7 @@ const state = {
   lastSearchQuery: "",
   adminTab: "overview",
   adminData: null,
+  catalogImportPreview: null,
   profileAvatarDraft: null,
   profileEditing: false,
   publicProfile: null,
@@ -2582,14 +2583,16 @@ async function renderAdminPage() {
   const container = $("#page-admin");
   container.innerHTML = `${adminHeaderMarkup()}${loadingMarkup("正在读取系统状态")}`;
   try {
-    const [dashboard, settings, users, comments, vectors] = await Promise.all([
+    const [dashboard, settings, users, comments, vectors, imports] = await Promise.all([
       api("/admin/dashboard"),
       api("/admin/settings"),
       api("/admin/users"),
       api("/admin/comments?limit=100"),
       api("/admin/vectors"),
+      api("/admin/catalog/imports"),
     ]);
-    state.adminData = { dashboard, settings, users: users.users || [], comments, vectors };
+    state.adminData = { dashboard, settings, users: users.users || [], comments, vectors, imports: imports.imports || [] };
+    if (state.catalogImportPreview && !state.adminData.imports.some((item) => item.import_id === state.catalogImportPreview.import_id)) state.catalogImportPreview = null;
     renderAdminContent();
     if (["queued", "running"].includes(vectors.operation?.status)) scheduleVectorPoll();
   } catch (error) {
@@ -2620,7 +2623,7 @@ function adminTabButton(tab, label) {
 
 function renderAdminTab() {
   const { dashboard, settings, users, comments } = state.adminData;
-  if (state.adminTab === "catalog") return renderCatalogManagement(dashboard.catalog);
+  if (state.adminTab === "catalog") return renderCatalogManagement(dashboard.catalog, state.adminData.imports || []);
   if (state.adminTab === "users") return renderUsers(users);
   if (state.adminTab === "comments") return renderAdminComments(comments);
   if (state.adminTab === "models") return renderModelSettings(settings);
@@ -2647,7 +2650,8 @@ function renderAdminTab() {
   </section>`;
 }
 
-function renderCatalogManagement(catalog) {
+function renderCatalogManagement(catalog, imports) {
+  const activeImport = state.catalogImportPreview || imports[0] || null;
   return `<section class="card admin-section">
     <div class="section-heading"><div><h2>题库管理</h2><p>以通用格式导出当前激活的只读 catalog，不包含账号、笔记、评论或其他用户状态。</p></div></div>
     <div class="catalog-export-facts"><span><small>规范题目</small><strong>${formatNumber(catalog.questions || 0)}</strong></span><span><small>原题记录</small><strong>${formatNumber(catalog.question_occurrences || 0)}</strong></span><span><small>题库文件</small><strong>${formatNumber(catalog.collections || 0)}</strong></span></div>
@@ -2656,6 +2660,13 @@ function renderCatalogManagement(catalog) {
       <label class="field"><span>导出格式</span><select name="format"><option value="jsonl">JSONL · 程序处理与再次导入</option><option value="csv">CSV · 表格软件与数据分析</option></select></label>
       <div class="catalog-export-actions"><span>当前导出只读取已激活版本，不会修改 catalog 或向量。</span><button class="button button-primary" type="submit">开始导出</button></div>
     </form>
+    <div class="catalog-import-divider"></div>
+    <form id="admin-catalog-import" class="settings-group catalog-import-card">
+      <div><h3>导入预检</h3><p>上传文件只进入隔离 staging，用于字段识别、逐行校验和样例预览；预检不会构建、激活或覆盖当前 catalog。</p></div>
+      <label class="field"><span>题库文件</span><input name="file" type="file" accept=".csv,.jsonl,.json,text/csv,application/json" required></label>
+      <div class="catalog-export-actions"><span>支持 UTF-8 CSV、JSONL、JSON，单文件不超过 16 MB、50,000 行。</span><button class="button button-primary" type="submit">上传并预检</button></div>
+    </form>
+    ${renderCatalogImportWorkspace(activeImport, imports)}
   </section>`;
 }
 
@@ -2669,6 +2680,66 @@ function exportAdminCatalog(form) {
   link.click();
   link.remove();
   showToast("题库导出已开始");
+}
+
+function renderCatalogImportWorkspace(activeImport, imports) {
+  if (!imports.length && !activeImport) return `<div class="catalog-import-empty">尚无暂存记录。上传后可检查自动映射、错误行和标准化预览。</div>`;
+  const records = imports.map((item) => `<button class="catalog-import-record ${activeImport?.import_id === item.import_id ? "active" : ""}" type="button" data-action="catalog-import-select" data-import-id="${escapeAttr(item.import_id)}"><span><strong>${escapeHtml(item.filename)}</strong><small>${escapeHtml(formatDate(item.updated_at || item.created_at))}</small></span><em class="status-pill ${item.status === "ready" ? "complete" : item.status === "needs_mapping" ? "disabled" : "pending"}">${item.status === "ready" ? "可用" : item.status === "needs_mapping" ? "待映射" : "有错误"}</em></button>`).join("");
+  return `<div class="catalog-import-workspace"><aside class="catalog-import-records"><div class="catalog-import-records-head"><strong>暂存记录</strong><span>${formatNumber(imports.length)}</span></div>${records}</aside><div class="catalog-import-detail">${activeImport ? renderCatalogImportDetail(activeImport) : emptyMarkup("选择预检记录", "查看字段映射和样例。", "◌")}</div></div>`;
+}
+
+function renderCatalogImportDetail(item) {
+  const columns = item.columns || [];
+  const mapping = item.mapping || {};
+  const coreFields = [["stem", "题干", true], ["raw_type", "题型", false], ["source_code", "来源题号", false], ["answer", "答案", false], ["point", "考点", false], ["explanation", "解析", false], ["options", "结构化选项", false]];
+  const mappingForm = `<form id="admin-catalog-import-mapping" data-import-id="${escapeAttr(item.import_id)}" class="catalog-import-mapping"><div class="catalog-import-mapping-grid">${coreFields.map(([field, label, required]) => `<label class="field"><span>${label}</span><select name="${field}" ${required ? "required" : ""}><option value="">不映射</option>${columns.map((column) => `<option value="${escapeAttr(column)}" ${mapping[field] === column ? "selected" : ""}>${escapeHtml(column)}</option>`).join("")}</select></label>`).join("")}</div><div class="catalog-export-actions"><span>选项 A–H 列会自动识别；使用单个 options/选项字段时可映射为结构化选项。</span><button class="button button-secondary" type="submit">按映射重新分析</button></div></form>`;
+  const preview = item.preview || [];
+  const errors = item.errors || [];
+  return `<div class="catalog-import-detail-head"><div><strong>${escapeHtml(item.filename)}</strong><span>${formatNumber(item.size_bytes || 0)} B · ${escapeHtml(item.extension || "")}</span></div><button class="text-button danger" type="button" data-action="catalog-import-delete" data-import-id="${escapeAttr(item.import_id)}">删除暂存</button></div>
+    <div class="admin-mini-stats"><span><strong>${formatNumber(item.total_rows || 0)}</strong>总行数</span><span><strong>${formatNumber(item.valid_rows || 0)}</strong>有效</span><span><strong>${formatNumber(item.error_rows || 0)}</strong>错误</span><span><strong>${formatNumber(columns.length)}</strong>字段</span></div>
+    ${mappingForm}
+    ${preview.length ? `<div class="table-wrap"><table class="data-table catalog-import-preview"><thead><tr><th>行</th><th>题型</th><th>题干</th><th>答案</th><th>选项</th></tr></thead><tbody>${preview.map((row) => `<tr><td>${formatNumber(row.row)}</td><td>${escapeHtml(row.raw_type || "-")}</td><td>${escapeHtml(row.stem)}</td><td>${escapeHtml(row.answer || "-")}</td><td>${formatNumber((row.options || []).length)}</td></tr>`).join("")}</tbody></table></div>` : emptyMarkup(item.status === "needs_mapping" ? "需要字段映射" : "没有有效预览", item.status === "needs_mapping" ? "选择题干字段后重新分析。" : "检查错误信息或调整字段映射。", "◌")}
+    ${errors.length ? `<div class="catalog-import-errors"><strong>错误摘要</strong>${errors.slice(0, 12).map((error) => `<span>第 ${formatNumber(error.row)} 行 · ${escapeHtml(error.message)}</span>`).join("")}</div>` : ""}`;
+}
+
+async function submitCatalogImport(form) {
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "预检中");
+  try {
+    const payload = await api("/admin/catalog/imports", { method: "POST", body: new FormData(form) });
+    state.catalogImportPreview = payload;
+    state.adminData.imports = [payload, ...(state.adminData.imports || []).filter((item) => item.import_id !== payload.import_id)];
+    renderAdminContent();
+    showToast("导入预检已完成");
+  } catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
+}
+
+async function analyzeCatalogImport(form) {
+  const current = state.catalogImportPreview || (state.adminData.imports || []).find((item) => item.import_id === form.dataset.importId);
+  const mapping = { ...(current?.mapping || {}) };
+  for (const [field, source] of new FormData(form)) {
+    if (source) mapping[field] = String(source); else delete mapping[field];
+  }
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "分析中");
+  try {
+    const payload = await api(`/admin/catalog/imports/${encodeURIComponent(form.dataset.importId)}/analyze`, { method: "POST", body: { mapping } });
+    state.catalogImportPreview = payload;
+    state.adminData.imports = (state.adminData.imports || []).map((item) => item.import_id === payload.import_id ? payload : item);
+    renderAdminContent();
+    showToast("字段映射已更新");
+  } catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
+}
+
+async function deleteCatalogImport(id) {
+  if (!window.confirm("删除这份导入预检暂存？当前 catalog 不受影响。")) return;
+  try {
+    await api(`/admin/catalog/imports/${encodeURIComponent(id)}`, { method: "DELETE", body: {} });
+    state.adminData.imports = (state.adminData.imports || []).filter((item) => item.import_id !== id);
+    state.catalogImportPreview = state.adminData.imports[0] || null;
+    renderAdminContent();
+    showToast("预检暂存已删除");
+  } catch (error) { showToast(error.message, "error"); }
 }
 
 function renderUsers(users) {
@@ -2978,6 +3049,12 @@ async function handleClick(event) {
   if (action === "delete-vectors") return deleteVectors();
   if (action === "admin-delete-comment") return adminDeleteComment(target.dataset.commentId);
   if (action === "open-personal-source") return openPersonalSource(target);
+  if (action === "catalog-import-select") {
+    state.catalogImportPreview = (state.adminData.imports || []).find((item) => item.import_id === target.dataset.importId) || null;
+    renderAdminContent();
+    return;
+  }
+  if (action === "catalog-import-delete") return deleteCatalogImport(target.dataset.importId);
   if (action === "admin-tab") {
     state.adminTab = target.dataset.tab;
     renderAdminContent();
@@ -3023,6 +3100,8 @@ async function handleSubmit(event) {
   if (event.target.id === "site-settings-form") return saveSiteSettings(event.target);
   if (event.target.id === "create-user-form") return createUser(event.target);
   if (event.target.id === "admin-catalog-export") return exportAdminCatalog(event.target);
+  if (event.target.id === "admin-catalog-import") return submitCatalogImport(event.target);
+  if (event.target.id === "admin-catalog-import-mapping") return analyzeCatalogImport(event.target);
   if (event.target.id === "admin-comment-search") return searchAdminComments(event.target);
   if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);

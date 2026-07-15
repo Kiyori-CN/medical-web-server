@@ -73,6 +73,7 @@
 - 错题、收藏、笔记、评论和点赞五个入口只在题库顶部显示，各二级页不重复五项导航；从笔记、评论或点赞进入原题时，会话 hash 保存个人列表和题库返回目标，显式返回按“原题 → 列表 → 题库”逐级恢复。
 - 管理员入口统一显示“系统管理”，只在管理员的“我的 → 常用功能”首位显示，普通用户不渲染。顶栏依次提供持久化日间/夜间主题切换和信封消息入口；消息中心用一行四项标签切换当前内容。“我的”页的常用/其他功能统一四列，账号与安全和密码修改进入设置页，退出登录位于底部。切换搜题标签不聚焦搜索框，手机端不会因此弹出输入法。
 - 系统管理的“题库管理”只读导出当前激活 catalog：JSONL/CSV 均按 occurrence 保留来源文件和原题版本，流式读取避免在 4G 服务器上整库载入内存；导出不包含任何 `state/` 用户数据，CSV 单元格执行公式注入防护。
+- 通用导入先进入 `state/import-staging/` 预检，不直接写 catalog。CSV/JSONL/JSON 文件受 16 MB、50,000 行、128 字段、30 份和 256 MB 总暂存预算约束；自动映射后可由管理员手动调整核心字段，错误行与标准化样例保存于 manifest。预检阶段禁止构建、激活或替换当前 catalog。
 - 手机刷题顶栏将返回、题库标题、计时和交卷分配到固定列，题目切换动画只作用于题卡，不能带动右侧控件水平位移。
 - 模型管理将嵌入模型与大语言模型独立保存和测试；未保存密钥可通过单次管理员请求查询上游 `/models`，不写入数据库或日志。
 - 语义索引按 64,078 道规范题构建 1024 维 float32 单位向量，使用 `vector-current.json` 原子指针激活；管理员可手动构建/续建、增量更新和删除。catalog 变化时按稳定 `question_id` 复用同配置旧矩阵行，仅请求新增或变化题目；构建前后校验 catalog、模型、API URL、维度、题目 ID 哈希和矩阵范数。
@@ -115,3 +116,5 @@ AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conve
 论坛 API 为 `GET /api/forum/sections`、`GET/POST /api/forum/topics`、`GET/PATCH/DELETE /api/forum/topics/<id>`、`POST /api/forum/topics/<id>/replies` 和 `PATCH/DELETE /api/forum/replies/<id>`。主题与回复保存在本地 state，列表支持分区、关键词、排序和 offset 分页；写操作要求 CSRF，编辑/删除权限由服务端按作者或管理员执行。
 
 题库导出 API 为 `GET /api/admin/catalog/export?format=jsonl|csv`，可选 `collection_id` 精确限制到单个题库文件。接口仅允许管理员，使用 SQLite 只读连接逐行输出，并返回 `Cache-Control: private, no-store` 与 `X-Accel-Buffering: no`。
+
+题库导入预检 API 为 `GET/POST /api/admin/catalog/imports`、`POST /api/admin/catalog/imports/<id>/analyze` 和 `DELETE /api/admin/catalog/imports/<id>`。上传与重新分析/删除要求管理员和 CSRF；暂存源文件与 manifest 位于生产 `state/`，不进入 Git、发布包、catalog 或向量。

@@ -46,6 +46,7 @@
 - 搜题可多选实际来源题型组合筛选（A1、A2、A3/A4、B、X 等细分标签与普通题型均来自 catalog）；筛选值与结果徽标使用同一题型标签，确保只勾选某一题型时不会混入其他题型；重置默认全选所有题型，不选题型时仍不限制范围；
 - 管理员入口统一命名为“系统管理”；账号管理下方提供评论管理。
 - 系统管理新增“题库管理”，管理员可把当前激活 catalog 按 occurrence 流式导出为 JSONL 或 CSV；导出保留原文件路径、题号、题型、选项、答案、考点与解析，不包含账号、笔记、评论或其他用户状态。
+- 题库管理同时提供隔离的导入预检：管理员可上传 UTF-8 CSV、JSONL 或 JSON，自动识别常见字段、手动调整题干/题型/答案/考点/解析/结构化选项映射，并查看有效行、错误行和标准化样例；预检文件只进入 `state/import-staging/`，不会构建或激活 catalog。
 - 模型管理将嵌入模型和大语言模型分开配置、测试和保存；输入未保存的 API 密钥后可临时查询上游模型列表并直接选择，临时密钥不会写入设置库。
 - 管理员可确认后手动构建、续建、增量更新或删除向量索引；后台任务跨页面持续运行并保存进度。
 - 语义搜索使用管理员配置的嵌入模型构建 question-level 向量索引，完成校验后原子激活，不引入独立向量数据库。
@@ -185,11 +186,15 @@ Qwen/Qwen3-Embedding-0.6B
 | `POST` | `/api/forum/topics/<id>/replies` | 发表主题回复 |
 | `PATCH/DELETE` | `/api/forum/replies/<id>` | 作者/管理员编辑或删除回复 |
 | `GET` | `/api/admin/catalog/export` | 管理员流式导出当前 catalog，支持 `jsonl`、`csv` 与可选 `collection_id` |
+| `GET/POST` | `/api/admin/catalog/imports` | 列出导入预检暂存或上传 CSV/JSONL/JSON |
+| `POST/DELETE` | `/api/admin/catalog/imports/<id>/analyze` / `/api/admin/catalog/imports/<id>` | 按字段映射重新分析或删除暂存 |
 | `GET/PATCH` | `/api/admin/users` | 管理角色、状态与密码 |
 
 所有写请求使用会话 Cookie 与 CSRF 校验。管理接口要求当前登录账号具有管理员角色；任何设置读取或错误响应都不得返回明文密钥。
 
 题库导出接口只读访问当前激活的 `catalog.sqlite3`，逐行输出 occurrence 以控制内存。JSONL 保留结构化选项；CSV 提供 A–H 选项列并对 `= + - @` 开头的单元格进行公式中和。响应禁止缓存和 Nginx 缓冲，普通用户调用返回 403。
+
+导入预检单文件上限 16 MB、最多 50,000 行；全局 multipart 上限 18 MB。每份暂存使用随机 `imp_*` 标识和独立目录，最多保留 30 份且总预算 256 MB。写接口要求管理员会话与 CSRF，文件名不参与服务端路径解析；分析失败或超限时不保留半成品。当前阶段只交付预检与字段映射，不会覆盖现有 64,078 题 catalog。
 
 AI 会话和消息仅存储在 `state/app.sqlite3`，每次回答最多检索 6 条题库材料并返回来源路径、题目 ID 和 occurrence 引用。LLM 使用管理员在加密设置库中保存的配置，以稳定的非流式请求执行；未配置或上游失败时返回明确的 `ai_unavailable`，不会把密钥、供应商原始错误或私有笔记写入响应。AI 页面支持全题库检索，刷题答案解析解锁后可直接带当前 occurrence 和 collection 上下文发起“AI 解析这道题”。
 
