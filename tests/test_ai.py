@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from medical_app.ai import AIAccessDenied, AIStore
+from medical_app.ai import AIAccessDenied, AIConflict, AIStore
 from medical_app.builder import build_catalog
 from medical_app.catalog import Catalog
 
@@ -63,3 +63,79 @@ def test_ai_collection_context_is_bounded(sample_source_tree: Path, tmp_path: Pa
     )
     assert len(result["assistant"]["citations"]) <= 6
     assert result["conversation"]["title"] == "文件复习"
+
+
+def test_ai_regenerate_replaces_last_answer_and_preserves_account_scope(
+    sample_source_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, catalog = _store(sample_source_tree, tmp_path)
+    calls = []
+
+    def fake_provider(config, messages, **kwargs):
+        calls.append(messages)
+        return f"重新生成回答 {len(calls)}"
+
+    monkeypatch.setattr("medical_app.ai.complete_chat_provider", fake_provider)
+    collection = catalog.list_collections()[0]["collection_id"]
+    conversation = store.create_conversation("重新生成验收")
+    first = store.send_message(
+        conversation["conversation_id"],
+        "请总结当前文件。",
+        context={"scope": "collection", "collection_id": collection},
+    )
+    before = store.list_messages(conversation["conversation_id"])["messages"]
+    regenerated = store.regenerate_last(conversation["conversation_id"])
+    after = store.list_messages(conversation["conversation_id"])["messages"]
+
+    assert len(calls) == 2
+    assert len(after) == len(before) == 2
+    assert after[-1]["message_id"] == first["assistant"]["message_id"]
+    assert after[-1]["content"] == "重新生成回答 2"
+    assert regenerated["assistant"]["message_id"] == first["assistant"]["message_id"]
+    assert calls[1][-1] == calls[0][-1]
+
+    other = AIStore(store.database_path, catalog, FakeSettings(), "bob")
+    other.initialize()
+    with pytest.raises(AIAccessDenied):
+        other.regenerate_last(conversation["conversation_id"])
+    empty = store.create_conversation("没有回答")
+    with pytest.raises(AIConflict):
+        store.regenerate_last(empty["conversation_id"])
+
+
+def test_ai_initialize_migrates_existing_messages_context_column(
+    sample_source_tree: Path, tmp_path: Path
+):
+    manifest = build_catalog(sample_source_tree, tmp_path / "builds")
+    catalog = Catalog(tmp_path / "builds" / manifest["build_id"] / "catalog.sqlite3")
+    database = tmp_path / "state" / "app.sqlite3"
+    database.parent.mkdir(parents=True)
+    with database.open("wb"):
+        pass
+    import sqlite3
+
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ai_conversations (
+                conversation_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE ai_messages (
+                message_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                citations_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+    AIStore(database, catalog, FakeSettings(), "alice").initialize()
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(ai_messages)")}
+    assert "context_json" in columns

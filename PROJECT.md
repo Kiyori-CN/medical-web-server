@@ -112,7 +112,7 @@
 - 题库页面支持目录浏览与分类导航切换；两种浏览方式互相切换时保留当前内容，目标数据完成后再原子替换，禁止闪现“正在整理分类导航”等中间加载卡。分类导航固定使用“考试多行标签 → 题库类型多行标签 → 学科纵向折叠 → 章节/最终文件”，前两组标签宽度固定、自动换行并可分别展开或收起，学科展开时按需请求子树，不预载全部文件；目录、分类、收藏和错题中的最终题库名称直接左对齐，不显示“卷”等装饰图标；切换标签或展开目录时必须保留当前滚动位置。
 - 收藏、错题、笔记、评论和点赞的增删操作必须使今日统计失效并在下一次进入题库时刷新；个人评论、笔记和点赞列表使用 offset 分批加载，点赞列表允许取消赞同。更新时间紧邻今日统计标题右侧，分类导航不显示解释性说明。
 
-AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conversations/<id>` 和 `GET/POST /api/ai/conversations/<id>/messages`。上下文最多纳入 6 条题库材料；刷题答案解析解锁后可以把当前 occurrence/collection 传入 AI；LLM 密钥只在服务端从加密设置库读取，响应不返回密钥或供应商原始错误。所有 AI 写操作要求登录会话和 CSRF。AI 回答支持复制、继续追问草稿；非流式等待可由浏览器 AbortController 停止，取消后前端不渲染未完成响应。
+AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conversations/<id>`、`GET/POST /api/ai/conversations/<id>/messages` 和 `POST /api/ai/conversations/<id>/regenerate`。上下文最多纳入 6 条题库材料；刷题答案解析解锁后可以把当前 occurrence/collection 传入 AI；LLM 密钥只在服务端从加密设置库读取，响应不返回密钥或供应商原始错误。所有 AI 写操作要求登录会话和 CSRF。AI 回答支持复制、继续追问草稿和最后一条回答原位重新生成；非流式等待可由浏览器 AbortController 停止，取消后前端不渲染未完成响应。
 
 论坛 API 为 `GET /api/forum/sections`、`GET/POST /api/forum/topics`、`GET/PATCH/DELETE /api/forum/topics/<id>`、`POST /api/forum/topics/<id>/replies` 和 `PATCH/DELETE /api/forum/replies/<id>`。主题与回复保存在本地 state，列表支持分区、关键词、排序和 offset 分页；写操作要求 CSRF，编辑/删除权限由服务端按作者或管理员执行。回复可携带同主题可见回复的 `parent_reply_id`，详情返回 `parent_author_name`；正文最多解析 20 个有效 `@用户名`，提及通知会排除自己并与楼主/父作者回复通知去重。
 

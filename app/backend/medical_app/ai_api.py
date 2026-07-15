@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from flask import Blueprint, g, jsonify, request
 
-from .ai import AIAccessDenied, AINotFound, AIStore, AIUnavailable
+from .ai import AIAccessDenied, AIConflict, AINotFound, AIStore, AIUnavailable
 from .auth import csrf_required, login_required
 
 
@@ -36,6 +36,10 @@ def create_ai_blueprint(
     @blueprint.errorhandler(AIAccessDenied)
     def handle_forbidden(error):
         return jsonify({"error": str(error)}), 403
+
+    @blueprint.errorhandler(AIConflict)
+    def handle_conflict(error):
+        return jsonify({"error": str(error)}), 409
 
     @blueprint.errorhandler(ValueError)
     def handle_value_error(error):
@@ -83,6 +87,12 @@ def create_ai_blueprint(
                 context=data.get("context"),
             )
         ), 201
+
+    @blueprint.post("/conversations/<conversation_id>/regenerate")
+    @login_required
+    @csrf_required
+    def regenerate_message(conversation_id: str):
+        return jsonify(store().regenerate_last(conversation_id))
 
     return blueprint
 

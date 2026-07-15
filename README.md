@@ -180,6 +180,7 @@ Qwen/Qwen3-Embedding-0.6B
 | `GET/POST` | `/api/ai/conversations` | 当前账号的 AI 会话列表与新建 |
 | `PATCH/DELETE` | `/api/ai/conversations/<id>` | 重命名或删除当前账号会话 |
 | `GET/POST` | `/api/ai/conversations/<id>/messages` | 读取消息或发送题库增强问答 |
+| `POST` | `/api/ai/conversations/<id>/regenerate` | 原位重新生成当前账号会话的最后一条 AI 回答 |
 | `GET` | `/api/forum/sections` | 论坛分区与主题数量 |
 | `GET/POST` | `/api/forum/topics` | 分页搜索主题或发布主题 |
 | `GET/PATCH/DELETE` | `/api/forum/topics/<id>` | 主题详情、作者/管理员编辑与删除 |
@@ -202,7 +203,7 @@ Qwen/Qwen3-Embedding-0.6B
 
 导入预检单文件上限 16 MB、最多 50,000 行；全局 multipart 上限 18 MB。每份暂存使用随机 `imp_*` 标识和独立目录，最多保留 30 份且总预算 256 MB。写接口要求管理员会话与 CSRF，文件名不参与服务端路径解析；分析失败或超限时不保留半成品。当前阶段只交付预检与字段映射，不会覆盖现有 64,078 题 catalog。
 
-AI 会话和消息仅存储在 `state/app.sqlite3`，每次回答最多检索 6 条题库材料并返回来源路径、题目 ID 和 occurrence 引用。LLM 使用管理员在加密设置库中保存的配置，以稳定的非流式请求执行；未配置或上游失败时返回明确的 `ai_unavailable`，不会把密钥、供应商原始错误或私有笔记写入响应。AI 页面支持全题库检索，刷题答案解析解锁后可直接带当前 occurrence 和 collection 上下文发起“AI 解析这道题”；回答卡片可复制内容或把继续追问草稿带回输入框，等待中的请求可取消且不会把中断响应加入本地消息状态。
+AI 会话和消息仅存储在 `state/app.sqlite3`，每次回答最多检索 6 条题库材料并返回来源路径、题目 ID 和 occurrence 引用。LLM 使用管理员在加密设置库中保存的配置，以稳定的非流式请求执行；未配置或上游失败时返回明确的 `ai_unavailable`，不会把密钥、供应商原始错误或私有笔记写入响应。AI 页面支持全题库检索，刷题答案解析解锁后可直接带当前 occurrence 和 collection 上下文发起“AI 解析这道题”；回答卡片可复制内容、把继续追问草稿带回输入框，或原位重新生成最后一条回答，等待中的请求可取消且不会把中断响应加入本地消息状态。
 
 论坛回复的 `parent_reply_id` 只能指向同主题内仍可见的回复，详情返回父回复作者快照并在前端显示回复对象。回复正文最多解析 20 个去重后的有效用户名提及；停用/不存在的账号、作者自己以及已经收到楼主/父回复通知的账号不会再收到重复提及通知。
 

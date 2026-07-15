@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS ai_messages (
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
     citations_json TEXT NOT NULL DEFAULT '[]',
+    context_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
 
@@ -54,6 +55,10 @@ class AINotFound(LookupError):
 
 
 class AIAccessDenied(PermissionError):
+    pass
+
+
+class AIConflict(RuntimeError):
     pass
 
 
@@ -92,6 +97,13 @@ class AIStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript(AI_SCHEMA_SQL)
+            message_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(ai_messages)")
+            }
+            if "context_json" not in message_columns:
+                connection.execute(
+                    "ALTER TABLE ai_messages ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'"
+                )
             connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -210,32 +222,9 @@ class AIStore:
                 "SELECT role, content FROM ai_messages WHERE conversation_id = ? AND profile_id = ? ORDER BY rowid DESC LIMIT 12",
                 (conversation_id, self.profile_id),
             ).fetchall()
-        history = []
-        history_budget = 24000
-        for row in reversed(history_rows):
-            content = str(row["content"] or "")[:4000]
-            if not content or history_budget <= 0:
-                continue
-            content = content[:history_budget]
-            history.append({"role": row["role"], "content": content})
-            history_budget -= len(content)
-        rag_text, citations = self._build_context(prompt, context_payload)
-        system = (
-            "你是本地题库学习助手。请用简洁、准确的中文回答，优先解释推理过程，"
-            "不要编造题库不存在的来源。引用题库材料时使用 [1]、[2] 这样的编号，"
-            "编号必须对应用户消息返回的 citations。若材料不足，请明确说明。"
+        answer, citations = self._complete_answer(
+            prompt, context_payload, history_rows
         )
-        if rag_text:
-            system += "\n\n可用题库材料：\n" + rag_text
-        try:
-            config = self.settings.provider_config("llm", include_secret=True)
-            answer = complete_chat_provider(
-                config,
-                [{"role": "system", "content": system}, *history, {"role": "user", "content": prompt}],
-                timeout=self.provider_timeout,
-            )
-        except (ProviderError, SettingsUnavailable, ValueError) as error:
-            raise AIUnavailable(str(error)) from error
         now = _utc_now()
         user_message = {
             "message_id": secrets.token_urlsafe(18),
@@ -256,12 +245,29 @@ class AIStore:
             title = prompt.replace("\n", " ").strip()[:32] or title
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO ai_messages(message_id, conversation_id, profile_id, role, content, citations_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_message["message_id"], conversation_id, self.profile_id, "user", prompt, "[]", now),
+                "INSERT INTO ai_messages(message_id, conversation_id, profile_id, role, content, citations_json, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_message["message_id"],
+                    conversation_id,
+                    self.profile_id,
+                    "user",
+                    prompt,
+                    "[]",
+                    json.dumps(context_payload, ensure_ascii=False),
+                    now,
+                ),
             )
             connection.execute(
-                "INSERT INTO ai_messages(message_id, conversation_id, profile_id, role, content, citations_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (assistant_message["message_id"], conversation_id, self.profile_id, "assistant", answer, json.dumps(citations, ensure_ascii=False), now),
+                "INSERT INTO ai_messages(message_id, conversation_id, profile_id, role, content, citations_json, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', ?)",
+                (
+                    assistant_message["message_id"],
+                    conversation_id,
+                    self.profile_id,
+                    "assistant",
+                    answer,
+                    json.dumps(citations, ensure_ascii=False),
+                    now,
+                ),
             )
             connection.execute(
                 "UPDATE ai_conversations SET title = ?, updated_at = ? WHERE conversation_id = ? AND profile_id = ?",
@@ -269,6 +275,129 @@ class AIStore:
             )
             connection.commit()
         return {"conversation": {**dict(conversation), "title": title, "updated_at": now}, "user": user_message, "assistant": assistant_message}
+
+    def regenerate_last(self, conversation_id: str) -> dict[str, Any]:
+        conversation_id = display_text(conversation_id)
+        with self._connect() as connection:
+            conversation = self._owned_conversation(connection, conversation_id)
+            latest = connection.execute(
+                """
+                SELECT rowid, message_id, role, content, citations_json,
+                       context_json, created_at
+                FROM ai_messages
+                WHERE conversation_id = ? AND profile_id = ?
+                ORDER BY rowid DESC LIMIT 2
+                """,
+                (conversation_id, self.profile_id),
+            ).fetchall()
+            if (
+                len(latest) != 2
+                or latest[0]["role"] != "assistant"
+                or latest[1]["role"] != "user"
+            ):
+                raise AIConflict("当前会话没有可重新生成的回答")
+            assistant_row, user_row = latest
+            history_rows = connection.execute(
+                """
+                SELECT role, content FROM ai_messages
+                WHERE conversation_id = ? AND profile_id = ? AND rowid < ?
+                ORDER BY rowid DESC LIMIT 12
+                """,
+                (conversation_id, self.profile_id, user_row["rowid"]),
+            ).fetchall()
+        try:
+            context_payload = json.loads(user_row["context_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            context_payload = {}
+        if not isinstance(context_payload, dict):
+            context_payload = {}
+        prompt = _clean_text(user_row["content"])
+        answer, citations = self._complete_answer(
+            prompt, context_payload, history_rows
+        )
+        now = _utc_now()
+        citations_json = json.dumps(citations, ensure_ascii=False)
+        with self._connect() as connection:
+            self._owned_conversation(connection, conversation_id)
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE ai_messages
+                SET content = ?, citations_json = ?, created_at = ?
+                WHERE message_id = ? AND conversation_id = ? AND profile_id = ?
+                  AND role = 'assistant' AND content = ? AND citations_json = ?
+                """,
+                (
+                    answer,
+                    citations_json,
+                    now,
+                    assistant_row["message_id"],
+                    conversation_id,
+                    self.profile_id,
+                    assistant_row["content"],
+                    assistant_row["citations_json"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise AIConflict("会话已更新，请刷新后重试")
+            connection.execute(
+                """
+                UPDATE ai_conversations SET updated_at = ?
+                WHERE conversation_id = ? AND profile_id = ?
+                """,
+                (now, conversation_id, self.profile_id),
+            )
+            connection.commit()
+        assistant = {
+            "message_id": assistant_row["message_id"],
+            "role": "assistant",
+            "content": answer,
+            "citations": citations,
+            "created_at": now,
+        }
+        return {
+            "conversation": {**dict(conversation), "updated_at": now},
+            "assistant": assistant,
+        }
+
+    def _complete_answer(
+        self,
+        prompt: str,
+        context_payload: dict[str, Any],
+        history_rows: list[sqlite3.Row],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        history = []
+        history_budget = 24000
+        for row in reversed(history_rows):
+            history_content = str(row["content"] or "")[:4000]
+            if not history_content or history_budget <= 0:
+                continue
+            history_content = history_content[:history_budget]
+            history.append({"role": row["role"], "content": history_content})
+            history_budget -= len(history_content)
+        rag_text, citations = self._build_context(prompt, context_payload)
+        system = (
+            "你是本地题库学习助手。请用简洁、准确的中文回答，优先解释推理过程，"
+            "不要编造题库不存在的来源。引用题库材料时使用 [1]、[2] 这样的编号，"
+            "编号必须对应用户消息返回的 citations。若材料不足，请明确说明。"
+        )
+        if rag_text:
+            system += "\n\n可用题库材料：\n" + rag_text
+        try:
+            config = self.settings.provider_config("llm", include_secret=True)
+            answer = complete_chat_provider(
+                config,
+                [
+                    {"role": "system", "content": system},
+                    *history,
+                    {"role": "user", "content": prompt},
+                ],
+                timeout=self.provider_timeout,
+            )
+        except (ProviderError, SettingsUnavailable, ValueError) as error:
+            raise AIUnavailable(str(error)) from error
+        return answer, citations
 
     def _owned_conversation(self, connection: sqlite3.Connection, conversation_id: str) -> sqlite3.Row:
         if not conversation_id:

@@ -102,6 +102,33 @@ def test_main_auth_roles_health_assets_and_practice(
     assert personal_export.status_code == 200
     assert personal_export.headers["Cache-Control"] == "private, no-store"
     assert personal_export.headers["X-Accel-Buffering"] == "no"
+    monkeypatch.setattr(
+        "medical_app.ai.AIStore._complete_answer",
+        lambda self, prompt, context, history: ("API 临时回答", []),
+    )
+    ai_conversation = client.post(
+        "/api/ai/conversations", headers=_csrf(client), json={}
+    )
+    assert ai_conversation.status_code == 201
+    ai_conversation_id = ai_conversation.get_json()["conversation_id"]
+    ai_message = client.post(
+        f"/api/ai/conversations/{ai_conversation_id}/messages",
+        headers=_csrf(client),
+        json={"content": "请解释这道题。", "context": {"scope": "catalog"}},
+    )
+    assert ai_message.status_code == 201
+    ai_message_id = ai_message.get_json()["assistant"]["message_id"]
+    assert client.post(
+        f"/api/ai/conversations/{ai_conversation_id}/regenerate",
+        json={},
+    ).status_code == 403
+    ai_regenerated = client.post(
+        f"/api/ai/conversations/{ai_conversation_id}/regenerate",
+        headers=_csrf(client),
+        json={},
+    )
+    assert ai_regenerated.status_code == 200
+    assert ai_regenerated.get_json()["assistant"]["message_id"] == ai_message_id
     stats = client.get("/api/stats").get_json()
     assert stats["questions"] == 5
     jsonl_export = client.get("/api/admin/catalog/export?format=jsonl")
@@ -217,6 +244,11 @@ def test_main_auth_roles_health_assets_and_practice(
     assert ordinary.get("/api/admin/catalog/export?format=jsonl").status_code == 403
     assert ordinary.get("/api/admin/catalog/imports").status_code == 403
     assert ordinary.get("/api/admin/forum/content").status_code == 403
+    assert ordinary.post(
+        f"/api/ai/conversations/{ai_conversation_id}/regenerate",
+        headers=_csrf(ordinary),
+        json={},
+    ).status_code == 403
     assert ordinary.patch(
         f"/api/admin/forum/content/topic/{forum_topic['topic_id']}",
         headers=_csrf(ordinary),

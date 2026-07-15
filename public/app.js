@@ -2122,12 +2122,12 @@ function aiConversationMarkup(item, activeId) {
   </button>`;
 }
 
-function aiMessageMarkup(message) {
+function aiMessageMarkup(message, { canRegenerate = false } = {}) {
   const citations = (message.citations || []).map((item) =>
     `<a href="#search" data-action="ai-citation" data-query="${escapeAttr(item.source || item.question_id || "")}">[${escapeHtml(item.index)}] ${escapeHtml(item.title || item.source || "题库来源")}</a>`
   ).join("");
   const content = escapeHtml(message.content || "").replace(/\n/g, "<br>");
-  const actions = message.role === "assistant" ? `<div class="ai-message-actions"><button class="text-button" type="button" data-action="ai-copy" data-message-id="${escapeAttr(message.message_id)}">复制</button><button class="text-button" type="button" data-action="ai-continue" data-message-id="${escapeAttr(message.message_id)}">继续追问</button></div>` : "";
+  const actions = message.role === "assistant" ? `<div class="ai-message-actions"><button class="text-button" type="button" data-action="ai-copy" data-message-id="${escapeAttr(message.message_id)}">复制</button><button class="text-button" type="button" data-action="ai-continue" data-message-id="${escapeAttr(message.message_id)}">继续追问</button>${canRegenerate ? `<button class="text-button" type="button" data-action="ai-regenerate" data-message-id="${escapeAttr(message.message_id)}">重新生成</button>` : ""}</div>` : "";
   return `<article class="ai-message ${message.role === "user" ? "user" : "assistant"}">
     <div class="ai-message-role">${message.role === "user" ? "我" : "AI 学习助手"}</div>
     <div class="ai-message-body">${content}</div>
@@ -2153,7 +2153,7 @@ function renderAIContent() {
     </aside>
     <section class="card ai-chat-panel">
       ${active ? `<div class="ai-chat-head"><div><strong>${escapeHtml(active.title || "新对话")}</strong><small>非流式回答 · 最多保留最近 12 条上下文</small></div><div class="ai-chat-actions"><button class="text-button" type="button" data-action="ai-rename">重命名</button><button class="text-button danger" type="button" data-action="ai-delete">删除</button></div></div>
-      <div class="ai-messages" aria-live="polite">${messages.length ? messages.map(aiMessageMarkup).join("") : `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
+      <div class="ai-messages" aria-live="polite">${messages.length ? messages.map((message, index) => aiMessageMarkup(message, { canRegenerate: message.role === "assistant" && index === messages.length - 1 })).join("") : `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
       <form id="ai-chat-form" class="ai-composer" data-form="ai-chat">
         <label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog"${state.ai.contextOccurrence ? "" : " selected"}>全题库</option><option value="question"${state.ai.contextOccurrence ? " selected" : " disabled"}>当前题（从刷题页发起）</option><option value="collection"${state.ai.contextCollection ? "" : " disabled"}>当前文件（从刷题页发起）</option></select></label>
         <textarea name="content" rows="3" maxlength="8000" placeholder="输入你的问题，按 Ctrl/⌘ + Enter 发送" required>${escapeHtml(state.ai.draft || "")}</textarea>
@@ -2287,6 +2287,34 @@ function continueAIMessage(messageId) {
   state.ai.draft = "请基于上一条回答继续解释：";
   renderAIContent();
   $("#ai-chat-form textarea")?.focus();
+}
+
+async function regenerateAIMessage(messageId) {
+  if (state.ai.sending) return;
+  const conversationId = state.ai.activeId;
+  const messages = state.ai.messages[conversationId] || [];
+  const message = messages.find((item) => item.message_id === messageId && item.role === "assistant");
+  if (!message || messages[messages.length - 1]?.message_id !== messageId) return;
+  state.ai.sending = true;
+  state.ai.abortController = new AbortController();
+  renderAIContent();
+  try {
+    const payload = await api(`/ai/conversations/${encodeURIComponent(conversationId)}/regenerate`, {
+      method: "POST",
+      signal: state.ai.abortController.signal,
+      body: {},
+    });
+    state.ai.messages[conversationId] = (state.ai.messages[conversationId] || []).map((item) => item.message_id === messageId ? payload.assistant : item);
+    state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === conversationId ? { ...item, ...payload.conversation, preview: payload.assistant.content } : item);
+  } catch (error) {
+    if (error?.name === "AbortError") showToast("已停止等待重新生成");
+    else showToast(error.message, "error");
+  }
+  finally {
+    state.ai.sending = false;
+    state.ai.abortController = null;
+    renderAIContent();
+  }
 }
 
 function forumRouteHash({ topic = "", section = "", query = "", returnHash = "" } = {}) {
@@ -3263,6 +3291,7 @@ async function handleClick(event) {
   if (action === "ai-stop") return stopAIMessage();
   if (action === "ai-copy") return copyAIMessage(target.dataset.messageId || "");
   if (action === "ai-continue") return continueAIMessage(target.dataset.messageId || "");
+  if (action === "ai-regenerate") return regenerateAIMessage(target.dataset.messageId || "");
   if (action === "ai-citation") {
     event.preventDefault();
     const query = target.dataset.query || "";

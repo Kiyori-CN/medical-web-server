@@ -929,7 +929,7 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 .ai-message.user { justify-self: end; justify-items: end; }
 .ai-message-role { color: var(--muted); font-size: 10px; font-weight: 700; }
   .ai-message-body { padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; color: var(--ink); background: var(--surface-soft); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
-  .ai-message-actions { display: flex; gap: 8px; padding-inline: 4px; }
+  .ai-message-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-inline: 4px; }
   .ai-message-actions .text-button { color: var(--muted); font-size: 11px; }
   .ai-message-actions .text-button:hover { color: var(--brand-dark); }
 .ai-message.user .ai-message-body { border-color: color-mix(in srgb, var(--brand) 24%, var(--line)); color: var(--brand-dark); background: var(--brand-soft); }
