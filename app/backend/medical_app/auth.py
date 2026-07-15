@@ -30,6 +30,21 @@ _LEGACY_AVATARS = {
 _AVATAR_OPTIONS = {*PRESET_AVATARS, *_LEGACY_AVATARS, "custom"}
 AVATAR_MAX_BYTES = 2 * 1024 * 1024
 AVATAR_SIZE = 512
+PROFILE_PRIVACY_DEFAULTS = {
+    "birthday": False,
+    "gender": False,
+    "school": False,
+    "major": False,
+    "followers": True,
+    "following": True,
+    "direct_messages": True,
+}
+NOTIFICATION_PREFERENCE_DEFAULTS = {
+    "system": True,
+    "direct": True,
+    "replies": True,
+    "agreements": True,
+}
 
 
 class AuthenticationError(RuntimeError):
@@ -57,6 +72,40 @@ def _ip_location(remote_address: str) -> str:
     if not value or value in {"127.0.0.1", "::1", "localhost"}:
         return "本地"
     return "未知"
+
+
+def normalized_preferences(value: object, defaults: dict[str, bool]) -> dict[str, bool]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "{}")
+        except (TypeError, ValueError):
+            value = {}
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: source[key] if key in source and isinstance(source[key], bool) else default
+        for key, default in defaults.items()
+    }
+
+
+def preference_updates(value: object, allowed: dict[str, bool]) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        return {}
+    updates: dict[str, bool] = {}
+    for key in allowed:
+        if key not in value:
+            continue
+        if not isinstance(value[key], bool):
+            raise ValueError("隐私与通知开关必须使用布尔值")
+        updates[key] = value[key]
+    return updates
+
+
+def profile_privacy_preferences(value: object) -> dict[str, bool]:
+    return normalized_preferences(value, PROFILE_PRIVACY_DEFAULTS)
+
+
+def notification_preferences(value: object) -> dict[str, bool]:
+    return normalized_preferences(value, NOTIFICATION_PREFERENCE_DEFAULTS)
 
 
 def validate_username(value: str) -> str:
@@ -150,6 +199,7 @@ class AuthStore:
                     school TEXT NOT NULL DEFAULT '',
                     major TEXT NOT NULL DEFAULT '',
                     privacy_json TEXT NOT NULL DEFAULT '{}',
+                    notification_json TEXT NOT NULL DEFAULT '{}',
                     ip_location TEXT NOT NULL DEFAULT '本地',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -193,6 +243,7 @@ class AuthStore:
                 ("school", "TEXT NOT NULL DEFAULT ''"),
                 ("major", "TEXT NOT NULL DEFAULT ''"),
                 ("privacy_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("notification_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("ip_location", "TEXT NOT NULL DEFAULT '本地'"),
             ):
                 if name not in user_columns:
@@ -351,15 +402,18 @@ class AuthStore:
         gender = str(profile.get("gender", "") or "").strip()[:20]
         school = str(profile.get("school", "") or "").strip()[:120]
         major = str(profile.get("major", "") or "").strip()[:120]
-        privacy = profile.get("privacy") if isinstance(profile.get("privacy"), dict) else {}
-        privacy = {key: bool(privacy.get(key)) for key in ("birthday", "gender", "school", "major")}
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
-                "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
-            ).fetchone() is None:
+            current = connection.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if current is None:
                 connection.rollback()
                 raise AuthenticationError("用户不存在")
+            privacy = profile_privacy_preferences(current["privacy_json"])
+            privacy.update(
+                preference_updates(profile.get("privacy"), PROFILE_PRIVACY_DEFAULTS)
+            )
             if avatar == "custom" and connection.execute(
                 "SELECT 1 FROM user_avatars WHERE user_id = ?", (user_id,)
             ).fetchone() is None:
@@ -390,6 +444,47 @@ class AuthStore:
             except sqlite3.IntegrityError as error:
                 connection.rollback()
                 raise AuthenticationError("用户名已存在") from error
+            updated = connection.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return self._public_user(updated)
+
+    def update_preferences(
+        self,
+        user_id: str,
+        *,
+        privacy: object = None,
+        notifications: object = None,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if current is None:
+                connection.rollback()
+                raise AuthenticationError("用户不存在")
+            privacy_values = profile_privacy_preferences(current["privacy_json"])
+            notification_values = notification_preferences(current["notification_json"])
+            privacy_values.update(
+                preference_updates(privacy, PROFILE_PRIVACY_DEFAULTS)
+            )
+            notification_values.update(
+                preference_updates(notifications, NOTIFICATION_PREFERENCE_DEFAULTS)
+            )
+            connection.execute(
+                """
+                UPDATE users
+                SET privacy_json = ?, notification_json = ?, updated_at = ?
+                WHERE user_id = ?
+                """,
+                (
+                    json.dumps(privacy_values, ensure_ascii=False),
+                    json.dumps(notification_values, ensure_ascii=False),
+                    _utc_now(),
+                    user_id,
+                ),
+            )
             updated = connection.execute(
                 "SELECT * FROM users WHERE user_id = ?", (user_id,)
             ).fetchone()
@@ -588,10 +683,12 @@ class AuthStore:
             "major": row["major"] if "major" in row.keys() else "",
             "ip_location": row["ip_location"] if "ip_location" in row.keys() else "本地",
         }
-        try:
-            payload["privacy"] = json.loads(row["privacy_json"] or "{}") if "privacy_json" in row.keys() else {}
-        except (TypeError, ValueError):
-            payload["privacy"] = {}
+        payload["privacy"] = profile_privacy_preferences(
+            row["privacy_json"] if "privacy_json" in row.keys() else {}
+        )
+        payload["notifications"] = notification_preferences(
+            row["notification_json"] if "notification_json" in row.keys() else {}
+        )
         payload["avatar_url"] = public_avatar_url(
             row["user_id"], row["avatar"], row["updated_at"]
         )
@@ -762,6 +859,18 @@ def create_auth_blueprint(
             data.get("username", g.current_user["username"]),
             data.get("avatar", g.current_user.get("avatar", "")),
             data,
+        )
+        return jsonify({"user": user})
+
+    @blueprint.put("/preferences")
+    @login_required
+    @csrf_required
+    def update_preferences():
+        data = _json_object()
+        user = store.update_preferences(
+            g.current_user["user_id"],
+            privacy=data.get("privacy"),
+            notifications=data.get("notifications"),
         )
         return jsonify({"user": user})
 

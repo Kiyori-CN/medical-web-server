@@ -3,7 +3,9 @@ from pathlib import Path
 from medical_app.auth import AuthStore
 from medical_app.builder import build_catalog
 from medical_app.catalog import Catalog
-from medical_app.practice import PracticeStore
+import pytest
+
+from medical_app.practice import PracticeForbidden, PracticeStore
 
 
 def _social_services(sample_source_tree: Path, tmp_path: Path):
@@ -45,6 +47,29 @@ def test_public_profile_follow_messages_and_comment_interactions(
     followed = alice_store.follow_user(bob["user_id"])
     assert followed["followers"] == 1
     assert followed["is_following"] is True
+    bob_store.follow_user(alice["user_id"])
+    alice_following = alice_store.profile_connections(
+        alice["user_id"], relation="following", query="bob"
+    )
+    assert alice_following["total"] == 1
+    assert alice_following["items"][0]["user_id"] == bob["user_id"]
+    assert alice_following["items"][0]["follows_viewer"] is True
+    alice_followers = alice_store.profile_connections(
+        alice["user_id"], relation="followers"
+    )
+    assert alice_followers["total"] == 1
+    assert alice_followers["items"][0]["user_id"] == bob["user_id"]
+    assert alice_store.profile_connections(
+        alice["user_id"], relation="followers", query="nobody"
+    )["items"] == []
+    auth.update_preferences(
+        bob["user_id"],
+        privacy={"followers": False},
+    )
+    private_bob = alice_store.profile_connections(
+        alice["user_id"], relation="following"
+    )["items"][0]
+    assert private_bob["follower_count"] is None
     public = bob_store.public_profile(alice["user_id"])
     assert public["school"] == "示例医学院"
     assert public["birthday"] == ""
@@ -74,6 +99,26 @@ def test_public_profile_follow_messages_and_comment_interactions(
     inbox = alice_store.list_messages()
     assert inbox["messages"][0]["body"] == "一起复习这道题。"
     assert {item["kind"] for item in inbox["notifications"]} >= {"agree", "reply"}
+    assert {item["category"] for item in alice_store.message_alerts()["items"]} >= {
+        "direct", "replies", "agreements"
+    }
+
+    auth.update_preferences(
+        alice["user_id"],
+        privacy={"followers": True, "following": False, "direct_messages": False},
+    )
+    private_profile = bob_store.public_profile(alice["user_id"])
+    assert private_profile["stats"]["following"] is None
+    assert private_profile["stats"]["can_message"] is False
+    visible_connections = bob_store.profile_connections(
+        alice["user_id"], relation="followers"
+    )
+    assert visible_connections["stats"]["following"] is None
+    assert visible_connections["visibility"]["following"] is False
+    with pytest.raises(PracticeForbidden, match="未公开关注"):
+        bob_store.profile_connections(alice["user_id"], relation="following")
+    with pytest.raises(PracticeForbidden, match="未开启私信"):
+        bob_store.send_message(alice["user_id"], "这条消息不应发送。")
 
     unfollowed = alice_store.unfollow_user(bob["user_id"])
     assert unfollowed["followers"] == 0

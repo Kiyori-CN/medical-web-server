@@ -269,6 +269,19 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
     def public_profile(user_id: str):
         return jsonify(store().public_profile(user_id))
 
+    @blueprint.get("/profiles/<user_id>/connections")
+    @login_required
+    def profile_connections(user_id: str):
+        return jsonify(
+            store().profile_connections(
+                user_id,
+                relation=request.args.get("relation", "followers"),
+                query=request.args.get("query", ""),
+                limit=request.args.get("limit", 30),
+                offset=request.args.get("offset", 0),
+            )
+        )
+
     @blueprint.post("/profiles/<user_id>/follow")
     @login_required
     @csrf_required
@@ -285,6 +298,11 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
     @login_required
     def messages():
         return jsonify(store().list_messages(request.args.get("category", "all")))
+
+    @blueprint.get("/messages/alerts")
+    @login_required
+    def message_alerts():
+        return jsonify(store().message_alerts(limit=request.args.get("limit", 40)))
 
     @blueprint.post("/messages")
     @login_required

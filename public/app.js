@@ -48,6 +48,16 @@ const state = {
   profileAvatarDraft: null,
   profileEditing: false,
   publicProfile: null,
+  profileConnections: null,
+  profileConnectionsTab: "followers",
+  profileConnectionsQuery: "",
+  profileConnectionsReturnHash: "#profile",
+  settingsPasswordExpanded: false,
+  preferenceSaveTokens: { privacy: 0, notifications: 0 },
+  preferenceSaveRuntime: {
+    privacy: { timer: null, inFlight: false, pending: null },
+    notifications: { timer: null, inFlight: false, pending: null },
+  },
   comments: {},
   notes: {},
   myComments: null,
@@ -55,6 +65,9 @@ const state = {
   myLikes: null,
   messageTab: "system",
   messageData: null,
+  notificationPollHandle: null,
+  notificationSeenIds: new Set(),
+  notificationBaselineReady: false,
   theme: window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light",
   avatarCrop: null,
   providerModels: {
@@ -139,6 +152,8 @@ function getCookie(name) {
 
 function showAuth(mode) {
   stopTimer();
+  stopNotificationPolling();
+  resetPreferenceSaveRuntime();
   document.body.classList.remove("in-session", "outline-open");
   state.authMode = mode;
   $("#app-shell").hidden = true;
@@ -174,6 +189,7 @@ function setAuthError(message) {
 }
 
 async function enterApp(user) {
+  resetPreferenceSaveRuntime();
   state.user = user;
   state.comments = {};
   state.notes = {};
@@ -181,6 +197,7 @@ async function enterApp(user) {
   state.myNotes = null;
   state.myLikes = null;
   state.messageData = null;
+  state.profileConnections = null;
   $("#auth-page").hidden = true;
   $("#app-shell").hidden = false;
   syncUserChrome(user);
@@ -191,6 +208,7 @@ async function enterApp(user) {
   } catch (error) {
     showToast(error.message, "error");
   }
+  startNotificationPolling();
   if (!location.hash) {
     await navigateHash("#library", { replace: true });
     return;
@@ -217,7 +235,7 @@ async function route() {
     return;
   }
   document.body.classList.remove("in-session", "outline-open");
-  const allowed = ["library", "search", "favorites", "wrong", "profile", "profile-detail", "settings", "messages", "my-comments", "notes", "my-likes", "ai", "forum", "admin"];
+  const allowed = ["library", "search", "favorites", "wrong", "profile", "profile-detail", "connections", "settings", "messages", "my-comments", "notes", "my-likes", "ai", "forum", "admin"];
   if (!allowed.includes(target)) {
     await navigateHash("#library", { replace: true });
     return;
@@ -230,7 +248,7 @@ async function route() {
   stopTimer();
   showPage(page);
   const studyPages = ["my-comments", "notes", "my-likes", "favorites", "wrong"];
-  const accountPages = ["profile-detail", "settings", "messages"];
+  const accountPages = ["profile-detail", "connections", "settings", "messages"];
   if (studyPages.includes(page)) {
     state.studyReturnHash = descriptor.returnHash || "#library";
   }
@@ -258,7 +276,17 @@ async function route() {
   } else if (page === "profile") {
     await renderMyHomePage();
   } else if (page === "profile-detail") {
+    if (descriptor.returnHash) state.profileReturnHash = descriptor.returnHash;
     await renderPublicProfilePage(descriptor.userId || state.user.user_id);
+  } else if (page === "connections") {
+    const connectionsUserId = descriptor.userId || state.user.user_id;
+    state.profileConnectionsReturnHash = descriptor.returnHash
+      || (connectionsUserId === state.user.user_id ? "#profile" : `#profile-detail?user=${encodeURIComponent(connectionsUserId)}`);
+    await renderProfileConnectionsPage(
+      connectionsUserId,
+      descriptor.tab,
+      descriptor.query
+    );
   } else if (page === "settings") {
     renderSettingsPage();
   } else if (page === "messages") {
@@ -329,6 +357,8 @@ function parseRouteHash() {
     path: params.get("path") || "",
     collectionId: params.get("collection") || "",
     userId: params.get("user") || "",
+    tab: params.get("tab") || "",
+    query: params.get("query") || "",
     returnHash: normalizeStudyReturnHash(params.get("return") || ""),
   };
 }
@@ -337,7 +367,7 @@ function normalizeStudyReturnHash(value, fallback = "") {
   const candidate = String(value || "").trim();
   if (!candidate.startsWith("#")) return fallback;
   const target = candidate.slice(1).split("?", 1)[0];
-  const allowed = new Set(["library", "profile", "favorites", "wrong", "my-comments", "notes", "my-likes"]);
+  const allowed = new Set(["library", "profile", "profile-detail", "connections", "favorites", "wrong", "my-comments", "notes", "my-likes"]);
   return allowed.has(target) ? candidate : fallback;
 }
 
@@ -357,7 +387,22 @@ function studyReturnLabel(hash = state.studyReturnHash) {
 function internalReturnLabel(hash) {
   const target = String(hash || "").replace(/^#/, "").split("?", 1)[0];
   if (target.startsWith("session/")) return "题目";
-  return ({ search: "搜题", "profile-detail": "个人资料", messages: "消息" })[target] || studyReturnLabel(hash);
+  return ({ search: "搜题", "profile-detail": "个人资料", connections: "粉丝与关注", messages: "消息" })[target] || studyReturnLabel(hash);
+}
+
+function profileConnectionsRouteHash(userId, tab = "followers", query = "", returnHash = "") {
+  const params = new URLSearchParams();
+  params.set("user", userId);
+  params.set("tab", tab === "following" ? "following" : "followers");
+  if (query) params.set("query", query);
+  if (returnHash) params.set("return", returnHash);
+  return `#connections?${params.toString()}`;
+}
+
+function publicProfileRouteHash(userId, returnHash = "") {
+  const params = new URLSearchParams({ user: userId });
+  if (returnHash) params.set("return", returnHash);
+  return `#profile-detail?${params.toString()}`;
 }
 
 function libraryRouteHash(kind, path = "", collectionId = "") {
@@ -591,6 +636,7 @@ async function toggleGuideBranch(path) {
 
 function renderTodaySummary() {
   const summary = state.todaySummary || {};
+  const libraryReturnHash = normalizeStudyReturnHash(location.hash, "#library");
   const updated = summary.updated_at ? new Date(summary.updated_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "--:--:--";
   const metrics = [
     ["score", summary.score || 0, "预估分"],
@@ -612,7 +658,7 @@ function renderTodaySummary() {
       ? `<div class="today-score"><span>${escapeHtml(String(value))}</span><small>${label}</small></div>`
       : `<div class="today-metric"><strong>${escapeHtml(String(value))}</strong><small>${label}</small></div>`).join("")}</div>
   </section>
-  <nav class="today-shortcuts card" aria-label="学习入口">${shortcuts.map(([page, label, icon, palette, metricKey]) => `<a class="today-shortcut" href="${escapeAttr(studyPageHash(page, "#library"))}" data-action="open-personal-page" data-page="${page}" data-return-hash="#library"><span class="today-shortcut-icon shortcut-${palette}">${icon}</span><strong>${label}</strong><small>${formatNumber(summary.totals?.[metricKey] || 0)}</small></a>`).join("")}</nav>`;
+  <nav class="today-shortcuts card" aria-label="学习入口">${shortcuts.map(([page, label, icon, palette, metricKey]) => `<a class="today-shortcut" href="${escapeAttr(studyPageHash(page, libraryReturnHash))}" data-action="open-personal-page" data-page="${page}" data-return-hash="${escapeAttr(libraryReturnHash)}"><span class="today-shortcut-icon shortcut-${palette}">${icon}</span><strong>${label}</strong><small>${formatNumber(summary.totals?.[metricKey] || 0)}</small></a>`).join("")}</nav>`;
 }
 
 function secondaryPageHeader(label, copy = "") {
@@ -1646,7 +1692,7 @@ async function renderMyHomePage() {
     const commonActions = `${user.role === "admin" ? homeUtility("系统管理", "admin", "admin", "open-admin") : ""}${homeUtility("下载", "download", "download")}`;
     container.innerHTML = `<div class="my-home">
       <section class="my-home-hero" data-action="open-own-profile" role="button" tabindex="0"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div><h1>${escapeHtml(profile.username || "我的")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div><span class="my-home-chevron">›</span></section>
-      <nav class="my-home-stats card" aria-label="个人数据">${profileStatLink("dynamics", "动态", stats.dynamics || 0, "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "profile-detail")}${profileStatLink("followers", "粉丝", stats.followers || 0, "profile-detail")}</nav>
+      <nav class="my-home-stats card" aria-label="个人数据">${profileStatLink("dynamics", "动态", stats.dynamics || 0, "profile-detail", profile.user_id, "#profile")}${profileStatLink("following", "关注", stats.following || 0, "connections", profile.user_id, "#profile")}${profileStatLink("followers", "粉丝", stats.followers || 0, "connections", profile.user_id, "#profile")}</nav>
       <section class="my-home-section"><h2>常用功能</h2><div class="my-home-actions">${commonActions}</div></section>
       <section class="my-home-section"><h2>其他功能</h2><div class="my-home-actions">${homeUtility("帮助中心", "help", "help")}${homeUtility("联系客服", "contact", "contact")}${homeUtility("意见反馈", "feedback", "feedback")}${homeUtility("设置", "settings", "settings")}</div></section>
       <button class="button button-danger logout-wide" type="button" data-action="logout">退出登录</button>
@@ -1656,9 +1702,15 @@ async function renderMyHomePage() {
   }
 }
 
-function profileStatLink(key, label, value, page, userId = "") {
+function profileStatLink(key, label, value, page, userId = "", returnHash = "", visible = true) {
   const targetId = userId || state.publicProfile?.user_id || state.user.user_id;
-  return `<a class="my-home-stat" href="#${page}?user=${encodeURIComponent(targetId)}&tab=${key}"><strong>${formatNumber(value)}</strong><small>${label}</small></a>`;
+  if (!visible) {
+    return `<span class="my-home-stat private"><strong>—</strong><small>${label}</small></span>`;
+  }
+  const href = page === "connections"
+    ? profileConnectionsRouteHash(targetId, key, "", returnHash)
+    : publicProfileRouteHash(targetId, returnHash);
+  return `<a class="my-home-stat" href="${escapeAttr(href)}"><strong>${formatNumber(value)}</strong><small>${label}</small></a>`;
 }
 
 function utilityIcon(name) {
@@ -1685,10 +1737,153 @@ async function renderPublicProfilePage(userId) {
     state.publicProfile = profile;
     if (state.profileEditing && profile.is_self) return renderProfileEditorPage(profile);
     const stats = profile.stats || {};
-    container.innerHTML = `<div class="public-profile"><button class="profile-back-button" type="button" data-action="return-from-profile">‹ 返回${escapeHtml(internalReturnLabel(state.profileReturnHash))}</button><section class="public-profile-card card"><div class="public-profile-head"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div class="public-profile-identity"><h1>${escapeHtml(profile.username || "用户")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div>${profile.is_self ? `<button class="button button-secondary button-small" type="button" data-action="edit-profile">编辑</button>` : ""}</div><nav class="public-profile-stats">${profileStatLink("followers", "粉丝", stats.followers || 0, "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "profile-detail")}${profileStatLink("likes", "获赞", stats.likes || 0, "profile-detail")}</nav><div class="public-profile-actions">${profile.is_self ? "" : `<button class="button ${stats.is_following ? "button-secondary" : "button-primary"} button-small" type="button" data-action="toggle-follow" data-user-id="${escapeAttr(profile.user_id)}" data-following="${stats.is_following ? "true" : "false"}">${stats.is_following ? "已关注" : "关注"}</button><button class="button button-secondary button-small" type="button" data-action="message-profile" data-user-id="${escapeAttr(profile.user_id)}" data-name="${escapeAttr(profile.username)}">私信</button>`}</div></section><section class="public-profile-dynamics"><div class="section-heading"><div><h2>动态</h2><p>评论与学习讨论</p></div></div>${(profile.dynamics || []).length ? profile.dynamics.map(profileDynamicCard).join("") : emptyMarkup("暂无动态", "发表评论后会显示在这里。", "▤")}</section></div>`;
+    const visibility = profile.visibility || { followers: true, following: true, direct_messages: true };
+    const profileHash = publicProfileRouteHash(profile.user_id, state.profileReturnHash);
+    container.innerHTML = `<div class="public-profile"><button class="profile-back-button" type="button" data-action="return-from-profile">‹ 返回${escapeHtml(internalReturnLabel(state.profileReturnHash))}</button><section class="public-profile-card card"><div class="public-profile-head"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div class="public-profile-identity"><h1>${escapeHtml(profile.username || "用户")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div>${profile.is_self ? `<button class="button button-secondary button-small" type="button" data-action="edit-profile">编辑</button>` : ""}</div><nav class="public-profile-stats">${profileStatLink("followers", "粉丝", stats.followers || 0, "connections", profile.user_id, profileHash, visibility.followers)}${profileStatLink("following", "关注", stats.following || 0, "connections", profile.user_id, profileHash, visibility.following)}${profileStatLink("likes", "获赞", stats.likes || 0, "profile-detail", profile.user_id)}</nav><div class="public-profile-actions">${profile.is_self ? "" : `<button class="button ${stats.is_following ? "button-secondary" : "button-primary"} button-small" type="button" data-action="toggle-follow" data-user-id="${escapeAttr(profile.user_id)}" data-following="${stats.is_following ? "true" : "false"}">${stats.is_following ? "已关注" : "关注"}</button><button class="button button-secondary button-small" type="button" data-action="message-profile" data-user-id="${escapeAttr(profile.user_id)}" data-name="${escapeAttr(profile.username)}" ${visibility.direct_messages ? "" : "disabled"}>${visibility.direct_messages ? "私信" : "暂不接收私信"}</button>`}</div></section><section class="public-profile-dynamics"><div class="section-heading"><div><h2>动态</h2><p>评论与学习讨论</p></div></div>${(profile.dynamics || []).length ? profile.dynamics.map(profileDynamicCard).join("") : emptyMarkup("暂无动态", "发表评论后会显示在这里。", "▤")}</section></div>`;
   } catch (error) {
     container.innerHTML = `<button class="profile-back-button" type="button" data-action="return-from-profile">‹ 返回${escapeHtml(internalReturnLabel(state.profileReturnHash))}</button>${emptyMarkup("个人资料读取失败", error.message, "!")}`;
   }
+}
+
+async function renderProfileConnectionsPage(userId, tab = "followers", query = "") {
+  const container = $("#page-connections");
+  const relation = tab === "following" ? "following" : "followers";
+  state.profileConnectionsTab = relation;
+  state.profileConnectionsQuery = String(query || "").trim();
+  container.innerHTML = `<div class="connections-page"><button class="profile-back-button" type="button" data-action="return-from-connections">‹ 返回${escapeHtml(internalReturnLabel(state.profileConnectionsReturnHash))}</button>${loadingMarkup("正在读取关注关系")}</div>`;
+  try {
+    const params = new URLSearchParams({ relation, limit: "30", offset: "0" });
+    if (state.profileConnectionsQuery) params.set("query", state.profileConnectionsQuery);
+    state.profileConnections = await api(`/profiles/${encodeURIComponent(userId)}/connections?${params.toString()}`);
+    renderProfileConnectionsContent();
+  } catch (error) {
+    container.innerHTML = `<div class="connections-page"><button class="profile-back-button" type="button" data-action="return-from-connections">‹ 返回${escapeHtml(internalReturnLabel(state.profileConnectionsReturnHash))}</button>${emptyMarkup("关注关系读取失败", error.message, "!")}</div>`;
+  }
+}
+
+function renderProfileConnectionsContent() {
+  const payload = state.profileConnections || {};
+  const owner = payload.owner || {};
+  const stats = payload.stats || {};
+  const visibility = payload.visibility || { followers: true, following: true };
+  const relation = payload.relation === "following" ? "following" : "followers";
+  const query = payload.query || "";
+  const relationLabel = relation === "following" ? "关注" : "粉丝";
+  const followersHash = profileConnectionsRouteHash(owner.user_id, "followers", "", state.profileConnectionsReturnHash);
+  const followingHash = profileConnectionsRouteHash(owner.user_id, "following", "", state.profileConnectionsReturnHash);
+  const list = (payload.items || []).map(profileConnectionItem).join("");
+  const summary = query ? `“${escapeHtml(query)}”找到 ${formatNumber(payload.total || 0)} 人` : `${escapeHtml(owner.username || "用户")}的${relationLabel} · ${formatNumber(payload.total || 0)}`;
+  $("#page-connections").innerHTML = `<div class="connections-page">
+    <button class="profile-back-button" type="button" data-action="return-from-connections">‹ 返回${escapeHtml(internalReturnLabel(state.profileConnectionsReturnHash))}</button>
+    <section class="connections-shell card">
+      <nav class="connections-tabs" aria-label="粉丝与关注" role="tablist">
+        ${profileConnectionTab("followers", "粉丝", stats.followers, followersHash, relation, visibility.followers)}
+        ${profileConnectionTab("following", "关注", stats.following, followingHash, relation, visibility.following)}
+      </nav>
+      <form id="profile-connections-search" class="connections-search" role="search">
+        <span aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span>
+        <input name="query" value="${escapeAttr(query)}" maxlength="64" autocomplete="off" placeholder="搜索${relationLabel}" aria-label="搜索${relationLabel}">
+        ${query ? `<button class="connections-search-clear" type="button" data-action="clear-profile-connections-search" aria-label="清除搜索">×</button>` : ""}
+        <button class="connections-search-submit" type="submit">搜索</button>
+      </form>
+      <div class="connections-summary"><span>${summary}</span></div>
+      <div class="connections-list">${list || `<div class="connections-empty"><strong>${query ? "没有匹配的用户" : `暂无${relationLabel}`}</strong><span>${query ? "换一个用户名试试" : relation === "following" ? "关注用户后会显示在这里" : "有新用户关注后会显示在这里"}</span></div>`}</div>
+      ${payload.has_more ? `<button class="connections-more" type="button" data-action="load-more-profile-connections">加载更多</button>` : ""}
+    </section>
+  </div>`;
+}
+
+function profileConnectionTab(key, label, value, href, active, visible) {
+  if (!visible) {
+    return `<span class="connections-tab disabled" role="tab" aria-selected="false" aria-disabled="true"><strong>${label}</strong><small>—</small></span>`;
+  }
+  return `<a class="connections-tab ${active === key ? "active" : ""}" href="${escapeAttr(href)}" role="tab" aria-selected="${active === key}"><strong>${label}</strong><small>${formatNumber(value || 0)}</small></a>`;
+}
+
+function profileConnectionItem(item) {
+  const returnHash = location.hash || profileConnectionsRouteHash(
+    state.profileConnections?.owner?.user_id || state.user.user_id,
+    state.profileConnectionsTab,
+    state.profileConnectionsQuery,
+    state.profileConnectionsReturnHash
+  );
+  const followerMeta = item.follower_count == null ? "" : ` · ${formatNumber(item.follower_count)} 粉丝`;
+  const meta = [item.school, item.major].filter(Boolean).join(" · ")
+    || `IP属地 ${item.ip_location || "本地"}${followerMeta}`;
+  const followLabel = item.is_self ? "自己" : item.is_following ? (item.follows_viewer ? "互相关注" : "已关注") : "关注";
+  return `<article class="connection-person">
+    <a class="connection-person-link" href="${escapeAttr(publicProfileRouteHash(item.user_id, returnHash))}">
+      <span class="profile-avatar connection-avatar">${avatarVisual(item, item.username)}</span>
+      <span class="connection-person-copy"><strong>${escapeHtml(item.username || "用户")}</strong><small>${escapeHtml(meta)}</small></span>
+    </a>
+    <button class="connection-follow-button ${item.is_following ? "following" : ""}" type="button" data-action="toggle-profile-connection-follow" data-user-id="${escapeAttr(item.user_id)}" data-following="${item.is_following ? "true" : "false"}" ${item.is_self ? "disabled" : ""}>${followLabel}</button>
+  </article>`;
+}
+
+async function loadMoreProfileConnections(button) {
+  const payload = state.profileConnections;
+  if (!payload?.has_more) return;
+  setButtonBusy(button, true, "加载中");
+  try {
+    const params = new URLSearchParams({
+      relation: payload.relation,
+      query: payload.query || "",
+      limit: "30",
+      offset: String((payload.items || []).length),
+    });
+    const next = await api(`/profiles/${encodeURIComponent(payload.owner.user_id)}/connections?${params.toString()}`);
+    state.profileConnections = {
+      ...payload,
+      ...next,
+      items: [...(payload.items || []), ...(next.items || [])],
+      count: (payload.items || []).length + (next.items || []).length,
+    };
+    renderProfileConnectionsContent();
+  } catch (error) {
+    setButtonBusy(button, false);
+    showToast(error.message, "error");
+  }
+}
+
+async function toggleProfileConnectionFollow(button) {
+  const payload = state.profileConnections;
+  const userId = button.dataset.userId;
+  const following = button.dataset.following === "true";
+  if (!payload || !userId) return;
+  setButtonBusy(button, true, following ? "处理中" : "关注中");
+  try {
+    await api(`/profiles/${encodeURIComponent(userId)}/follow`, { method: following ? "DELETE" : "POST", body: {} });
+    const removeFromOwnFollowing = following
+      && payload.relation === "following"
+      && payload.owner.user_id === state.user.user_id;
+    state.profileConnections = {
+      ...payload,
+      total: removeFromOwnFollowing ? Math.max(0, payload.total - 1) : payload.total,
+      stats: {
+        ...(payload.stats || {}),
+        following: removeFromOwnFollowing ? Math.max(0, (payload.stats?.following || 0) - 1) : payload.stats?.following,
+      },
+      items: removeFromOwnFollowing
+        ? payload.items.filter((item) => item.user_id !== userId)
+        : payload.items.map((item) => item.user_id === userId ? { ...item, is_following: !following } : item),
+    };
+    renderProfileConnectionsContent();
+    showToast(following ? "已取消关注" : "已关注");
+  } catch (error) {
+    setButtonBusy(button, false);
+    showToast(error.message, "error");
+  }
+}
+
+function submitProfileConnectionsSearch(form) {
+  const query = String(new FormData(form).get("query") || "").trim();
+  const payload = state.profileConnections || {};
+  return navigateHash(profileConnectionsRouteHash(
+    payload.owner?.user_id || state.user.user_id,
+    payload.relation || state.profileConnectionsTab,
+    query,
+    state.profileConnectionsReturnHash
+  ));
 }
 
 function profileDynamicCard(item) {
@@ -1699,11 +1894,63 @@ function profileDynamicCard(item) {
 function renderProfileEditorPage(user) {
   const selectedAvatar = (state.profileAvatarDraft ?? user.avatar) || "preset-01";
   const preview = selectedAvatar === user.avatar ? user : { avatar: selectedAvatar, avatar_url: selectedAvatar.startsWith("preset-") ? `/avatars/${selectedAvatar}.svg` : "" };
-  $("#page-profile-detail").innerHTML = `<div class="profile-editor-page"><button class="profile-back-button" type="button" data-action="cancel-profile-edit">‹ 个人资料</button><section class="card profile-card profile-editor-card"><div class="profile-card-head"><div><h1>编辑个人资料</h1><p>头像、昵称和公开资料。</p></div></div><form id="profile-form" class="profile-form"><div class="profile-avatar-editor"><span class="profile-avatar profile-avatar-large">${avatarVisual(preview, user.username)}</span><div class="avatar-editor-main"><div class="avatar-editor-copy"><strong>个人头像</strong><small>选择统一风格头像，或上传并裁剪自己的图片</small></div><div class="avatar-picker" role="radiogroup" aria-label="预设头像">${PROFILE_AVATARS.map((avatar) => `<button class="avatar-choice ${avatar.id === selectedAvatar ? "active" : ""}" type="button" role="radio" aria-label="${escapeAttr(avatar.label)}" aria-checked="${avatar.id === selectedAvatar}" data-action="select-avatar" data-avatar="${avatar.id}"><img src="/avatars/${avatar.id}.svg" alt=""></button>`).join("")}${user.avatar === "custom" ? `<button class="avatar-choice ${selectedAvatar === "custom" ? "active" : ""}" type="button" aria-label="当前自定义头像" data-action="select-avatar" data-avatar="custom">${avatarVisual(user, user.username)}</button>` : ""}<button class="avatar-upload-button" type="button" data-action="choose-avatar-file"><span aria-hidden="true">＋</span>上传图片</button><input id="avatar-file-input" type="file" accept="image/jpeg,image/png,image/webp" hidden></div></div></div><label class="field"><span>昵称</span><input name="username" minlength="3" maxlength="32" value="${escapeAttr(user.username || "")}" required></label><div class="profile-fields-grid"><label class="field"><span>生日</span><input name="birthday" type="date" value="${escapeAttr(user.birthday || "")}"></label><label class="field"><span>性别</span><select name="gender"><option value="">未设置</option><option value="男" ${user.gender === "男" ? "selected" : ""}>男</option><option value="女" ${user.gender === "女" ? "selected" : ""}>女</option><option value="保密" ${user.gender === "保密" ? "selected" : ""}>保密</option></select></label><label class="field"><span>学校</span><input name="school" maxlength="120" value="${escapeAttr(user.school || "")}"></label><label class="field"><span>专业</span><input name="major" maxlength="120" value="${escapeAttr(user.major || "")}"></label></div><fieldset class="privacy-settings"><legend>资料可见性</legend>${[["birthday","生日"],["gender","性别"],["school","学校"],["major","专业"]].map(([key,label]) => `<label><input name="privacy_${key}" type="checkbox" ${user.privacy?.[key] ? "checked" : ""}><span>${label}对其他人可见</span></label>`).join("")}</fieldset><div class="question-actions"><button class="button button-primary" type="submit">保存资料</button></div></form></section></div>`;
+  $("#page-profile-detail").innerHTML = `<div class="profile-editor-page"><button class="profile-back-button" type="button" data-action="cancel-profile-edit">‹ 个人资料</button><section class="card profile-card profile-editor-card"><div class="profile-card-head"><div><h1>编辑个人资料</h1><p>头像、昵称和基础资料。</p></div></div><form id="profile-form" class="profile-form"><div class="profile-avatar-editor"><span class="profile-avatar profile-avatar-large">${avatarVisual(preview, user.username)}</span><div class="avatar-editor-main"><div class="avatar-editor-copy"><strong>个人头像</strong><small>选择统一风格头像，或上传并裁剪自己的图片</small></div><div class="avatar-picker" role="radiogroup" aria-label="预设头像">${PROFILE_AVATARS.map((avatar) => `<button class="avatar-choice ${avatar.id === selectedAvatar ? "active" : ""}" type="button" role="radio" aria-label="${escapeAttr(avatar.label)}" aria-checked="${avatar.id === selectedAvatar}" data-action="select-avatar" data-avatar="${avatar.id}"><img src="/avatars/${avatar.id}.svg" alt=""></button>`).join("")}${user.avatar === "custom" ? `<button class="avatar-choice ${selectedAvatar === "custom" ? "active" : ""}" type="button" aria-label="当前自定义头像" data-action="select-avatar" data-avatar="custom">${avatarVisual(user, user.username)}</button>` : ""}<button class="avatar-upload-button" type="button" data-action="choose-avatar-file"><span aria-hidden="true">＋</span>上传图片</button><input id="avatar-file-input" type="file" accept="image/jpeg,image/png,image/webp" hidden></div></div></div><label class="field"><span>昵称</span><input name="username" minlength="3" maxlength="32" value="${escapeAttr(user.username || "")}" required></label><div class="profile-fields-grid"><label class="field"><span>生日</span><input name="birthday" type="date" value="${escapeAttr(user.birthday || "")}"></label><label class="field"><span>性别</span><select name="gender"><option value="">未设置</option><option value="男" ${user.gender === "男" ? "selected" : ""}>男</option><option value="女" ${user.gender === "女" ? "selected" : ""}>女</option><option value="保密" ${user.gender === "保密" ? "selected" : ""}>保密</option></select></label><label class="field"><span>学校</span><input name="school" maxlength="120" value="${escapeAttr(user.school || "")}"></label><label class="field"><span>专业</span><input name="major" maxlength="120" value="${escapeAttr(user.major || "")}"></label></div><p class="profile-privacy-tip">资料可见性请前往“我的 → 设置 → 隐私设置”管理。</p><div class="question-actions"><button class="button button-primary" type="submit">保存资料</button></div></form></section></div>`;
 }
 
 function renderSettingsPage() {
-  $("#page-settings").innerHTML = `<div class="settings-page"><button class="profile-back-button" type="button" data-action="back-to-my-home">‹ 我的</button><section class="card settings-card"><div class="section-heading"><div><h1>设置</h1><p>账号与安全、绑定和应用偏好。</p></div></div><div class="settings-list"><button type="button" class="settings-list-item" data-action="show-placeholder" data-title="第三方账号绑定"><span><strong>第三方账号绑定</strong><small>暂未开放第三方登录</small></span><b>›</b></button><button type="button" class="settings-list-item" data-action="show-placeholder" data-title="通知设置"><span><strong>通知设置</strong><small>管理消息提醒</small></span><b>›</b></button></div><form id="settings-password-form" class="stack-form settings-password-form"><h2>修改密码</h2><label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label><label class="field"><span>新密码</span><input name="new_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label><label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label><p class="form-error" data-profile-password-error></p><button class="button button-primary" type="submit">保存新密码</button></form></section></div>`;
+  const user = state.user || {};
+  const privacy = {
+    birthday: false, gender: false, school: false, major: false,
+    followers: true, following: true, direct_messages: true,
+    ...(user.privacy || {}),
+  };
+  const notifications = {
+    system: true, direct: true, replies: true, agreements: true,
+    ...(user.notifications || {}),
+  };
+  $("#page-settings").innerHTML = `<div class="settings-page settings-hub">
+    <header class="settings-page-header"><button type="button" data-action="back-to-my-home" aria-label="返回我的">‹</button><h1>设置</h1><span></span></header>
+    <section class="settings-section">
+      <div class="settings-section-title"><h2>账号与安全</h2><p>管理本地账号与登录凭证</p></div>
+      <div class="card settings-row-card">
+        <div class="settings-detail-row"><span><strong>登录账号</strong><small>当前本地账号</small></span><b>${escapeHtml(user.username || "-")}</b></div>
+        <div class="settings-detail-row"><span><strong>账号身份</strong><small>决定系统管理权限</small></span><b>${user.role === "admin" ? "管理员" : "普通用户"}</b></div>
+        <button class="settings-detail-row interactive" type="button" data-action="toggle-settings-password" aria-expanded="${state.settingsPasswordExpanded}"><span><strong>修改密码</strong><small>修改后需要重新登录</small></span><b>•••••• <i>›</i></b></button>
+      </div>
+      <form id="settings-password-form" class="card settings-password-panel" ${state.settingsPasswordExpanded ? "" : "hidden"}>
+        <div class="settings-inline-heading"><h3>修改登录密码</h3><button type="button" data-action="toggle-settings-password">收起</button></div>
+        <div class="settings-password-fields"><label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label><label class="field"><span>新密码</span><input name="new_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label><label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label></div>
+        <p class="form-error" data-profile-password-error></p><button class="button button-primary" type="submit">保存新密码</button>
+      </form>
+    </section>
+    <section class="settings-section">
+      <div class="settings-section-title"><h2>隐私设置</h2><p>控制其他用户可以看到和联系你的范围</p></div>
+      <form id="privacy-settings-form" class="card settings-toggle-card" data-preference-form="privacy">
+        ${settingsToggle("birthday", "公开生日", "在个人主页展示生日", privacy.birthday)}
+        ${settingsToggle("gender", "公开性别", "在个人主页展示性别", privacy.gender)}
+        ${settingsToggle("school", "公开学校", "在个人主页和用户列表展示学校", privacy.school)}
+        ${settingsToggle("major", "公开专业", "在个人主页和用户列表展示专业", privacy.major)}
+        ${settingsToggle("followers", "公开粉丝", "允许其他用户查看你的粉丝数量和列表", privacy.followers)}
+        ${settingsToggle("following", "公开关注", "允许其他用户查看你的关注数量和列表", privacy.following)}
+        ${settingsToggle("direct_messages", "允许私信", "允许其他用户从你的主页发起私信", privacy.direct_messages)}
+        <p class="settings-save-status" data-preference-status="privacy" aria-live="polite"></p>
+      </form>
+    </section>
+    <section class="settings-section">
+      <div class="settings-section-title"><h2>通知设置</h2><p>选择哪些新消息显示顶部即时提醒</p></div>
+      <form id="notification-settings-form" class="card settings-toggle-card" data-preference-form="notifications">
+        ${settingsToggle("system", "系统通知", "账号与系统的重要状态提醒", notifications.system)}
+        ${settingsToggle("direct", "私信对话", "收到其他用户的新私信时提醒", notifications.direct)}
+        ${settingsToggle("replies", "回复与@", "评论被回复或提及时提醒", notifications.replies)}
+        ${settingsToggle("agreements", "收到赞同", "评论收到新的赞同时提醒", notifications.agreements)}
+        <p class="settings-save-status" data-preference-status="notifications" aria-live="polite"></p>
+      </form>
+    </section>
+  </div>`;
+}
+
+function settingsToggle(name, label, copy, checked) {
+  return `<label class="settings-toggle-row"><span><strong>${label}</strong><small>${copy}</small></span><span class="switch"><input name="${name}" type="checkbox" ${checked ? "checked" : ""}><span></span></span></label>`;
 }
 
 async function toggleFollowProfile(button) {
@@ -1771,6 +2018,68 @@ function renderMessageCenter(payload) {
   container.innerHTML = `${messagePageHeader()}
     <nav class="message-tabs card" aria-label="消息分类">${groups.map((group) => `<button class="message-tab ${group.key === active.key ? "active" : ""}" type="button" data-action="message-tab" data-tab="${group.key}" aria-pressed="${group.key === active.key}"><span>${group.label}</span><small>${formatNumber(group.items.length)}</small></button>`).join("")}</nav>
     <section class="card message-panel" aria-live="polite"><div class="message-panel-head"><h2>${active.label}</h2><span>${formatNumber(active.items.length)} 条</span></div>${active.items.length ? `<div class="message-list">${active.items.slice(0, 50).map((item) => `<article><strong>${escapeHtml(item.sender_name || active.label)}</strong><p>${escapeHtml(item.body || (item.kind === "agree" ? "赞同了你的评论" : "你收到一条新消息"))}</p><time>${escapeHtml(formatDate(item.created_at))}</time></article>`).join("")}</div>` : `<p class="message-empty">暂无${active.label}</p>`}</section>`;
+}
+
+async function startNotificationPolling() {
+  stopNotificationPolling();
+  state.notificationSeenIds = new Set();
+  state.notificationBaselineReady = false;
+  await pollMessageAlerts();
+  if (!state.user) return;
+  state.notificationPollHandle = window.setInterval(pollMessageAlerts, 20000);
+}
+
+function stopNotificationPolling() {
+  if (state.notificationPollHandle) window.clearInterval(state.notificationPollHandle);
+  state.notificationPollHandle = null;
+  state.notificationBaselineReady = false;
+}
+
+async function pollMessageAlerts() {
+  if (!state.user) return;
+  try {
+    const payload = await api("/messages/alerts?limit=40", { authRedirect: false });
+    const items = payload.items || [];
+    if (!state.notificationBaselineReady) {
+      items.forEach((item) => state.notificationSeenIds.add(item.event_id));
+      state.notificationBaselineReady = true;
+      return;
+    }
+    const fresh = items.filter((item) => !state.notificationSeenIds.has(item.event_id));
+    items.forEach((item) => state.notificationSeenIds.add(item.event_id));
+    if (state.notificationSeenIds.size > 500) {
+      state.notificationSeenIds = new Set(items.map((item) => item.event_id));
+    }
+    if (!fresh.length) return;
+    state.messageData = null;
+    if (parseRouteHash().target === "messages") {
+      await renderMessagesPage();
+      return;
+    }
+    const preferences = {
+      system: true, direct: true, replies: true, agreements: true,
+      ...(state.user.notifications || {}),
+    };
+    const visible = fresh.filter((item) => preferences[item.category] !== false);
+    if (!visible.length) return;
+    showNotificationHint(visible.length === 1 ? visible[0].message : `收到 ${visible.length} 条新消息`);
+  } catch (_) {
+    // 即时提醒失败不影响消息中心和其他页面。
+  }
+}
+
+function showNotificationHint(message) {
+  const region = $("#notification-hint-region");
+  if (!region) return;
+  region.innerHTML = "";
+  const hint = document.createElement("div");
+  hint.className = "notification-hint";
+  hint.innerHTML = `<span aria-hidden="true"></span><p>${escapeHtml(message)}</p>`;
+  region.append(hint);
+  window.setTimeout(() => {
+    hint.classList.add("leaving");
+    window.setTimeout(() => hint.remove(), 180);
+  }, 2800);
 }
 
 function renderPlaceholderPage(page) {
@@ -1885,7 +2194,6 @@ async function saveProfile(form) {
         gender: values.gender || "",
         school: values.school || "",
         major: values.major || "",
-        privacy: { birthday: Boolean(values.privacy_birthday), gender: Boolean(values.privacy_gender), school: Boolean(values.privacy_school), major: Boolean(values.privacy_major) },
       },
     });
     state.user = result.user;
@@ -1899,6 +2207,69 @@ async function saveProfile(form) {
     showToast("个人资料已保存");
   } catch (error) {
     showToast(error.message, "error");
+  }
+}
+
+function scheduleAccountPreferences(form) {
+  const group = form.dataset.preferenceForm;
+  if (!["privacy", "notifications"].includes(group)) return;
+  const runtime = state.preferenceSaveRuntime[group];
+  const status = $(`[data-preference-status="${group}"]`, form);
+  runtime.pending = Object.fromEntries(
+    $$('input[type="checkbox"]', form).map((input) => [input.name, input.checked])
+  );
+  if (status) status.textContent = "正在保存…";
+  if (runtime.timer) window.clearTimeout(runtime.timer);
+  runtime.timer = window.setTimeout(() => flushAccountPreferences(group), 180);
+}
+
+function resetPreferenceSaveRuntime() {
+  for (const group of ["privacy", "notifications"]) {
+    const runtime = state.preferenceSaveRuntime[group];
+    if (runtime.timer) window.clearTimeout(runtime.timer);
+    runtime.timer = null;
+    runtime.pending = null;
+    state.preferenceSaveTokens[group] = (state.preferenceSaveTokens[group] || 0) + 1;
+  }
+}
+
+async function flushAccountPreferences(group) {
+  const runtime = state.preferenceSaveRuntime[group];
+  if (!runtime || runtime.inFlight || !runtime.pending) return;
+  const values = runtime.pending;
+  runtime.pending = null;
+  runtime.timer = null;
+  runtime.inFlight = true;
+  const token = (state.preferenceSaveTokens[group] || 0) + 1;
+  state.preferenceSaveTokens[group] = token;
+  const userId = state.user?.user_id || "";
+  const form = $(`[data-preference-form="${group}"]`);
+  const status = form ? $(`[data-preference-status="${group}"]`, form) : null;
+  try {
+    const result = await api("/auth/preferences", {
+      method: "PUT",
+      body: { [group]: values },
+    });
+    if (state.preferenceSaveTokens[group] !== token || state.user?.user_id !== userId) return;
+    state.user = {
+      ...state.user,
+      [group]: result.user[group],
+    };
+    if (!runtime.pending && status) {
+      status.textContent = "已保存";
+      window.setTimeout(() => {
+        if (status.textContent === "已保存") status.textContent = "";
+      }, 1600);
+    }
+  } catch (error) {
+    if (status) status.textContent = "保存失败";
+    showToast(error.message, "error");
+    if (!runtime.pending) renderSettingsPage();
+  } finally {
+    runtime.inFlight = false;
+    if (runtime.pending) {
+      runtime.timer = window.setTimeout(() => flushAccountPreferences(group), 0);
+    }
   }
 }
 
@@ -2137,15 +2508,33 @@ async function handleClick(event) {
     if (location.hash === destination) return;
     return navigateHash(destination);
   }
-  if (action === "open-own-profile") { state.profileEditing = false; state.profileReturnHash = "#profile"; return navigateHash(`#profile-detail?user=${encodeURIComponent(state.user.user_id)}`); }
+  if (action === "open-own-profile") { state.profileEditing = false; state.profileReturnHash = "#profile"; return navigateHash(publicProfileRouteHash(state.user.user_id, "#profile")); }
   if (action === "back-to-my-home") { state.profileEditing = false; return navigateHash("#profile"); }
+  if (action === "toggle-settings-password") {
+    state.settingsPasswordExpanded = !state.settingsPasswordExpanded;
+    renderSettingsPage();
+    if (state.settingsPasswordExpanded) window.setTimeout(() => $('#settings-password-form input')?.focus(), 0);
+    return;
+  }
+  if (action === "return-from-connections") return navigateHash(state.profileConnectionsReturnHash || "#profile");
+  if (action === "clear-profile-connections-search") {
+    const payload = state.profileConnections || {};
+    return navigateHash(profileConnectionsRouteHash(
+      payload.owner?.user_id || state.user.user_id,
+      payload.relation || state.profileConnectionsTab,
+      "",
+      state.profileConnectionsReturnHash
+    ));
+  }
+  if (action === "load-more-profile-connections") return loadMoreProfileConnections(target);
+  if (action === "toggle-profile-connection-follow") return toggleProfileConnectionFollow(target);
   if (action === "edit-profile") { state.profileEditing = true; return renderPublicProfilePage(state.user.user_id); }
   if (action === "cancel-profile-edit") { state.profileEditing = false; return renderPublicProfilePage(state.user.user_id); }
   if (action === "toggle-follow") return toggleFollowProfile(target);
   if (action === "message-profile") return messageProfile(target.dataset.userId, target.dataset.name);
   if (action === "home-utility") return handleHomeUtility(target.dataset.utility);
   if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
-  if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(`#profile-detail?user=${encodeURIComponent(target.dataset.userId || state.user.user_id)}`); }
+  if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(publicProfileRouteHash(target.dataset.userId || state.user.user_id, state.profileReturnHash)); }
   if (action === "return-from-profile") return navigateHash(state.profileReturnHash || "#profile");
   if (action === "return-from-account") return navigateHash(state.accountReturnHash || "#library");
   if (action === "return-to-profile") return navigateHash("#profile");
@@ -2300,6 +2689,7 @@ async function handleSubmit(event) {
   event.preventDefault();
   if (event.target.id === "auth-form") return submitAuth(event.target);
   if (event.target.id === "search-form") return submitSearch(event.target);
+  if (event.target.id === "profile-connections-search") return submitProfileConnectionsSearch(event.target);
   if (event.target.id === "profile-form") return saveProfile(event.target);
   if (event.target.id === "settings-password-form") return saveProfilePassword(event.target);
   if (event.target.id === "semantic-settings-form") return saveSemanticSettings(event.target);
@@ -2324,6 +2714,11 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const preferenceForm = event.target.closest?.("[data-preference-form]");
+  if (preferenceForm && event.target.matches('input[type="checkbox"]')) {
+    scheduleAccountPreferences(preferenceForm);
+    return;
+  }
   if (event.target.id !== "avatar-file-input") return;
   const file = event.target.files?.[0];
   if (file) openAvatarCrop(file);
@@ -2353,6 +2748,8 @@ async function logout() {
     // Clearing the local UI is still correct when the server session expired.
   }
   state.user = null;
+  stopNotificationPolling();
+  resetPreferenceSaveRuntime();
   state.session = null;
   state.comments = {};
   state.notes = {};

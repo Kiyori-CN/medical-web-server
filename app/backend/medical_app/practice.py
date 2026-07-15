@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .auth import public_avatar_url
+from .auth import profile_privacy_preferences, public_avatar_url
 from .catalog import Catalog
 from .normalize import display_text, normalize_answer
 
@@ -1344,10 +1344,20 @@ class PracticeStore:
         connection = self.connect()
         try:
             followers = connection.execute(
-                "SELECT COUNT(*) FROM user_follows WHERE following_id = ?", (user_id,)
+                """
+                SELECT COUNT(*) FROM user_follows f
+                JOIN users u ON u.user_id = f.follower_id
+                WHERE f.following_id = ? AND u.status = 'active'
+                """,
+                (user_id,),
             ).fetchone()[0]
             following = connection.execute(
-                "SELECT COUNT(*) FROM user_follows WHERE follower_id = ?", (user_id,)
+                """
+                SELECT COUNT(*) FROM user_follows f
+                JOIN users u ON u.user_id = f.following_id
+                WHERE f.follower_id = ? AND u.status = 'active'
+                """,
+                (user_id,),
             ).fetchone()[0]
             likes = connection.execute(
                 """
@@ -1377,6 +1387,136 @@ class PracticeStore:
             "is_self": user_id == self.profile_id,
         }
 
+    def profile_connections(
+        self,
+        user_id: str,
+        *,
+        relation: str = "followers",
+        query: str = "",
+        limit: int = 30,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        user_id = display_text(user_id)
+        relation = display_text(relation).lower()
+        if relation not in {"followers", "following"}:
+            raise ValueError("关系类型无效")
+        query = display_text(query)[:64]
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        connection = self.connect()
+        try:
+            owner = connection.execute(
+                """
+                SELECT user_id, username, avatar, updated_at, privacy_json
+                FROM users WHERE user_id = ? AND status = 'active'
+                """,
+                (user_id,),
+            ).fetchone()
+            if owner is None:
+                raise PracticeNotFound("用户不存在")
+            owner_privacy = profile_privacy_preferences(owner["privacy_json"])
+            if user_id != self.profile_id and not owner_privacy[relation]:
+                raise PracticeForbidden(
+                    "该用户未公开粉丝列表" if relation == "followers" else "该用户未公开关注列表"
+                )
+
+            owner_column = "f.following_id" if relation == "followers" else "f.follower_id"
+            person_column = "f.follower_id" if relation == "followers" else "f.following_id"
+            where = [f"{owner_column} = ?", "u.status = 'active'"]
+            parameters: list[Any] = [user_id]
+            if query:
+                escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                where.append("u.username LIKE ? ESCAPE '\\' COLLATE NOCASE")
+                parameters.append(f"%{escaped_query}%")
+            where_sql = " AND ".join(where)
+            rows = connection.execute(
+                f"""
+                SELECT u.user_id, u.username, u.avatar, u.updated_at, u.ip_location,
+                       u.school, u.major, u.privacy_json, f.created_at AS connected_at,
+                       (SELECT COUNT(*) FROM user_follows count_followers
+                        JOIN users count_users
+                          ON count_users.user_id = count_followers.follower_id
+                         AND count_users.status = 'active'
+                        WHERE count_followers.following_id = u.user_id) AS follower_count,
+                       EXISTS(
+                           SELECT 1 FROM user_follows viewer_follow
+                           WHERE viewer_follow.follower_id = ? AND viewer_follow.following_id = u.user_id
+                       ) AS is_following,
+                       EXISTS(
+                           SELECT 1 FROM user_follows follows_viewer
+                           WHERE follows_viewer.follower_id = u.user_id AND follows_viewer.following_id = ?
+                       ) AS follows_viewer
+                FROM user_follows f
+                JOIN users u ON u.user_id = {person_column}
+                WHERE {where_sql}
+                ORDER BY f.created_at DESC, u.username COLLATE NOCASE, u.user_id
+                LIMIT ? OFFSET ?
+                """,
+                (self.profile_id, self.profile_id, *parameters, limit, offset),
+            ).fetchall()
+            total = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM user_follows f
+                JOIN users u ON u.user_id = {person_column}
+                WHERE {where_sql}
+                """,
+                parameters,
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            privacy = profile_privacy_preferences(row["privacy_json"])
+            is_self = row["user_id"] == self.profile_id
+            items.append(
+                {
+                    "user_id": row["user_id"],
+                    "username": row["username"],
+                    "avatar": row["avatar"],
+                    "avatar_url": public_avatar_url(row["user_id"], row["avatar"], row["updated_at"]),
+                    "ip_location": row["ip_location"] or "本地",
+                    "school": row["school"] if is_self or privacy.get("school") else "",
+                    "major": row["major"] if is_self or privacy.get("major") else "",
+                    "follower_count": (
+                        int(row["follower_count"])
+                        if is_self or privacy["followers"]
+                        else None
+                    ),
+                    "is_following": bool(row["is_following"]),
+                    "follows_viewer": bool(row["follows_viewer"]),
+                    "is_self": is_self,
+                    "connected_at": row["connected_at"],
+                }
+            )
+        stats = self.profile_stats(user_id)
+        visibility = {
+            "followers": user_id == self.profile_id or owner_privacy["followers"],
+            "following": user_id == self.profile_id or owner_privacy["following"],
+        }
+        if not visibility["followers"]:
+            stats["followers"] = None
+        if not visibility["following"]:
+            stats["following"] = None
+        return {
+            "owner": {
+                "user_id": owner["user_id"],
+                "username": owner["username"],
+                "avatar": owner["avatar"],
+                "avatar_url": public_avatar_url(owner["user_id"], owner["avatar"], owner["updated_at"]),
+            },
+            "relation": relation,
+            "query": query,
+            "count": len(items),
+            "total": int(total),
+            "offset": offset,
+            "has_more": offset + len(items) < int(total),
+            "stats": stats,
+            "visibility": visibility,
+            "items": items,
+        }
+
     def public_profile(self, user_id: str) -> dict[str, Any]:
         user_id = display_text(user_id)
         connection = self.connect()
@@ -1399,10 +1539,7 @@ class PracticeStore:
             "school": row["school"] if "school" in row.keys() else "",
             "major": row["major"] if "major" in row.keys() else "",
         }
-        try:
-            privacy = json.loads(row["privacy_json"] or "{}")
-        except (TypeError, ValueError, KeyError):
-            privacy = {}
+        privacy = profile_privacy_preferences(row["privacy_json"])
         if user_id != self.profile_id:
             for key in ("birthday", "gender", "school", "major"):
                 if not privacy.get(key):
@@ -1416,6 +1553,17 @@ class PracticeStore:
                 }
             )
         profile["stats"] = self.profile_stats(user_id)
+        profile["visibility"] = {
+            "followers": user_id == self.profile_id or privacy["followers"],
+            "following": user_id == self.profile_id or privacy["following"],
+            "direct_messages": user_id == self.profile_id or privacy["direct_messages"],
+        }
+        if user_id != self.profile_id:
+            if not privacy["followers"]:
+                profile["stats"]["followers"] = None
+            if not privacy["following"]:
+                profile["stats"]["following"] = None
+        profile["stats"]["can_message"] = profile["visibility"]["direct_messages"]
         profile["is_self"] = profile["stats"]["is_self"]
         profile["dynamics"] = self._public_dynamics(user_id)
         return profile
@@ -1465,6 +1613,74 @@ class PracticeStore:
             connection.close()
         return {"category": category, "notifications": [dict(row) for row in notifications], "messages": [dict(row) for row in direct]}
 
+    def message_alerts(self, *, limit: int = 40) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 100))
+        connection = self.connect()
+        try:
+            notifications = connection.execute(
+                """
+                SELECT n.notification_id, n.kind, n.body, n.created_at,
+                       COALESCE(u.username, '') AS actor_name
+                FROM notifications n
+                LEFT JOIN users u ON u.user_id = n.actor_id
+                WHERE n.profile_id = ?
+                ORDER BY n.created_at DESC, n.notification_id DESC
+                LIMIT ?
+                """,
+                (self.profile_id, limit),
+            ).fetchall()
+            direct = connection.execute(
+                """
+                SELECT m.message_id, m.body, m.created_at,
+                       COALESCE(u.username, '') AS sender_name
+                FROM direct_messages m
+                LEFT JOIN users u ON u.user_id = m.sender_id
+                WHERE m.receiver_id = ?
+                ORDER BY m.created_at DESC, m.message_id DESC
+                LIMIT ?
+                """,
+                (self.profile_id, limit),
+            ).fetchall()
+        finally:
+            connection.close()
+        items: list[dict[str, Any]] = []
+        category_map = {
+            "system": "system",
+            "reply": "replies",
+            "mention": "replies",
+            "agree": "agreements",
+        }
+        for row in notifications:
+            category = category_map.get(row["kind"])
+            if not category:
+                continue
+            actor = row["actor_name"] or "用户"
+            message = {
+                "system": row["body"] or "有一条新的系统通知",
+                "replies": f"{actor} 回复或提到了你",
+                "agreements": f"{actor} 赞同了你的评论",
+            }[category]
+            items.append(
+                {
+                    "event_id": f"notification:{row['notification_id']}",
+                    "category": category,
+                    "message": message,
+                    "created_at": row["created_at"],
+                }
+            )
+        for row in direct:
+            sender = row["sender_name"] or "用户"
+            items.append(
+                {
+                    "event_id": f"direct:{row['message_id']}",
+                    "category": "direct",
+                    "message": f"{sender} 发来一条私信",
+                    "created_at": row["created_at"],
+                }
+            )
+        items.sort(key=lambda item: (item["created_at"], item["event_id"]), reverse=True)
+        return {"items": items[:limit]}
+
     def send_message(self, receiver_id: str, body: object) -> dict[str, Any]:
         normalized_body = _comment_body(body)
         receiver_id = display_text(receiver_id)
@@ -1472,8 +1688,14 @@ class PracticeStore:
         connection = self.connect()
         try:
             with connection:
-                if connection.execute("SELECT 1 FROM users WHERE user_id = ? AND status = 'active'", (receiver_id,)).fetchone() is None:
+                receiver = connection.execute(
+                    "SELECT privacy_json FROM users WHERE user_id = ? AND status = 'active'",
+                    (receiver_id,),
+                ).fetchone()
+                if receiver is None:
                     raise PracticeNotFound("用户不存在")
+                if receiver_id != self.profile_id and not profile_privacy_preferences(receiver["privacy_json"])["direct_messages"]:
+                    raise PracticeForbidden("该用户暂未开启私信")
                 message = {"message_id": f"msg_{secrets.token_hex(12)}", "sender_id": self.profile_id, "receiver_id": receiver_id, "body": normalized_body, "created_at": now, "read_at": None}
                 connection.execute(
                     "INSERT INTO direct_messages(message_id, sender_id, receiver_id, body, created_at) VALUES (?, ?, ?, ?, ?)",

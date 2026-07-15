@@ -65,6 +65,31 @@ def test_main_auth_roles_health_assets_and_practice(
     )
     assert profile.status_code == 200
     assert profile.get_json()["user"]["avatar"] == "🩺"
+    assert client.put(
+        "/api/auth/preferences",
+        json={"privacy": {"followers": False}},
+    ).status_code == 403
+    assert client.put(
+        "/api/auth/preferences",
+        headers=_csrf(client),
+        json={"privacy": {"followers": "false"}},
+    ).status_code == 400
+    preferences = client.put(
+        "/api/auth/preferences",
+        headers=_csrf(client),
+        json={
+            "privacy": {"followers": False, "direct_messages": False},
+            "notifications": {"direct": False},
+        },
+    )
+    assert preferences.status_code == 200
+    preference_user = preferences.get_json()["user"]
+    assert preference_user["privacy"]["followers"] is False
+    assert preference_user["privacy"]["direct_messages"] is False
+    assert preference_user["notifications"]["direct"] is False
+    me = client.get("/api/auth/me").get_json()["user"]
+    assert me["privacy"]["followers"] is False
+    assert me["notifications"]["direct"] is False
 
     assert client.get("/api/settings").status_code == 200
     assert client.get("/api/admin/dashboard").status_code == 200

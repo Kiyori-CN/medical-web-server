@@ -27,6 +27,19 @@ def test_local_accounts_hash_passwords_sessions_and_last_admin_guard(tmp_path):
     profile = store.update_profile(user["user_id"], "StudentNew", "🩺")
     assert profile["username"] == "StudentNew"
     assert profile["avatar"] == "🩺"
+    assert profile["privacy"]["followers"] is True
+    assert profile["notifications"]["direct"] is True
+    preferences = store.update_preferences(
+        user["user_id"],
+        privacy={"school": True, "followers": False},
+        notifications={"direct": False},
+    )
+    assert preferences["privacy"]["school"] is True
+    assert preferences["privacy"]["followers"] is False
+    assert preferences["notifications"]["direct"] is False
+    preserved = store.update_profile(user["user_id"], "StudentNew", "🩺")
+    assert preserved["privacy"]["followers"] is False
+    assert preserved["notifications"]["direct"] is False
     assert store.authenticate("studentnew", "StudentPass1!")["avatar"] == "🩺"
     store.change_password(user["user_id"], "StudentPass1!", "ChangedPass2!")
     assert store.resolve_session(token) is None
