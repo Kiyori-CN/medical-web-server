@@ -76,6 +76,12 @@ const state = {
   },
   providerDiscoveryTimers: {},
   vectorPollHandle: null,
+  ai: {
+    conversations: null,
+    activeId: "",
+    messages: {},
+    sending: false,
+  },
 };
 
 document.addEventListener("DOMContentLoaded", boot);
@@ -298,7 +304,8 @@ async function route() {
   } else if (page === "my-likes") {
     await renderMyLikesPage();
   } else if (page === "ai" || page === "forum") {
-    renderPlaceholderPage(page);
+    if (page === "ai") await renderAIPage();
+    else renderPlaceholderPage(page);
   } else if (page === "admin") {
     await renderAdminPage();
   }
@@ -2087,6 +2094,139 @@ function renderPlaceholderPage(page) {
   $(`#page-${page}`).innerHTML = emptyMarkup(meta[1], meta[2], meta[3]);
 }
 
+function aiConversationMarkup(item, activeId) {
+  const active = item.conversation_id === activeId ? " active" : "";
+  return `<button class="ai-conversation${active}" type="button" data-action="ai-select" data-id="${escapeAttr(item.conversation_id)}">
+    <strong>${escapeHtml(item.title || "新对话")}</strong>
+    <span>${escapeHtml(item.preview || "暂无消息")}</span>
+    <small>${formatDate(item.updated_at)}</small>
+  </button>`;
+}
+
+function aiMessageMarkup(message) {
+  const citations = (message.citations || []).map((item) =>
+    `<a href="#search" data-action="ai-citation" data-query="${escapeAttr(item.source || item.question_id || "")}">[${escapeHtml(item.index)}] ${escapeHtml(item.title || item.source || "题库来源")}</a>`
+  ).join("");
+  const content = escapeHtml(message.content || "").replace(/\n/g, "<br>");
+  return `<article class="ai-message ${message.role === "user" ? "user" : "assistant"}">
+    <div class="ai-message-role">${message.role === "user" ? "我" : "AI 学习助手"}</div>
+    <div class="ai-message-body">${content}</div>
+    ${citations ? `<div class="ai-citations"><span>题库引用</span>${citations}</div>` : ""}
+  </article>`;
+}
+
+function renderAIContent() {
+  const container = $("#page-ai");
+  const conversations = state.ai.conversations || [];
+  const active = conversations.find((item) => item.conversation_id === state.ai.activeId) || conversations[0];
+  if (active && active.conversation_id !== state.ai.activeId) state.ai.activeId = active.conversation_id;
+  const messages = state.ai.messages[state.ai.activeId] || [];
+  container.innerHTML = `<section class="ai-page-header page-header page-header-compact">
+    <div class="page-title"><p class="eyebrow">AI 学习</p><h1>把题库变成可追问的学习助手</h1><p class="section-copy">回答会绑定当前账号，会话和题库引用只保存在本地状态库。</p></div>
+    <button class="button button-primary" type="button" data-action="ai-new">新建会话</button>
+  </section>
+  <div class="ai-layout">
+    <aside class="card ai-sidebar" aria-label="AI 会话列表">
+      <div class="ai-sidebar-head"><strong>会话</strong><span>${formatNumber(conversations.length)}</span></div>
+      <div class="ai-conversation-list">${conversations.length ? conversations.map((item) => aiConversationMarkup(item, state.ai.activeId)).join("") : `<p class="ai-sidebar-empty">还没有会话</p>`}</div>
+    </aside>
+    <section class="card ai-chat-panel">
+      ${active ? `<div class="ai-chat-head"><div><strong>${escapeHtml(active.title || "新对话")}</strong><small>非流式回答 · 最多保留最近 12 条上下文</small></div><div class="ai-chat-actions"><button class="text-button" type="button" data-action="ai-rename">重命名</button><button class="text-button danger" type="button" data-action="ai-delete">删除</button></div></div>
+      <div class="ai-messages" aria-live="polite">${messages.length ? messages.map(aiMessageMarkup).join("") : `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
+      <form id="ai-chat-form" class="ai-composer" data-form="ai-chat">
+        <label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog">全题库</option><option value="question"${state.session ? "" : " disabled"}>当前题（从刷题页发起）</option><option value="collection" disabled>当前文件（从刷题页发起）</option></select></label>
+        <textarea name="content" rows="3" maxlength="8000" placeholder="输入你的问题，按 Ctrl/⌘ + Enter 发送" required></textarea>
+        <div class="ai-composer-foot"><span>答案可能需要复核，请以原题和标准解析为准。</span><button class="button button-primary" type="submit"${state.ai.sending ? " disabled" : ""}>${state.ai.sending ? "生成中…" : "发送"}</button></div>
+      </form>` : `<div class="ai-no-conversation">${emptyMarkup("创建一个 AI 会话", "会话按账号隔离，回答可引用全题库内容。", "✦")}<button class="button button-primary" type="button" data-action="ai-new">新建会话</button></div>`}
+    </section>
+  </div>`;
+  if (messages.length) window.requestAnimationFrame(() => { const box = $(".ai-messages"); if (box) box.scrollTop = box.scrollHeight; });
+}
+
+async function renderAIPage({ force = false } = {}) {
+  const container = $("#page-ai");
+  if (!state.ai.conversations || force) container.innerHTML = loadingMarkup("正在读取 AI 会话");
+  try {
+    if (!state.ai.conversations || force) {
+      const payload = await api("/ai/conversations");
+      state.ai.conversations = payload.conversations || [];
+      if (!state.ai.activeId && state.ai.conversations[0]) state.ai.activeId = state.ai.conversations[0].conversation_id;
+    }
+    if (state.ai.activeId && !state.ai.messages[state.ai.activeId]) {
+      const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`);
+      state.ai.messages[state.ai.activeId] = payload.messages || [];
+    }
+    renderAIContent();
+  } catch (error) {
+    container.innerHTML = `${emptyMarkup("AI 暂时不可用", error.message, "!")}<button class="button" type="button" data-action="ai-retry">重试</button>`;
+  }
+}
+
+async function createAIConversation() {
+  try {
+    const item = await api("/ai/conversations", { method: "POST", body: {} });
+    state.ai.conversations = [item, ...(state.ai.conversations || [])];
+    state.ai.activeId = item.conversation_id;
+    state.ai.messages[item.conversation_id] = [];
+    renderAIContent();
+    $("#ai-chat-form textarea")?.focus();
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function selectAIConversation(id) {
+  state.ai.activeId = id;
+  if (!state.ai.messages[id]) {
+    try {
+      const payload = await api(`/ai/conversations/${encodeURIComponent(id)}/messages`);
+      state.ai.messages[id] = payload.messages || [];
+    } catch (error) { showToast(error.message, "error"); }
+  }
+  renderAIContent();
+}
+
+async function renameAIConversation() {
+  const active = (state.ai.conversations || []).find((item) => item.conversation_id === state.ai.activeId);
+  if (!active) return;
+  const title = window.prompt("会话名称", active.title || "新对话");
+  if (title === null) return;
+  try {
+    const updated = await api(`/ai/conversations/${encodeURIComponent(active.conversation_id)}`, { method: "PATCH", body: { title } });
+    state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === updated.conversation_id ? { ...item, ...updated } : item);
+    renderAIContent();
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function deleteAIConversation() {
+  if (!state.ai.activeId || !window.confirm("删除当前 AI 会话及其消息？")) return;
+  const id = state.ai.activeId;
+  try {
+    await api(`/ai/conversations/${encodeURIComponent(id)}`, { method: "DELETE", body: {} });
+    state.ai.conversations = (state.ai.conversations || []).filter((item) => item.conversation_id !== id);
+    delete state.ai.messages[id];
+    state.ai.activeId = state.ai.conversations[0]?.conversation_id || "";
+    if (state.ai.activeId && !state.ai.messages[state.ai.activeId]) {
+      const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`);
+      state.ai.messages[state.ai.activeId] = payload.messages || [];
+    }
+    renderAIContent();
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function sendAIMessage(form) {
+  if (!state.ai.activeId) return createAIConversation();
+  const content = String(new FormData(form).get("content") || "").trim();
+  if (!content || state.ai.sending) return;
+  state.ai.sending = true;
+  renderAIContent();
+  try {
+    const scope = String(new FormData(form).get("scope") || "catalog");
+    const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`, { method: "POST", body: { content, context: { scope } } });
+    state.ai.messages[state.ai.activeId] = [...(state.ai.messages[state.ai.activeId] || []), payload.user, payload.assistant];
+    state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === state.ai.activeId ? { ...item, ...payload.conversation, preview: payload.assistant.content, message_count: (item.message_count || 0) + 2 } : item);
+  } catch (error) { showToast(error.message, "error"); }
+  finally { state.ai.sending = false; renderAIContent(); }
+}
+
 async function renderMyCommentsPage({ force = false } = {}) {
   const container = $("#page-my-comments");
   if (!state.myComments || force) container.innerHTML = `${personalPageHeader("评论", "正在读取评论")}${loadingMarkup("正在读取评论")}`;
@@ -2683,6 +2823,16 @@ async function handleClick(event) {
   if (action === "update-user-role") return updateUserRole(target.dataset.id);
   if (action === "reset-user-password") return resetUserPassword(target.dataset.id, target.dataset.name);
   if (action === "test-provider") return testProvider(target.dataset.provider, target);
+  if (action === "ai-new") return createAIConversation();
+  if (action === "ai-select") return selectAIConversation(target.dataset.id);
+  if (action === "ai-rename") return renameAIConversation();
+  if (action === "ai-delete") return deleteAIConversation();
+  if (action === "ai-retry") return renderAIPage({ force: true });
+  if (action === "ai-citation") {
+    event.preventDefault();
+    const query = target.dataset.query || "";
+    if (query) { state.lastSearchQuery = query; return navigateHash("#search"); }
+  }
 }
 
 async function handleSubmit(event) {
@@ -2699,7 +2849,15 @@ async function handleSubmit(event) {
   if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);
   if (event.target.dataset.form === "question-note") return submitQuestionNote(event.target);
+  if (event.target.dataset.form === "ai-chat") return sendAIMessage(event.target);
 }
+
+document.addEventListener("keydown", (event) => {
+  if (event.target.closest?.("#ai-chat-form") && event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    event.target.closest("form")?.requestSubmit();
+  }
+});
 
 document.addEventListener("input", (event) => {
   if (event.target.dataset.providerKey) {

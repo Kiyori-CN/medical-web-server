@@ -858,6 +858,66 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 
+.ai-page-header { align-items: flex-end; }
+.ai-page-header .section-copy { max-width: 650px; margin: 8px 0 0; }
+.ai-layout { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); gap: 16px; min-height: 620px; }
+.ai-sidebar { align-self: start; overflow: hidden; padding: 0; }
+.ai-sidebar-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 17px 12px; border-bottom: 1px solid var(--line); color: var(--ink); font-size: 13px; }
+.ai-sidebar-head span { color: var(--muted); font-size: 11px; }
+.ai-conversation-list { display: grid; gap: 4px; padding: 8px; max-height: 560px; overflow: auto; }
+.ai-conversation { display: grid; gap: 4px; min-width: 0; padding: 11px 10px; border: 1px solid transparent; border-radius: 12px; color: var(--ink); background: transparent; text-align: left; cursor: pointer; }
+.ai-conversation:hover { background: var(--surface-soft); }
+.ai-conversation.active { border-color: color-mix(in srgb, var(--brand) 36%, var(--line)); background: var(--brand-soft); }
+.ai-conversation strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.ai-conversation span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.ai-conversation small { color: var(--muted); font-size: 9px; }
+.ai-sidebar-empty { padding: 30px 12px; color: var(--muted); font-size: 12px; text-align: center; }
+.ai-chat-panel { display: flex; min-height: 620px; flex-direction: column; overflow: hidden; padding: 0; }
+.ai-chat-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 66px; padding: 13px 18px; border-bottom: 1px solid var(--line); }
+.ai-chat-head > div:first-child { display: grid; gap: 4px; min-width: 0; }
+.ai-chat-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.ai-chat-head small { color: var(--muted); font-size: 10px; }
+.ai-chat-actions { display: flex; flex: 0 0 auto; gap: 8px; }
+.ai-chat-actions .danger { color: var(--danger); }
+.ai-messages { display: grid; align-content: start; gap: 15px; flex: 1; min-height: 380px; max-height: 580px; overflow: auto; padding: 20px; }
+.ai-message { display: grid; gap: 6px; max-width: min(88%, 760px); }
+.ai-message.user { justify-self: end; justify-items: end; }
+.ai-message-role { color: var(--muted); font-size: 10px; font-weight: 700; }
+.ai-message-body { padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; color: var(--ink); background: var(--surface-soft); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.ai-message.user .ai-message-body { border-color: color-mix(in srgb, var(--brand) 24%, var(--line)); color: var(--brand-dark); background: var(--brand-soft); }
+.ai-citations { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; color: var(--muted); font-size: 10px; }
+.ai-citations span { color: var(--ink-soft); font-weight: 700; }
+.ai-citations a { color: var(--brand-dark); text-decoration: none; }
+.ai-citations a:hover { text-decoration: underline; }
+.ai-welcome { display: grid; place-items: center; align-content: center; min-height: 320px; padding: 20px; color: var(--muted); text-align: center; }
+.ai-welcome > span { display: grid; width: 44px; height: 44px; place-items: center; margin-bottom: 10px; border-radius: 14px; color: var(--brand); background: var(--brand-soft); font-size: 22px; }
+.ai-welcome h2 { margin: 0; color: var(--ink); font-size: 18px; }
+.ai-welcome p { max-width: 470px; margin: 8px 0 0; font-size: 12px; line-height: 1.7; }
+.ai-composer { display: grid; gap: 10px; padding: 14px 18px 16px; border-top: 1px solid var(--line); background: var(--surface); }
+.ai-context-label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+.ai-context-label select { min-height: 34px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--ink); background: var(--surface-soft); font-size: 11px; }
+.ai-composer textarea { min-height: 78px; resize: vertical; }
+.ai-composer-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ai-composer-foot span { color: var(--muted); font-size: 10px; }
+.ai-no-conversation { display: grid; place-items: center; align-content: center; flex: 1; gap: 4px; padding: 20px; }
+.ai-no-conversation .empty-state { min-height: 220px; background: transparent; box-shadow: none; }
+
+@media (max-width: 760px) {
+  .ai-page-header { align-items: flex-start; gap: 12px; }
+  .ai-page-header .button { min-height: 40px; padding-inline: 11px; }
+  .ai-layout { grid-template-columns: 1fr; min-height: 0; }
+  .ai-sidebar { order: 2; }
+  .ai-conversation-list { display: flex; max-height: 150px; overflow-x: auto; overflow-y: hidden; }
+  .ai-conversation { flex: 0 0 190px; }
+  .ai-chat-panel { order: 1; min-height: 590px; }
+  .ai-messages { min-height: 340px; max-height: none; padding: 14px; }
+  .ai-message { max-width: 94%; }
+  .ai-chat-head { padding-inline: 13px; }
+  .ai-composer { padding: 12px 13px calc(14px + env(safe-area-inset-bottom)); }
+  .ai-composer-foot { align-items: flex-end; }
+  .ai-composer-foot span { max-width: 55%; line-height: 1.5; }
+}
+
 :root[data-theme="dark"] .mobile-nav,
 :root[data-theme="dark"] body.in-session .practice-top,
 :root[data-theme="dark"] body.in-session .practice-footer,
@@ -886,6 +946,10 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 :root[data-theme="dark"] .personal-content-body.note,
 :root[data-theme="dark"] .note-form textarea { border-color: #29483d; background: #1b2b25; }
 :root[data-theme="dark"] .personal-content-body.like { border-color: #55452a; background: #2d281c; }
+:root[data-theme="dark"] .ai-message.assistant .ai-message-body { background: var(--surface-soft); }
+:root[data-theme="dark"] .ai-sidebar-empty,
+:root[data-theme="dark"] .ai-welcome p,
+:root[data-theme="dark"] .ai-composer-foot span { color: var(--muted); }
 :root[data-theme="dark"] .solution-answer .solution-content,
 :root[data-theme="dark"] .solution-point .solution-content,
 :root[data-theme="dark"] .solution-explanation .solution-content { color: #171a21; }

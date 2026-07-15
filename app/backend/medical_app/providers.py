@@ -194,3 +194,67 @@ def test_chat_provider(config: dict[str, Any], timeout: int = 30) -> dict[str, A
     except (KeyError, IndexError, TypeError, ValueError) as error:
         raise ProviderError("Large-model provider returned an invalid response") from error
     return {"status": "ok", "model": config["model"], "response_received": bool(content)}
+
+
+def complete_chat_provider(
+    config: dict[str, Any],
+    messages: list[dict[str, str]],
+    *,
+    timeout: int = 90,
+    max_tokens: int = 1200,
+) -> str:
+    """Run one bounded, non-streaming chat completion.
+
+    The caller supplies a decrypted configuration from ``SettingsStore``.  This
+    helper deliberately returns only model content and replaces provider errors
+    with safe, non-secret diagnostics so credentials never reach the API layer.
+    """
+    api_key = str(config.get("api_key") or "").strip()
+    if len(api_key) < 8:
+        raise ProviderError("Large-model API key is not configured")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages must contain at least one item")
+    safe_messages = []
+    for item in messages:
+        if not isinstance(item, dict):
+            raise ValueError("messages must be objects")
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if role not in {"system", "user", "assistant"} or not content:
+            raise ValueError("messages contain an invalid role or content")
+        safe_messages.append({"role": role, "content": content[:12000]})
+    payload = {
+        "model": str(config.get("model") or ""),
+        "messages": safe_messages,
+        "max_tokens": max(64, min(int(max_tokens), 4000)),
+        "temperature": 0.2,
+        "stream": False,
+    }
+    try:
+        response = requests.post(
+            str(config.get("api_url") or ""),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=max(10, min(int(timeout), 180)),
+        )
+    except requests.RequestException as error:
+        raise ProviderError(f"Large-model provider request failed: {type(error).__name__}") from error
+    if response.status_code >= 400:
+        raise ProviderError(f"Large-model provider returned HTTP {response.status_code}")
+    try:
+        body = response.json()
+        content = body["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                str(part.get("text") or "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        content = str(content or "").strip()
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise ProviderError("Large-model provider returned an invalid response") from error
+    if not content:
+        raise ProviderError("Large-model provider returned an empty response")
+    return content[:30000]

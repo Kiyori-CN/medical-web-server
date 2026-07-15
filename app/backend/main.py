@@ -9,6 +9,7 @@ from flask import Flask, jsonify, send_from_directory
 
 from config import get_config
 from medical_app.api import create_catalog_blueprint
+from medical_app.ai_api import create_ai_blueprint
 from medical_app.auth import (
     AuthStore,
     admin_required,
@@ -70,6 +71,14 @@ def create_app() -> Flask:
     application.register_blueprint(create_vector_admin_blueprint(vector_operations))
     application.register_blueprint(create_user_admin_blueprint(auth_store))
     application.register_blueprint(create_catalog_blueprint(catalog_path, semantic_service))
+    application.register_blueprint(
+        create_ai_blueprint(
+            config.APP_DB,
+            catalog,
+            settings_store,
+            provider_timeout=config.PROVIDER_TIMEOUT,
+        )
+    )
     application.register_blueprint(
         create_practice_blueprint(catalog_path, config.APP_DB)
     )
