@@ -45,6 +45,7 @@ const state = {
   lastSearchQuery: "",
   adminTab: "overview",
   adminData: null,
+  feedback: null,
   catalogImportPreview: null,
   profileAvatarDraft: null,
   profileEditing: false,
@@ -2002,8 +2003,33 @@ async function messageProfile(userId, name) {
 function handleHomeUtility(utility) {
   if (utility === "settings") return navigateHash("#settings");
   if (utility === "download") return exportPersonalStudy();
+  if (utility === "feedback") return openFeedbackModal();
   const labels = { download: "下载", help: "帮助中心", contact: "联系客服", feedback: "意见反馈" };
   return showToast(`${labels[utility] || "该功能"}即将开放`);
+}
+
+function openFeedbackModal() {
+  const root = $("#modal-root");
+  root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal feedback-modal" role="dialog" aria-modal="true" aria-labelledby="feedback-modal-title"><div class="modal-heading"><h2 id="feedback-modal-title">意见反馈</h2><button class="icon-button" type="button" data-modal="cancel" aria-label="取消">×</button></div><form id="feedback-form" class="stack-form"><label class="field"><span>反馈类型</span><select name="category"><option value="bug">Bug</option><option value="suggestion" selected>功能建议</option><option value="content">题库内容</option><option value="other">其他</option></select></label><label class="field"><span>反馈内容</span><textarea name="body" rows="7" minlength="2" maxlength="4000" required placeholder="请描述遇到的问题或希望改进的地方"></textarea></label><p class="form-tip">内容仅用于产品改进，最多 4000 个字符。</p><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="submit">提交反馈</button></div></form></section></div>`;
+  const finish = () => { root.innerHTML = ""; };
+  $$('[data-modal="cancel"]', root).forEach((button) => button.addEventListener("click", finish));
+  $(".modal-backdrop", root).addEventListener("click", (event) => { if (event.target.classList.contains("modal-backdrop")) finish(); });
+  $("#feedback-form", root).addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.target;
+    const button = $('button[type="submit"]', form);
+    setButtonBusy(button, true, "提交中");
+    const values = Object.fromEntries(new FormData(form));
+    try {
+      await api("/feedback", { method: "POST", body: { category: values.category, body: String(values.body || "").trim() } });
+      finish();
+      showToast("反馈已提交，感谢你的建议");
+    } catch (error) {
+      showToast(error.message || "反馈提交失败", "error");
+      setButtonBusy(button, false);
+    }
+  });
+  $("#feedback-form textarea", root).focus();
 }
 
 async function renderMessagesPage() {
@@ -2734,16 +2760,17 @@ async function renderAdminPage() {
   const container = $("#page-admin");
   container.innerHTML = `${adminHeaderMarkup()}${loadingMarkup("正在读取系统状态")}`;
   try {
-    const [dashboard, settings, users, comments, forum, vectors, imports] = await Promise.all([
+    const [dashboard, settings, users, comments, forum, feedback, vectors, imports] = await Promise.all([
       api("/admin/dashboard"),
       api("/admin/settings"),
       api("/admin/users"),
       api("/admin/comments?limit=100"),
       api("/admin/forum/content?limit=100"),
+      api("/admin/feedback?limit=100"),
       api("/admin/vectors"),
       api("/admin/catalog/imports"),
     ]);
-    state.adminData = { dashboard, settings, users: users.users || [], comments, forum, vectors, imports: imports.imports || [] };
+    state.adminData = { dashboard, settings, users: users.users || [], comments, forum, feedback, vectors, imports: imports.imports || [] };
     if (state.catalogImportPreview && !state.adminData.imports.some((item) => item.import_id === state.catalogImportPreview.import_id)) state.catalogImportPreview = null;
     renderAdminContent();
     if (["queued", "running"].includes(vectors.operation?.status)) scheduleVectorPoll();
@@ -2759,7 +2786,7 @@ function renderAdminContent() {
     ${adminHeaderMarkup()}
     <div class="admin-layout">
       <nav class="card admin-nav" aria-label="管理导航">
-        ${adminTabButton("overview", "运行概览")}${adminTabButton("catalog", "题库管理")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("forum", "论坛管理")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
+        ${adminTabButton("overview", "运行概览")}${adminTabButton("catalog", "题库管理")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("forum", "论坛管理")}${adminTabButton("feedback", "用户反馈")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
       </nav>
       <div class="admin-content">${renderAdminTab()}</div>
     </div>`;
@@ -2774,11 +2801,12 @@ function adminTabButton(tab, label) {
 }
 
 function renderAdminTab() {
-  const { dashboard, settings, users, comments, forum } = state.adminData;
+  const { dashboard, settings, users, comments, forum, feedback } = state.adminData;
   if (state.adminTab === "catalog") return renderCatalogManagement(dashboard.catalog, state.adminData.imports || []);
   if (state.adminTab === "users") return renderUsers(users);
   if (state.adminTab === "comments") return renderAdminComments(comments);
   if (state.adminTab === "forum") return renderAdminForum(forum);
+  if (state.adminTab === "feedback") return renderAdminFeedback(feedback);
   if (state.adminTab === "models") return renderModelSettings(settings);
   if (state.adminTab === "site") return renderSiteSettings(settings);
   const vector = dashboard.vector_index || {};
@@ -2995,6 +3023,36 @@ function renderAdminForum(payload = {}) {
     }).join("")}</div>` : emptyMarkup("没有匹配的论坛内容", "调整关键词、类型或状态后重试。", "◌")}
     <div class="admin-forum-audit"><div class="section-heading"><div><h3>审核记录</h3><p>最近 ${formatNumber(audit.length)} 条管理员操作，仅记录目标、状态、原因与操作者。</p></div></div>${audit.length ? `<div class="admin-forum-audit-list">${audit.map((item) => `<article><div><strong>${escapeHtml(item.moderator_name || "管理员")} · ${actionLabels[item.action] || escapeHtml(item.action)}</strong><time>${escapeHtml(formatDate(item.created_at))}</time></div><p>${escapeHtml(item.reason)}</p><small>${item.target_type === "topic" ? "主题" : "回复"} · ${escapeHtml(item.previous_status)} → ${escapeHtml(item.new_status)} · ${escapeHtml(item.target_id)}</small></article>`).join("")}</div>` : `<p class="message-empty">暂无审核记录</p>`}</div>
   </section>`;
+}
+
+function feedbackCategoryLabel(category) {
+  return ({ bug: "Bug", suggestion: "功能建议", content: "题库内容", other: "其他" })[category] || "其他";
+}
+
+function renderAdminFeedback(payload = {}) {
+  const items = payload.items || [];
+  const stats = payload.stats || {};
+  return `<section class="card admin-section feedback-admin-section">
+    <div class="section-heading"><div><h2>用户反馈</h2><p>集中查看用户提交的问题与建议，处理状态只影响后台工作流。</p></div></div>
+    <div class="admin-mini-stats"><span><strong>${formatNumber(stats.total || 0)}</strong>全部反馈</span><span><strong>${formatNumber(stats.open || 0)}</strong>待处理</span><span><strong>${formatNumber(stats.resolved || 0)}</strong>已处理</span></div>
+    <form id="admin-feedback-search" class="admin-feedback-search"><label class="field"><span>关键词</span><input name="query" value="${escapeAttr(payload.query || "")}" maxlength="200" placeholder="用户名或反馈内容"></label><label class="field"><span>状态</span><select name="status"><option value="">全部</option><option value="open" ${payload.status === "open" ? "selected" : ""}>待处理</option><option value="resolved" ${payload.status === "resolved" ? "selected" : ""}>已处理</option></select></label><button class="button button-secondary" type="submit">筛选</button></form>
+    <div class="admin-feedback-summary">当前显示 ${formatNumber(items.length)} / ${formatNumber(payload.total || 0)}</div>
+    ${items.length ? `<div class="admin-feedback-list">${items.map((item) => `<article class="admin-feedback-item ${item.status === "resolved" ? "resolved" : ""}">
+      <div class="admin-feedback-item-head"><div><span class="status-pill ${item.status === "resolved" ? "complete" : "pending"}">${item.status === "resolved" ? "已处理" : "待处理"}</span><strong>${escapeHtml(feedbackCategoryLabel(item.category))}</strong><time>${escapeHtml(formatDate(item.created_at))}</time></div><span class="admin-feedback-user">${escapeHtml(item.username || "已注销用户")}</span></div>
+      <p>${escapeHtml(item.body)}</p>
+      <div class="admin-feedback-item-foot"><small>更新于 ${escapeHtml(formatDate(item.updated_at))}</small><button class="button ${item.status === "resolved" ? "button-secondary" : "button-primary"} button-small" type="button" data-action="admin-feedback-status" data-feedback-id="${escapeAttr(item.feedback_id)}" data-status="${item.status === "resolved" ? "open" : "resolved"}">${item.status === "resolved" ? "重新打开" : "标记已处理"}</button></div>
+    </article>`).join("")}</div>${renderFeedbackPagination(payload)}` : emptyMarkup("暂无用户反馈", "新的反馈提交后会显示在这里。", "◌")}
+  </section>`;
+}
+
+function renderFeedbackPagination(payload = {}) {
+  const total = Number(payload.total || 0);
+  const limit = Math.max(1, Number(payload.limit || 100));
+  const offset = Math.max(0, Number(payload.offset || 0));
+  if (total <= limit) return "";
+  const previous = offset > 0 ? `<button class="button button-secondary button-small" type="button" data-action="admin-feedback-page" data-offset="${Math.max(0, offset - limit)}">上一页</button>` : "";
+  const next = offset + limit < total ? `<button class="button button-secondary button-small" type="button" data-action="admin-feedback-page" data-offset="${offset + limit}">下一页</button>` : "";
+  return `<div class="admin-feedback-pagination"><span>${formatNumber(offset + 1)}-${formatNumber(Math.min(total, offset + limit))} / ${formatNumber(total)}</span><div>${previous}${next}</div></div>`;
 }
 
 function renderModelSettings(settings) {
@@ -3267,6 +3325,8 @@ async function handleClick(event) {
   if (action === "delete-vectors") return deleteVectors();
   if (action === "admin-delete-comment") return adminDeleteComment(target.dataset.commentId);
   if (action === "admin-forum-moderate") return moderateAdminForum(target);
+  if (action === "admin-feedback-status") return updateAdminFeedback(target);
+  if (action === "admin-feedback-page") return loadAdminFeedbackPage(Number(target.dataset.offset || 0));
   if (action === "open-personal-source") return openPersonalSource(target);
   if (action === "catalog-import-select") {
     state.catalogImportPreview = (state.adminData.imports || []).find((item) => item.import_id === target.dataset.importId) || null;
@@ -3346,6 +3406,7 @@ async function handleSubmit(event) {
   if (event.target.id === "admin-catalog-import-mapping") return analyzeCatalogImport(event.target);
   if (event.target.id === "admin-comment-search") return searchAdminComments(event.target);
   if (event.target.id === "admin-forum-search") return searchAdminForum(event.target);
+  if (event.target.id === "admin-feedback-search") return searchAdminFeedback(event.target);
   if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);
   if (event.target.dataset.form === "question-note") return submitQuestionNote(event.target);
@@ -3985,6 +4046,53 @@ async function searchAdminForum(form) {
     renderAdminContent();
   } catch (error) {
     showToast(error.message, "error");
+  }
+}
+
+function adminFeedbackQuery(payload = state.adminData?.feedback || {}) {
+  const params = new URLSearchParams({ limit: String(payload.limit || 100), offset: String(payload.offset || 0) });
+  if (payload.query) params.set("query", payload.query);
+  if (payload.status) params.set("status", payload.status);
+  return params;
+}
+
+async function refreshAdminFeedback() {
+  state.adminData.feedback = await api(`/admin/feedback?${adminFeedbackQuery()}`);
+  renderAdminContent();
+}
+
+async function searchAdminFeedback(form) {
+  const values = Object.fromEntries(new FormData(form));
+  try {
+    state.adminData.feedback = await api(`/admin/feedback?${adminFeedbackQuery({ query: String(values.query || "").trim(), status: String(values.status || "") })}`);
+    renderAdminContent();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function loadAdminFeedbackPage(offset) {
+  const payload = state.adminData?.feedback || {};
+  try {
+    state.adminData.feedback = await api(`/admin/feedback?${adminFeedbackQuery({ query: payload.query || "", status: payload.status || "", limit: payload.limit || 100, offset: Math.max(0, offset) })}`);
+    renderAdminContent();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function updateAdminFeedback(button) {
+  const feedbackId = button.dataset.feedbackId;
+  const status = button.dataset.status;
+  if (!feedbackId || !["open", "resolved"].includes(status)) return;
+  setButtonBusy(button, true, "保存中");
+  try {
+    await api(`/admin/feedback/${encodeURIComponent(feedbackId)}`, { method: "PATCH", body: { status } });
+    await refreshAdminFeedback();
+    showToast(status === "resolved" ? "反馈已标记为已处理" : "反馈已重新打开");
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
   }
 }
 

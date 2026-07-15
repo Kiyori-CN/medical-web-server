@@ -158,6 +158,8 @@ git rev-parse HEAD
 
 不要使用 `git add .` 无差别加入本地文件。确认 `data/`、catalog、state、日志和密钥均未进入提交。
 
+反馈闭环的本地验收至少覆盖：未登录 `POST /api/feedback` 返回 401；缺少或错误 CSRF 返回 403；普通用户不能读取或修改 `/api/admin/feedback`；不同账号提交记录在管理员列表中保持隔离；非法类型、少于 2 字或超过 4000 字返回 400；管理员可按关键词/状态分页并在 `open` 与 `resolved` 间切换。
+
 ## 服务器边界
 
 所有服务器操作使用 Tencent Cloud wrapper。`/srv/projects/medical-web-server/repo` 只允许快进到已发布的 GitHub 精确提交；生产运行目录不能做常规源码编辑。

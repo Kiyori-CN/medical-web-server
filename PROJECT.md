@@ -123,3 +123,5 @@ AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conve
 题库导入预检 API 为 `GET/POST /api/admin/catalog/imports`、`POST /api/admin/catalog/imports/<id>/analyze` 和 `DELETE /api/admin/catalog/imports/<id>`。上传与重新分析/删除要求管理员和 CSRF；暂存源文件与 manifest 位于生产 `state/`，不进入 Git、发布包、catalog 或向量。
 
 个人学习数据 API 为 `GET /api/study/export?format=jsonl|csv`，仅登录用户可读，按 `profile_id` 导出收藏、错题、笔记、进度、会话和作答记录，响应禁止缓存和代理缓冲，CSV 公式前缀会被中和。
+
+用户反馈 API 为 `POST /api/feedback`、`GET /api/admin/feedback` 和 `PATCH /api/admin/feedback/<feedback_id>`。反馈写入 `state/app.sqlite3` 的 `user_feedback`，按当前账号保存，类型为 Bug、功能建议、题库内容或其他，正文限制 2–4000 字；用户提交要求登录与 CSRF，后台列表与状态更新仅管理员可用并支持关键词、状态、分页和统计。

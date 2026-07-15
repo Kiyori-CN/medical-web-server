@@ -22,6 +22,7 @@ from medical_app.catalog import Catalog, CatalogUnavailable, resolve_catalog_pat
 from medical_app.catalog_export import create_catalog_export_blueprint
 from medical_app.catalog_import import create_catalog_import_blueprint
 from medical_app.forum_api import create_forum_admin_blueprint, create_forum_blueprint
+from medical_app.feedback_api import create_feedback_blueprint
 from medical_app.practice import PracticeStore
 from medical_app.practice_api import create_practice_blueprint
 from medical_app.semantic import SemanticSearchService
@@ -82,6 +83,7 @@ def create_app() -> Flask:
     application.register_blueprint(create_catalog_blueprint(catalog_path, semantic_service))
     application.register_blueprint(create_forum_blueprint(config.APP_DB))
     application.register_blueprint(create_forum_admin_blueprint(config.APP_DB))
+    application.register_blueprint(create_feedback_blueprint(config.APP_DB))
     application.register_blueprint(create_study_export_blueprint(config.APP_DB))
     application.register_blueprint(
         create_ai_blueprint(

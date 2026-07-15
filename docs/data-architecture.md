@@ -210,3 +210,7 @@ AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` �
 - foreign key errors：0。
 
 还必须抽查 `专硕考研/历年真题/2026/2026.xlsx`：165 题、A1/A2/A3-A4/B/X 题型目录、指定题号起始、原 occurrence 判分和四种模式。
+
+## 用户反馈数据
+
+`state/app.sqlite3` 中的 `user_feedback` 是独立的账号反馈表，不进入 catalog、FTS、向量或公共动态。每行包含不可预测的 `feedback_id`、`profile_id`、`category`、`body`、`status` 以及创建/更新时间；`category` 仅允许 `bug`、`suggestion`、`content`、`other`，`status` 仅允许 `open`、`resolved`，正文限制 2–4000 字。管理员查询通过状态/更新时间和账号/创建时间索引分页，账号删除后列表显示“已注销用户”而不丢失反馈记录。
