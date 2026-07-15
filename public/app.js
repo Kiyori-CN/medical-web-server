@@ -2604,7 +2604,7 @@ function renderAdminContent() {
     ${adminHeaderMarkup()}
     <div class="admin-layout">
       <nav class="card admin-nav" aria-label="管理导航">
-        ${adminTabButton("overview", "运行概览")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
+        ${adminTabButton("overview", "运行概览")}${adminTabButton("catalog", "题库管理")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
       </nav>
       <div class="admin-content">${renderAdminTab()}</div>
     </div>`;
@@ -2620,6 +2620,7 @@ function adminTabButton(tab, label) {
 
 function renderAdminTab() {
   const { dashboard, settings, users, comments } = state.adminData;
+  if (state.adminTab === "catalog") return renderCatalogManagement(dashboard.catalog);
   if (state.adminTab === "users") return renderUsers(users);
   if (state.adminTab === "comments") return renderAdminComments(comments);
   if (state.adminTab === "models") return renderModelSettings(settings);
@@ -2644,6 +2645,30 @@ function renderAdminTab() {
       <div class="settings-group"><h3>向量索引</h3><div class="solution-row"><strong>状态</strong><span>${escapeHtml(vector.status || "unavailable")}</span></div><div class="solution-row"><strong>模型</strong><span>${escapeHtml(vector.model || "尚未构建")}</span></div><div class="solution-row"><strong>向量数</strong><span>${formatNumber(vector.count || 0)}</span></div></div>
     </div>
   </section>`;
+}
+
+function renderCatalogManagement(catalog) {
+  return `<section class="card admin-section">
+    <div class="section-heading"><div><h2>题库管理</h2><p>以通用格式导出当前激活的只读 catalog，不包含账号、笔记、评论或其他用户状态。</p></div></div>
+    <div class="catalog-export-facts"><span><small>规范题目</small><strong>${formatNumber(catalog.questions || 0)}</strong></span><span><small>原题记录</small><strong>${formatNumber(catalog.question_occurrences || 0)}</strong></span><span><small>题库文件</small><strong>${formatNumber(catalog.collections || 0)}</strong></span></div>
+    <form id="admin-catalog-export" class="settings-group catalog-export-card">
+      <div><h3>导出当前题库</h3><p>逐行输出原题 occurrence，保留来源路径、题号、题型、选项、答案、考点和解析。大题库导出会在后台持续下载，无需停用搜题和刷题。</p></div>
+      <label class="field"><span>导出格式</span><select name="format"><option value="jsonl">JSONL · 程序处理与再次导入</option><option value="csv">CSV · 表格软件与数据分析</option></select></label>
+      <div class="catalog-export-actions"><span>当前导出只读取已激活版本，不会修改 catalog 或向量。</span><button class="button button-primary" type="submit">开始导出</button></div>
+    </form>
+  </section>`;
+}
+
+function exportAdminCatalog(form) {
+  const format = String(new FormData(form).get("format") || "jsonl");
+  if (!new Set(["jsonl", "csv"]).has(format)) return showToast("导出格式无效", "error");
+  const link = document.createElement("a");
+  link.href = `/api/admin/catalog/export?format=${encodeURIComponent(format)}`;
+  link.download = `medical-catalog.${format}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  showToast("题库导出已开始");
 }
 
 function renderUsers(users) {
@@ -2997,6 +3022,7 @@ async function handleSubmit(event) {
   if (event.target.id === "semantic-settings-form") return saveSemanticSettings(event.target);
   if (event.target.id === "site-settings-form") return saveSiteSettings(event.target);
   if (event.target.id === "create-user-form") return createUser(event.target);
+  if (event.target.id === "admin-catalog-export") return exportAdminCatalog(event.target);
   if (event.target.id === "admin-comment-search") return searchAdminComments(event.target);
   if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);

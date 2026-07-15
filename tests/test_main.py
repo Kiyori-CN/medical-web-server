@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import csv
 import importlib
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -97,6 +100,47 @@ def test_main_auth_roles_health_assets_and_practice(
     assert client.get("/api/admin/vectors").get_json()["operation"]["status"] == "idle"
     stats = client.get("/api/stats").get_json()
     assert stats["questions"] == 5
+    jsonl_export = client.get("/api/admin/catalog/export?format=jsonl")
+    assert jsonl_export.status_code == 200
+    assert jsonl_export.mimetype == "application/x-ndjson"
+    assert jsonl_export.headers["Cache-Control"] == "private, no-store"
+    assert jsonl_export.headers["X-Accel-Buffering"] == "no"
+    assert "medical-catalog-all.jsonl" in jsonl_export.headers["Content-Disposition"]
+    exported = [
+        json.loads(line)
+        for line in jsonl_export.get_data(as_text=True).splitlines()
+        if line
+    ]
+    assert len(exported) == stats["question_occurrences"] == 6
+    assert all(item["relative_path"] and item["options"] for item in exported if item["canonical_type"] == "single")
+    assert {item["occurrence_id"] for item in exported} == set(range(1, 7))
+    conflict_row = next(
+        item for item in exported if item["relative_path"].endswith("重复题.xlsx")
+    )
+    assert conflict_row["answer"] == "B"
+    assert conflict_row["explanation"].startswith("此行故意制造答案冲突")
+    assert conflict_row["options"][0]["text"] == "易化扩散"
+
+    collection_id = exported[0]["collection_id"]
+    collection_export = client.get(
+        f"/api/admin/catalog/export?format=jsonl&collection_id={collection_id}"
+    )
+    filtered_export = [
+        json.loads(line)
+        for line in collection_export.get_data(as_text=True).splitlines()
+        if line
+    ]
+    assert filtered_export
+    assert {item["collection_id"] for item in filtered_export} == {collection_id}
+
+    csv_export = client.get("/api/admin/catalog/export?format=csv")
+    assert csv_export.status_code == 200
+    csv_rows = list(
+        csv.DictReader(io.StringIO(csv_export.get_data(as_text=True).lstrip("\ufeff")))
+    )
+    assert len(csv_rows) == 6
+    assert csv_rows[0]["option_a"]
+    assert client.get("/api/admin/catalog/export?format=xlsx").status_code == 400
     search = client.post(
         "/api/search",
         json={"query": "细胞膜运输", "include_solution": False},
@@ -122,6 +166,7 @@ def test_main_auth_roles_health_assets_and_practice(
     assert ordinary.get("/api/admin/dashboard").status_code == 403
     assert ordinary.get("/api/admin/comments").status_code == 403
     assert ordinary.get("/api/admin/vectors").status_code == 403
+    assert ordinary.get("/api/admin/catalog/export?format=jsonl").status_code == 403
     assert ordinary.get("/api/settings").status_code == 200
     wrong_password = ordinary.post(
         "/api/auth/password",

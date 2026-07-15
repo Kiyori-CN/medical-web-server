@@ -9,6 +9,7 @@
 | `gunicorn_config.py` | 生产 worker、preload、超时和日志 |
 | `medical_app/auth.py` | 本地账号、密码修改/重置、会话、角色与 CSRF |
 | `medical_app/catalog.py` | 只读 SQLite/FTS 访问 |
+| `medical_app/catalog_export.py` | 管理员 JSONL/CSV occurrence 流式导出 |
 | `medical_app/practice.py` | 会话、四种刷题模式、文件进度重置、收藏、错题和评论 |
 | `medical_app/settings.py` | 网站/模型设置与秘密加密 |
 | `medical_app/semantic.py` | keyword、semantic、hybrid 编排 |
@@ -29,6 +30,7 @@
 - 用户修改密码验证当前密码；任何密码修改都会撤销该用户的既有会话。
 - 文件进度重置只清空当前账号和当前 collection 的题号状态投影，不删除历史试卷、收藏、错题或评论。
 - 评论绑定 occurrence；登录用户可发表，作者本人和管理员可删除。
+- `/api/admin/catalog/export` 只允许管理员，以只读连接逐行输出当前 catalog；CSV 单元格中和公式前缀，响应不缓存且不读取用户 state。
 
 ## 本地启动
 

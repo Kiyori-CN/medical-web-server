@@ -8,7 +8,7 @@ app/
     main.py              Flask 入口与静态文件服务
     config.py            本地/生产配置
     gunicorn_config.py   4 核 4G 生产配置
-    medical_app/         账号、题库、搜索、刷题、设置和向量模块
+    medical_app/         账号、题库、流式导出、搜索、刷题、设置和向量模块
 ```
 
 唯一前端源码位于仓库根 `public/`，由 Flask 直接提供。
@@ -16,6 +16,7 @@ app/
 应用边界：
 
 - 只读消费 `knowledge-base` 中激活的 catalog；
+- 允许管理员把激活 catalog 按 occurrence 流式导出为 JSONL/CSV，但不修改 catalog 或读取用户 state；
 - 将账号、会话、可独立重置的文件刷题状态、可切换收藏、可删除错题与原题评论写入 `state/app.sqlite3`；
 - 将网站和模型设置写入 `state/settings.sqlite3`；
 - 通过独立 `state/settings.key` 加密 API 密钥；
