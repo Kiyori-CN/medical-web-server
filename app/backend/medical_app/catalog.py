@@ -545,6 +545,62 @@ class Catalog:
             "collections": sort_library_entries(collections, parent_path),
         }
 
+    def browse_library_tree(self, parent: str = "") -> dict[str, Any]:
+        parent_path = _safe_library_path(parent)
+        prefix = f"{parent_path}/" if parent_path else ""
+        root: dict[str, Any] = {
+            "kind": "directory",
+            "name": PurePosixPath(parent_path).name if parent_path else "全部题库",
+            "path": parent_path,
+            "collection_count": 0,
+            "question_count": 0,
+            "directories": {},
+            "collections": [],
+        }
+        for source_row in self._library_rows():
+            relative_path = str(source_row["relative_path"] or "")
+            if not relative_path.startswith(prefix):
+                continue
+            remainder = relative_path[len(prefix) :]
+            if not remainder:
+                continue
+            parts = remainder.split("/")
+            node = root
+            node["collection_count"] += 1
+            node["question_count"] += int(source_row["question_count"] or 0)
+            current_path = parent_path
+            for directory_name in parts[:-1]:
+                current_path = f"{current_path}/{directory_name}".strip("/")
+                child = node["directories"].setdefault(
+                    directory_name,
+                    {
+                        "kind": "directory",
+                        "name": directory_name,
+                        "path": current_path,
+                        "collection_count": 0,
+                        "question_count": 0,
+                        "directories": {},
+                        "collections": [],
+                    },
+                )
+                child["collection_count"] += 1
+                child["question_count"] += int(source_row["question_count"] or 0)
+                node = child
+            row = dict(source_row)
+            node["collections"].append(
+                {"kind": "collection", "name": parts[-1], **row}
+            )
+
+        def finalize(node: dict[str, Any]) -> dict[str, Any]:
+            directory_rows = [finalize(value) for value in node["directories"].values()]
+            return {
+                **{key: value for key, value in node.items() if key != "directories"},
+                "directories": sort_library_entries(directory_rows, node["path"]),
+                "collections": sort_library_entries(node["collections"], node["path"]),
+            }
+
+        return finalize(root)
+
     def collection_outline(self, collection_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(

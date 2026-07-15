@@ -7,6 +7,7 @@
 - 按考试、学科、系统、章节和年份的学习顺序浏览题库；
 - 底部五个主页面不显示重复的红色栏目标题；收藏和错题等二级页面保留单一红色栏目名；
 - 点击左上角“医考知库”始终返回题库根目录首页；
+- 题库支持“目录 / 分类”两种浏览样式；分类模式以考试、题库类型横向滑动选择，学科使用纵向折叠列表，按需展开章节和最终原始文件；
 - 刷题页左上角回退返回当前文件的题号目录详情，而不是题库列表；
 - 题库文件卡片和页面可见来源路径隐藏 `.xlsx` 后缀，卡片同时隐藏重复的 `XLSX` 格式标签，原始路径仍完整保留；
 - 保留原文件相对路径、扩展名、原题号和 occurrence 版本；
@@ -134,6 +135,7 @@ Qwen/Qwen3-Embedding-0.6B
 | `GET` | `/api/stats` | 题库统计 |
 | `POST` | `/api/search` | keyword / semantic / hybrid 搜题，支持 `search_fields` 字段范围与 `question_types` 实际题型数组过滤 |
 | `GET` | `/api/library` | 原目录浏览 |
+| `GET` | `/api/library/tree` | 按指定父目录返回医学顺序的只读子树，用于分类折叠导航 |
 | `GET` | `/api/practice/collections/<id>/outline` | 文件题号与进度 |
 | `POST` | `/api/practice/collections/<id>/progress/reset` | 重置当前账号在当前文件的刷题状态 |
 | `POST` | `/api/practice/sessions` | 创建四种模式的文件会话 |

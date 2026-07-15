@@ -143,6 +143,11 @@ def create_catalog_blueprint(
     def library():
         return jsonify(catalog.browse_library(request.args.get("parent", "")))
 
+    @blueprint.get("/library/tree")
+    @login_required
+    def library_tree():
+        return jsonify(catalog.browse_library_tree(request.args.get("parent", "")))
+
     @blueprint.get("/collections/<collection_id>/questions")
     @login_required
     def collection_questions(collection_id: str):

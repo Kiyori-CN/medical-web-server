@@ -77,6 +77,9 @@ def test_catalog_collections_and_blueprint(sample_source_tree: Path, tmp_path: P
     assert root["directories"][0]["name"] == "执业医师"
     leaf = catalog.browse_library("执业医师/学科刷题/生理学")
     assert {item["name"] for item in leaf["collections"]} == {"第一章.xlsx", "第一章.docx"}
+    tree = catalog.browse_library_tree("执业医师/学科刷题")
+    physiology = next(item for item in tree["directories"] if item["name"] == "生理学")
+    assert {item["name"] for item in physiology["collections"]} == {"第一章.xlsx", "第一章.docx"}
 
     app = Flask(__name__)
     @app.before_request
@@ -89,6 +92,9 @@ def test_catalog_collections_and_blueprint(sample_source_tree: Path, tmp_path: P
     health = client.get("/api/catalog/health")
     assert health.status_code == 200
     assert health.get_json()["engine"] == "sqlite-fts5"
+    tree_response = client.get("/api/library/tree?parent=执业医师/学科刷题")
+    assert tree_response.status_code == 200
+    assert tree_response.get_json()["collection_count"] == 2
 
     response = client.post(
         "/api/search",

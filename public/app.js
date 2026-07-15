@@ -12,6 +12,12 @@ const state = {
   stats: null,
   todaySummary: null,
   libraryPath: { library: "", favorites: "", wrong: "" },
+  libraryViewMode: "folders",
+  libraryGuideExam: "",
+  libraryGuideKind: "",
+  libraryGuideExpanded: new Set(),
+  libraryGuideCache: {},
+  libraryGuideLoading: new Set(),
   outline: null,
   outlineMode: "practice",
   session: null,
@@ -333,6 +339,10 @@ function emptyMarkup(title, copy, icon = "·") {
 async function renderLibrary(kind) {
   state.outline = null;
   renderLibraryShell(kind);
+  if (kind === "library" && state.libraryViewMode === "guided") {
+    await renderGuidedLibrary();
+    return;
+  }
   const container = $(`#page-${kind}`);
   const parent = state.libraryPath[kind] || "";
   try {
@@ -350,7 +360,8 @@ function renderLibraryShell(kind) {
   const container = $(`#page-${kind}`);
   const meta = libraryMeta(kind);
   const heading = kind === "library" ? "" : `<div class="page-header page-header-compact"><div class="page-title"><p class="eyebrow">${meta.eyebrow}</p></div></div>`;
-  container.innerHTML = `${heading}<div id="${kind}-content">${loadingMarkup("正在读取题库目录")}</div>`;
+  const viewToggle = kind === "library" ? `<div class="library-view-toolbar"><span>浏览方式</span><div class="library-view-switch" role="group" aria-label="题库浏览方式"><button class="${state.libraryViewMode === "folders" ? "active" : ""}" type="button" data-action="library-view-mode" data-mode="folders"><span aria-hidden="true">▦</span>目录</button><button class="${state.libraryViewMode === "guided" ? "active" : ""}" type="button" data-action="library-view-mode" data-mode="guided"><span aria-hidden="true">☷</span>分类</button></div></div>` : "";
+  container.innerHTML = `${heading}${viewToggle}<div id="${kind}-content">${loadingMarkup("正在读取题库目录")}</div>`;
 }
 
 function libraryMeta(kind) {
@@ -377,6 +388,104 @@ function renderLibraryPayload(kind, payload) {
       kind === "favorites" ? "在搜题或练习页面点击收藏后，会按原文件路径显示在这里。" : kind === "wrong" ? "答错的客观题会自动归档到这里。" : "当前目录没有可用题库文件。",
       kind === "favorites" ? "☆" : kind === "wrong" ? "!" : "▦"
     )}`;
+}
+
+async function renderGuidedLibrary() {
+  const content = $("#library-content");
+  if (!content) return;
+  content.innerHTML = loadingMarkup("正在整理分类导航");
+  try {
+    const currentParts = String(state.libraryPath.library || "").split("/").filter(Boolean);
+    const root = await api("/library?parent=");
+    const exams = root.directories || [];
+    const requestedExam = state.libraryGuideExam || currentParts[0] || exams[0]?.path || "";
+    const exam = exams.find((item) => item.path === requestedExam) || exams[0];
+    if (!exam) {
+      content.innerHTML = emptyMarkup("暂无题库分类", "当前题库没有可用目录。", "▦");
+      return;
+    }
+    state.libraryGuideExam = exam.path;
+    const examPayload = await api(`/library?parent=${encodeURIComponent(exam.path)}`);
+    const kinds = examPayload.directories || [];
+    const requestedKind = state.libraryGuideKind || (currentParts[0] === exam.name && currentParts[1] ? `${exam.path}/${currentParts[1]}` : "") || kinds[0]?.path || "";
+    const collectionKind = kinds.find((item) => item.path === requestedKind) || kinds[0];
+    state.libraryGuideKind = collectionKind?.path || "";
+    const branchPayload = collectionKind
+      ? await api(`/library?parent=${encodeURIComponent(collectionKind.path)}`)
+      : examPayload;
+    const lead = !state.libraryPath.library ? renderTodaySummary() : "";
+    content.innerHTML = `${lead}<section class="card guided-library"><div class="guided-library-head"><div><h2>分类导航</h2><p>按考试与题库类型定位，再展开学科查看原始文件。</p></div><span>${formatNumber(branchPayload.directories?.length || branchPayload.collections?.length || 0)} 个分类</span></div>${renderGuideRail("考试", exams, exam.path, "exam")}${renderGuideRail("题库", kinds, collectionKind?.path || "", "kind")}<div class="guided-library-body">${renderGuideBranches(branchPayload)}</div></section>`;
+  } catch (error) {
+    content.innerHTML = emptyMarkup("分类导航读取失败", error.message, "!");
+  }
+}
+
+function renderGuideRail(label, items, activePath, level) {
+  if (!items.length) return "";
+  return `<div class="guide-rail-row"><strong>${label}</strong><div class="guide-rail" role="tablist" aria-label="${label}">${items.map((item) => `<button class="${item.path === activePath ? "active" : ""}" type="button" role="tab" aria-selected="${item.path === activePath}" data-action="guide-select" data-level="${level}" data-path="${escapeAttr(item.path)}"><span>${escapeHtml(item.name)}</span><small>${formatNumber(item.collection_count || 0)}</small></button>`).join("")}</div></div>`;
+}
+
+function renderGuideBranches(payload) {
+  const directories = payload.directories || [];
+  const collections = payload.collections || [];
+  const directFiles = collections.length ? `<section class="guide-direct-files"><h3>题库文件</h3>${renderGuideFiles(collections)}</section>` : "";
+  const branches = directories.map((directory) => {
+    const expanded = state.libraryGuideExpanded.has(directory.path);
+    const loading = state.libraryGuideLoading.has(directory.path);
+    const cached = state.libraryGuideCache[directory.path];
+    const body = loading
+      ? `<div class="guide-branch-loading"><span class="loading-spinner"></span><span>正在读取目录</span></div>`
+      : cached ? renderGuideTreeNode(cached) : "";
+    return `<article class="guide-branch ${expanded ? "open" : ""}"><button class="guide-branch-trigger" type="button" data-action="toggle-guide-branch" data-path="${escapeAttr(directory.path)}" aria-expanded="${expanded}"><span class="guide-branch-icon" aria-hidden="true">${expanded ? "−" : "+"}</span><span class="guide-branch-copy"><strong>${escapeHtml(directory.name)}</strong><small>${formatNumber(directory.collection_count || 0)} 个文件 · ${formatNumber(directory.question_count || 0)} 道题</small></span><span class="guide-branch-arrow" aria-hidden="true">⌄</span></button><div class="guide-branch-body" ${expanded ? "" : "hidden"}>${body}</div></article>`;
+  }).join("");
+  return `${directFiles}${branches || (!directFiles ? emptyMarkup("暂无可展开目录", "当前分类没有题库文件。", "▦") : "")}`;
+}
+
+function renderGuideTreeNode(node, depth = 0) {
+  const files = renderGuideFiles(node.collections || []);
+  const directories = (node.directories || []).map((directory) => `<details class="guide-nested-folder" ${depth === 0 ? "open" : ""}><summary><span>${escapeHtml(directory.name)}</span><small>${formatNumber(directory.collection_count || 0)} 个文件</small></summary><div class="guide-nested-content">${renderGuideTreeNode(directory, depth + 1)}</div></details>`).join("");
+  return `${files}${directories}` || `<p class="guide-empty">该目录暂无题库文件</p>`;
+}
+
+function renderGuideFiles(collections) {
+  if (!collections.length) return "";
+  return `<div class="guide-file-list">${collections.map((item) => `<button type="button" data-action="open-collection" data-kind="library" data-parent-path="${escapeAttr(collectionParentPath(item.relative_path || ""))}" data-id="${escapeAttr(item.collection_id || "")}"><span class="guide-file-icon" aria-hidden="true">卷</span><span><strong>${escapeHtml(String(item.name || "").replace(/\.xlsx$/i, ""))}</strong><small>${formatNumber(item.question_count || 0)} 题</small></span><b aria-hidden="true">›</b></button>`).join("")}</div>`;
+}
+
+async function selectGuideLevel(level, path) {
+  if (!path) return;
+  if (level === "exam") {
+    state.libraryGuideExam = path;
+    state.libraryGuideKind = "";
+    state.libraryGuideExpanded.clear();
+  } else {
+    state.libraryGuideKind = path;
+    state.libraryGuideExpanded.clear();
+  }
+  await renderGuidedLibrary();
+}
+
+async function toggleGuideBranch(path) {
+  if (!path) return;
+  if (state.libraryGuideExpanded.has(path)) {
+    state.libraryGuideExpanded.delete(path);
+    await renderGuidedLibrary();
+    return;
+  }
+  state.libraryGuideExpanded.add(path);
+  if (!state.libraryGuideCache[path]) {
+    state.libraryGuideLoading.add(path);
+    await renderGuidedLibrary();
+    try {
+      state.libraryGuideCache[path] = await api(`/library/tree?parent=${encodeURIComponent(path)}`);
+    } catch (error) {
+      state.libraryGuideExpanded.delete(path);
+      showToast(error.message, "error");
+    } finally {
+      state.libraryGuideLoading.delete(path);
+    }
+  }
+  await renderGuidedLibrary();
 }
 
 function renderTodaySummary() {
@@ -1846,6 +1955,21 @@ async function handleClick(event) {
     setPracticeOutline(false);
     return navigateHash("#library");
   }
+  if (action === "library-view-mode") {
+    const mode = target.dataset.mode === "guided" ? "guided" : "folders";
+    if (state.libraryViewMode === mode) return;
+    state.libraryViewMode = mode;
+    if (mode === "guided") {
+      const parts = String(state.libraryPath.library || "").split("/").filter(Boolean);
+      state.libraryGuideExam = parts[0] || state.libraryGuideExam;
+      state.libraryGuideKind = parts.length > 1 ? `${parts[0]}/${parts[1]}` : "";
+      state.libraryGuideExpanded.clear();
+    }
+    savePreferences();
+    return renderLibrary("library");
+  }
+  if (action === "guide-select") return selectGuideLevel(target.dataset.level, target.dataset.path);
+  if (action === "toggle-guide-branch") return toggleGuideBranch(target.dataset.path);
   if (action === "open-directory") {
     state.libraryPath[target.dataset.kind] = target.dataset.path;
     return navigateHash(libraryRouteHash(target.dataset.kind, target.dataset.path));
@@ -1856,6 +1980,7 @@ async function handleClick(event) {
   }
   if (action === "open-collection") {
     const kind = target.dataset.kind;
+    if (target.dataset.parentPath) state.libraryPath[kind] = target.dataset.parentPath;
     return navigateHash(libraryRouteHash(kind, state.libraryPath[kind], target.dataset.id));
   }
   if (action === "close-outline") {
@@ -2799,6 +2924,7 @@ function savePreferences() {
       searchQuestionTypes: state.searchQuestionTypes,
       searchSolutionVisibility: state.searchSolutionVisibility,
       searchSettingsExpanded: state.searchSettingsExpanded,
+      libraryViewMode: state.libraryViewMode,
     }));
   } catch (_) {
     // 浏览器禁用本地存储时仍可在当前会话使用设置。
@@ -2808,6 +2934,7 @@ function savePreferences() {
 try {
   const preferences = JSON.parse(localStorage.getItem(PREFERENCE_KEY) || "{}");
   if (preferences.searchMode) state.searchMode = preferences.searchMode;
+  if (["folders", "guided"].includes(preferences.libraryViewMode)) state.libraryViewMode = preferences.libraryViewMode;
   if (Array.isArray(preferences.searchQuestionTypes)) {
     state.searchQuestionTypes = [...new Set(preferences.searchQuestionTypes.map((value) => String(value || "").trim()).filter(Boolean))];
   } else if (typeof preferences.searchQuestionType === "string" && preferences.searchQuestionType) {
