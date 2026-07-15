@@ -1370,6 +1370,38 @@ class PracticeStore:
             dynamics = connection.execute(
                 "SELECT COUNT(*) FROM question_comments WHERE author_id = ?", (user_id,)
             ).fetchone()[0]
+            has_forum_reactions = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'forum_reactions'"
+            ).fetchone()
+            if has_forum_reactions:
+                forum_likes = connection.execute(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM forum_reactions fr
+                       JOIN forum_topics t ON fr.target_type = 'topic' AND fr.target_id = t.topic_id
+                       WHERE t.author_id = ? AND t.status = 'open'
+                         AND fr.reaction = 'agree' AND fr.profile_id != t.author_id)
+                      +
+                      (SELECT COUNT(*) FROM forum_reactions fr
+                       JOIN forum_replies r ON fr.target_type = 'reply' AND fr.target_id = r.reply_id
+                       JOIN forum_topics t ON t.topic_id = r.topic_id
+                       WHERE r.author_id = ? AND r.status = 'visible' AND t.status = 'open'
+                         AND fr.reaction = 'agree' AND fr.profile_id != r.author_id)
+                    """,
+                    (user_id, user_id),
+                ).fetchone()[0]
+                forum_dynamics = connection.execute(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM forum_topics WHERE author_id = ? AND status = 'open')
+                      +
+                      (SELECT COUNT(*) FROM forum_replies r JOIN forum_topics t ON t.topic_id = r.topic_id
+                       WHERE r.author_id = ? AND r.status = 'visible' AND t.status = 'open')
+                    """,
+                    (user_id, user_id),
+                ).fetchone()[0]
+                likes += int(forum_likes)
+                dynamics += int(forum_dynamics)
             is_following = bool(
                 connection.execute(
                     "SELECT 1 FROM user_follows WHERE follower_id = ? AND following_id = ?",
@@ -1720,8 +1752,8 @@ class PracticeStore:
             actor = row["actor_name"] or "用户"
             message = {
                 "system": row["body"] or "有一条新的系统通知",
-                "replies": f"{actor} 回复或提到了你",
-                "agreements": f"{actor} 赞同了你的评论",
+                "replies": f"{actor} {row['body']}" if row["body"].startswith("论坛回复：") else f"{actor} 回复或提到了你",
+                "agreements": f"{actor} {row['body']}" if row["body"].startswith("赞同了你的论坛") else f"{actor} 赞同了你的评论",
             }[category]
             items.append(
                 {

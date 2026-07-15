@@ -1964,7 +1964,7 @@ function renderSettingsPage() {
         ${settingsToggle("system", "系统通知", "账号与系统的重要状态提醒", notifications.system)}
         ${settingsToggle("direct", "私信对话", "收到其他用户的新私信时提醒", notifications.direct)}
         ${settingsToggle("replies", "回复与@", "评论被回复或提及时提醒", notifications.replies)}
-        ${settingsToggle("agreements", "收到赞同", "评论收到新的赞同时提醒", notifications.agreements)}
+        ${settingsToggle("agreements", "收到赞同", "评论或论坛内容收到新的赞同时提醒", notifications.agreements)}
         <p class="settings-save-status" data-preference-status="notifications" aria-live="polite"></p>
       </form>
     </section>
@@ -2261,8 +2261,13 @@ function forumTopicCard(item) {
     <div class="forum-topic-meta"><span>${escapeHtml(item.section_name)}</span><time datetime="${escapeAttr(item.last_activity)}">${escapeHtml(formatDate(item.last_activity))}</time></div>
     <h2>${escapeHtml(item.title)}</h2>
     <p>${escapeHtml(item.preview || "")}</p>
-    <div class="forum-topic-foot"><span>${escapeHtml(item.author_name)}</span><strong>${formatNumber(item.reply_count)} 回复</strong></div>
+    <div class="forum-topic-foot"><span>${escapeHtml(item.author_name)}</span><strong>${formatNumber(item.agree_count || 0)} 赞同 · ${formatNumber(item.reply_count)} 回复</strong></div>
   </button>`;
+}
+
+function forumReactionMarkup(item, targetType, targetId, topicId) {
+  if (item.author_id === state.user?.user_id) return "";
+  return `<div class="forum-reactions" aria-label="论坛互动"><button class="${item.my_reaction === "agree" ? "active" : ""}" type="button" data-action="forum-react" data-target-type="${targetType}" data-target-id="${escapeAttr(targetId)}" data-topic="${escapeAttr(topicId)}" data-reaction="agree" data-active="${item.my_reaction === "agree" ? "true" : "false"}" aria-pressed="${item.my_reaction === "agree"}">赞同 <span>${formatNumber(item.agree_count || 0)}</span></button><button class="${item.my_reaction === "disagree" ? "active disagree" : ""}" type="button" data-action="forum-react" data-target-type="${targetType}" data-target-id="${escapeAttr(targetId)}" data-topic="${escapeAttr(topicId)}" data-reaction="disagree" data-active="${item.my_reaction === "disagree" ? "true" : "false"}" aria-pressed="${item.my_reaction === "disagree"}">反对 <span>${formatNumber(item.disagree_count || 0)}</span></button></div>`;
 }
 
 function forumComposerMarkup(sections) {
@@ -2317,8 +2322,8 @@ function renderForumTopic(payload, descriptor = parseRouteHash()) {
   const replies = payload.replies || [];
   const returnHash = descriptor.returnHash || "#forum";
   container.innerHTML = `<div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back" data-return="${escapeAttr(returnHash)}">‹ 返回${descriptor.returnHash ? "个人主页" : "论坛"}</button>${topic.can_manage ? `<div class="forum-manage-actions"><button class="text-button" type="button" data-action="forum-edit-topic" data-topic="${escapeAttr(topic.topic_id)}">编辑主题</button><button class="text-button danger" type="button" data-action="forum-delete-topic" data-topic="${escapeAttr(topic.topic_id)}">删除主题</button></div>` : ""}</div>
-    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span><time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(topic.author_id)}" aria-label="查看${escapeAttr(topic.author_name)}的个人资料">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主 · 查看主页</small></span></button><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div></article>
-    <section class="forum-replies"><div class="forum-replies-head"><h2>全部回复</h2><span>${formatNumber(topic.reply_count || replies.length)}</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(reply.author_id)}" aria-label="查看${escapeAttr(reply.author_name)}的个人资料">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${index + 1} 楼 · ${escapeHtml(formatDate(reply.created_at))}</small></span></button>${reply.can_manage && reply.status === "visible" ? `<div class="forum-manage-actions"><button class="text-button" type="button" data-action="forum-edit-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">编辑</button><button class="text-button danger" type="button" data-action="forum-delete-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">删除</button></div>` : ""}</div><p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p></article>`).join("") : `<div class="forum-reply-empty">还没有回复，来说说你的看法。</div>`}</section>
+    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span><time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(topic.author_id)}" aria-label="查看${escapeAttr(topic.author_name)}的个人资料">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主 · 查看主页</small></span></button><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div>${topic.status === "open" ? forumReactionMarkup(topic, "topic", topic.topic_id, topic.topic_id) : ""}</article>
+    <section class="forum-replies"><div class="forum-replies-head"><h2>全部回复</h2><span>${formatNumber(topic.reply_count || replies.length)}</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(reply.author_id)}" aria-label="查看${escapeAttr(reply.author_name)}的个人资料">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${index + 1} 楼 · ${escapeHtml(formatDate(reply.created_at))}</small></span></button>${reply.can_manage && reply.status === "visible" ? `<div class="forum-manage-actions"><button class="text-button" type="button" data-action="forum-edit-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">编辑</button><button class="text-button danger" type="button" data-action="forum-delete-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">删除</button></div>` : ""}</div><p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p>${reply.status === "visible" ? forumReactionMarkup(reply, "reply", reply.reply_id, topic.topic_id) : ""}</article>`).join("") : `<div class="forum-reply-empty">还没有回复，来说说你的看法。</div>`}</section>
     <form id="forum-reply-form" class="card forum-reply-form" data-form="forum-reply" data-topic="${escapeAttr(topic.topic_id)}"><label><span>参与讨论</span><textarea name="body" rows="4" minlength="2" maxlength="5000" required placeholder="写下你的观点、解题思路或补充"></textarea></label><div><small>回复对所有登录用户可见</small><button class="button button-primary" type="submit">发表回复</button></div></form>`;
 }
 
@@ -2395,6 +2400,22 @@ async function editForumReply(id, topicId) {
     await api(`/forum/replies/${encodeURIComponent(id)}`, { method: "PATCH", body: { body } });
     await renderForumPage({ ...parseRouteHash(), topicId });
     showToast("回复已更新");
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function reactForumContent(button) {
+  const targetType = button.dataset.targetType;
+  const targetId = button.dataset.targetId;
+  const topicId = button.dataset.topic;
+  if (!new Set(["topic", "reply"]).has(targetType) || !targetId || !topicId) return;
+  const resource = targetType === "topic" ? "topics" : "replies";
+  const active = button.dataset.active === "true";
+  try {
+    await api(`/forum/${resource}/${encodeURIComponent(targetId)}/reaction`, {
+      method: active ? "DELETE" : "PUT",
+      body: active ? {} : { reaction: button.dataset.reaction },
+    });
+    await renderForumPage({ ...parseRouteHash(), topicId });
   } catch (error) { showToast(error.message, "error"); }
 }
 
@@ -3117,6 +3138,7 @@ async function handleClick(event) {
   if (action === "forum-open-topic") return navigateHash(forumRouteHash({ topic: target.dataset.topic || "" }));
   if (action === "forum-back") return navigateHash(target.dataset.return || "#forum");
   if (action === "forum-load-more") return loadMoreForumTopics(target);
+  if (action === "forum-react") return reactForumContent(target);
   if (action === "forum-edit-topic") return editForumTopic(target.dataset.topic);
   if (action === "forum-delete-topic") return deleteForumTopic(target.dataset.topic);
   if (action === "forum-edit-reply") return editForumReply(target.dataset.reply, target.dataset.topic);

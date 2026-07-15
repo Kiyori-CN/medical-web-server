@@ -104,9 +104,11 @@ def test_public_profile_follow_messages_and_comment_interactions(
         body="希望把章节练习拆成稳定的每日任务。",
         author_name="Alice",
     )
-    bob_forum.create_reply(
+    forum_reply = bob_forum.create_reply(
         topic["topic_id"], body="可以按章节和错题数量分配。", author_name="BobUser"
     )
+    bob_forum.set_reaction("topic", topic["topic_id"], "agree")
+    alice_forum.set_reaction("reply", forum_reply["reply_id"], "agree")
     alice_dynamics = bob_store.public_profile(alice["user_id"])["dynamics"]
     bob_dynamics = alice_store.public_profile(bob["user_id"])["dynamics"]
     assert {item["kind"] for item in alice_dynamics} >= {"comment", "forum_topic"}
@@ -114,6 +116,8 @@ def test_public_profile_follow_messages_and_comment_interactions(
         item["kind"] == "forum_reply" and item["topic_id"] == topic["topic_id"]
         for item in bob_dynamics
     )
+    assert bob_store.public_profile(alice["user_id"])["stats"]["likes"] >= 2
+    assert alice_store.public_profile(bob["user_id"])["stats"]["likes"] >= 1
 
     message = bob_store.send_message(alice["user_id"], "一起复习这道题。")
     assert message["receiver_id"] == alice["user_id"]

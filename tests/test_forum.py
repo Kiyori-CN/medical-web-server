@@ -73,6 +73,38 @@ def test_forum_topic_reply_search_and_permissions(tmp_path: Path):
     )
     assert notification[4].startswith("论坛回复：细胞膜运输方式")
 
+    with pytest.raises(ValueError, match="自己的论坛内容"):
+        alice_store.set_reaction("topic", topic["topic_id"], "agree")
+
+    topic_reaction = bob_store.set_reaction("topic", topic["topic_id"], "agree")
+    assert topic_reaction["my_reaction"] == "agree"
+    assert topic_reaction["agree_count"] == 1
+    bob_store.set_reaction("topic", topic["topic_id"], "agree")
+    with sqlite3.connect(alice_store.database_path) as connection:
+        agree_notifications = connection.execute(
+            "SELECT COUNT(*) FROM notifications WHERE profile_id = ? AND kind = 'agree'",
+            (alice["user_id"],),
+        ).fetchone()[0]
+    assert agree_notifications == 1
+    switched = bob_store.set_reaction("topic", topic["topic_id"], "disagree")
+    assert switched["agree_count"] == 0
+    assert switched["disagree_count"] == 1
+    cleared = bob_store.clear_reaction("topic", topic["topic_id"])
+    assert cleared["my_reaction"] == ""
+    assert cleared["disagree_count"] == 0
+
+    reply_reaction = alice_store.set_reaction("reply", reply["reply_id"], "agree")
+    assert reply_reaction["agree_count"] == 1
+    with sqlite3.connect(alice_store.database_path) as connection:
+        reply_agree = connection.execute(
+            "SELECT body FROM notifications WHERE profile_id = ? AND kind = 'agree'",
+            (bob["user_id"],),
+        ).fetchone()[0]
+    assert reply_agree.startswith("赞同了你的论坛回复")
+    reacted_detail = alice_store.get_topic(topic["topic_id"], viewer_is_admin=True)
+    assert reacted_detail["replies"][0]["my_reaction"] == "agree"
+    assert reacted_detail["replies"][0]["agree_count"] == 1
+
     updated_topic = alice_store.update_topic(
         topic["topic_id"],
         title="细胞膜运输方式如何区分",
@@ -87,6 +119,8 @@ def test_forum_topic_reply_search_and_permissions(tmp_path: Path):
     with pytest.raises(ForumForbidden):
         bob_store.delete_topic(topic["topic_id"])
     assert alice_store.delete_reply(reply["reply_id"], viewer_is_admin=True) is True
+    with pytest.raises(ForumForbidden, match="不可互动"):
+        alice_store.set_reaction("reply", reply["reply_id"], "disagree")
     with pytest.raises(ForumForbidden, match="不能编辑"):
         bob_store.update_reply(reply["reply_id"], body="不能更新已删除回复")
     assert alice_store.delete_topic(topic["topic_id"], viewer_is_admin=True) is True

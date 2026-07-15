@@ -44,11 +44,23 @@ CREATE TABLE IF NOT EXISTS forum_replies (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS forum_reactions (
+    target_type TEXT NOT NULL CHECK (target_type IN ('topic', 'reply')),
+    target_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    reaction TEXT NOT NULL CHECK (reaction IN ('agree', 'disagree')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (target_type, target_id, profile_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_forum_topics_listing
 ON forum_topics(section_id, status, updated_at DESC, topic_id);
 
 CREATE INDEX IF NOT EXISTS idx_forum_replies_topic
 ON forum_replies(topic_id, status, created_at, reply_id);
+
+CREATE INDEX IF NOT EXISTS idx_forum_reactions_target
+ON forum_reactions(target_type, target_id, reaction);
 """
 
 DEFAULT_SECTIONS = (
@@ -160,14 +172,23 @@ class ForumStore:
                         WHERE r.topic_id = t.topic_id AND r.status = 'visible') AS reply_count,
                        COALESCE((SELECT MAX(r.updated_at) FROM forum_replies r
                                  WHERE r.topic_id = t.topic_id AND r.status = 'visible'),
-                                t.updated_at) AS last_activity
+                                t.updated_at) AS last_activity,
+                       (SELECT COUNT(*) FROM forum_reactions fr
+                        WHERE fr.target_type = 'topic' AND fr.target_id = t.topic_id
+                          AND fr.reaction = 'agree') AS agree_count,
+                       (SELECT COUNT(*) FROM forum_reactions fr
+                        WHERE fr.target_type = 'topic' AND fr.target_id = t.topic_id
+                          AND fr.reaction = 'disagree') AS disagree_count,
+                       COALESCE((SELECT fr.reaction FROM forum_reactions fr
+                                 WHERE fr.target_type = 'topic' AND fr.target_id = t.topic_id
+                                   AND fr.profile_id = ?), '') AS my_reaction
                 FROM forum_topics t
                 JOIN forum_sections s ON s.section_id = t.section_id
                 WHERE {where}
                 ORDER BY {ordering}
                 LIMIT ? OFFSET ?
                 """,
-                [*parameters, limit, offset],
+                [self.profile_id, *parameters, limit, offset],
             ).fetchall()
         return {"total": int(total), "limit": limit, "offset": offset, "items": [self._topic_summary(row) for row in rows]}
 
@@ -199,24 +220,42 @@ class ForumStore:
                 """
                 SELECT t.*, s.name AS section_name,
                        (SELECT COUNT(*) FROM forum_replies r
-                        WHERE r.topic_id = t.topic_id AND r.status = 'visible') AS reply_count
+                        WHERE r.topic_id = t.topic_id AND r.status = 'visible') AS reply_count,
+                       (SELECT COUNT(*) FROM forum_reactions fr
+                        WHERE fr.target_type = 'topic' AND fr.target_id = t.topic_id
+                          AND fr.reaction = 'agree') AS agree_count,
+                       (SELECT COUNT(*) FROM forum_reactions fr
+                        WHERE fr.target_type = 'topic' AND fr.target_id = t.topic_id
+                          AND fr.reaction = 'disagree') AS disagree_count,
+                       COALESCE((SELECT fr.reaction FROM forum_reactions fr
+                                 WHERE fr.target_type = 'topic' AND fr.target_id = t.topic_id
+                                   AND fr.profile_id = ?), '') AS my_reaction
                 FROM forum_topics t JOIN forum_sections s ON s.section_id = t.section_id
                 WHERE t.topic_id = ?
                 """,
-                (topic_id,),
+                (self.profile_id, topic_id),
             ).fetchone()
             if row is None or (row["status"] != "open" and not viewer_is_admin and row["author_id"] != self.profile_id):
                 raise ForumNotFound("论坛主题不存在")
             replies = connection.execute(
                 """
-                SELECT reply_id, topic_id, author_id, author_name, body,
-                       parent_reply_id, status, created_at, updated_at
-                FROM forum_replies
-                WHERE topic_id = ? AND (status = 'visible' OR author_id = ? OR ? = 1)
-                ORDER BY created_at, rowid
+                SELECT r.reply_id, r.topic_id, r.author_id, r.author_name, r.body,
+                       r.parent_reply_id, r.status, r.created_at, r.updated_at,
+                       (SELECT COUNT(*) FROM forum_reactions fr
+                        WHERE fr.target_type = 'reply' AND fr.target_id = r.reply_id
+                          AND fr.reaction = 'agree') AS agree_count,
+                       (SELECT COUNT(*) FROM forum_reactions fr
+                        WHERE fr.target_type = 'reply' AND fr.target_id = r.reply_id
+                          AND fr.reaction = 'disagree') AS disagree_count,
+                       COALESCE((SELECT fr.reaction FROM forum_reactions fr
+                                 WHERE fr.target_type = 'reply' AND fr.target_id = r.reply_id
+                                   AND fr.profile_id = ?), '') AS my_reaction
+                FROM forum_replies r
+                WHERE r.topic_id = ? AND (r.status = 'visible' OR r.author_id = ? OR ? = 1)
+                ORDER BY r.created_at, r.rowid
                 LIMIT 500
                 """,
-                (topic_id, self.profile_id, int(viewer_is_admin)),
+                (self.profile_id, topic_id, self.profile_id, int(viewer_is_admin)),
             ).fetchall()
         return {"topic": self._topic_detail(row, viewer_is_admin), "replies": [self._reply(row, viewer_is_admin) for row in replies]}
 
@@ -333,6 +372,48 @@ class ForumStore:
             connection.commit()
         return cursor.rowcount > 0
 
+    def set_reaction(
+        self, target_type: str, target_id: str, reaction: object
+    ) -> dict[str, Any]:
+        target_type = _reaction_target(target_type)
+        target_id = display_text(target_id)
+        reaction = display_text(reaction).lower()
+        if reaction not in {"agree", "disagree"}:
+            raise ValueError("论坛反应类型无效")
+        with self._connect() as connection:
+            target = self._reaction_target_row(connection, target_type, target_id)
+            if target["author_id"] == self.profile_id:
+                raise ValueError("不能对自己的论坛内容表态")
+            previous = connection.execute(
+                "SELECT reaction FROM forum_reactions WHERE target_type = ? AND target_id = ? AND profile_id = ?",
+                (target_type, target_id, self.profile_id),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO forum_reactions(target_type, target_id, profile_id, reaction, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(target_type, target_id, profile_id)
+                DO UPDATE SET reaction = excluded.reaction, created_at = excluded.created_at
+                """,
+                (target_type, target_id, self.profile_id, reaction, _utc_now()),
+            )
+            if reaction == "agree" and (previous is None or previous["reaction"] != "agree"):
+                self._notify_agree(connection, target_type, target_id, target)
+            connection.commit()
+            return self._reaction_payload(connection, target_type, target_id)
+
+    def clear_reaction(self, target_type: str, target_id: str) -> dict[str, Any]:
+        target_type = _reaction_target(target_type)
+        target_id = display_text(target_id)
+        with self._connect() as connection:
+            self._reaction_target_row(connection, target_type, target_id)
+            connection.execute(
+                "DELETE FROM forum_reactions WHERE target_type = ? AND target_id = ? AND profile_id = ?",
+                (target_type, target_id, self.profile_id),
+            )
+            connection.commit()
+            return self._reaction_payload(connection, target_type, target_id)
+
     def _topic_row(self, connection: sqlite3.Connection, topic_id: str) -> sqlite3.Row:
         row = connection.execute("SELECT * FROM forum_topics WHERE topic_id = ?", (display_text(topic_id),)).fetchone()
         if row is None:
@@ -344,6 +425,50 @@ class ForumStore:
         if row is None:
             raise ForumNotFound("论坛回复不存在")
         return row
+
+    def _reaction_target_row(
+        self, connection: sqlite3.Connection, target_type: str, target_id: str
+    ) -> sqlite3.Row:
+        if target_type == "topic":
+            row = self._topic_row(connection, target_id)
+            if row["status"] != "open":
+                raise ForumForbidden("该主题不可互动")
+            return row
+        row = connection.execute(
+            """
+            SELECT r.*, t.title AS topic_title, t.status AS topic_status
+            FROM forum_replies r JOIN forum_topics t ON t.topic_id = r.topic_id
+            WHERE r.reply_id = ?
+            """,
+            (target_id,),
+        ).fetchone()
+        if row is None:
+            raise ForumNotFound("论坛回复不存在")
+        if row["status"] != "visible" or row["topic_status"] != "open":
+            raise ForumForbidden("该回复不可互动")
+        return row
+
+    def _reaction_payload(
+        self, connection: sqlite3.Connection, target_type: str, target_id: str
+    ) -> dict[str, Any]:
+        rows = connection.execute(
+            "SELECT reaction, COUNT(*) AS count FROM forum_reactions WHERE target_type = ? AND target_id = ? GROUP BY reaction",
+            (target_type, target_id),
+        ).fetchall()
+        selected = connection.execute(
+            "SELECT reaction FROM forum_reactions WHERE target_type = ? AND target_id = ? AND profile_id = ?",
+            (target_type, target_id, self.profile_id),
+        ).fetchone()
+        payload = {
+            "target_type": target_type,
+            "target_id": target_id,
+            "my_reaction": selected["reaction"] if selected else "",
+            "agree_count": 0,
+            "disagree_count": 0,
+        }
+        for row in rows:
+            payload[f"{row['reaction']}_count"] = int(row["count"])
+        return payload
 
     def _require_owner(self, author_id: str, viewer_is_admin: bool) -> None:
         if author_id != self.profile_id and not viewer_is_admin:
@@ -387,6 +512,39 @@ class ForumStore:
                 ),
             )
 
+    def _notify_agree(
+        self,
+        connection: sqlite3.Connection,
+        target_type: str,
+        target_id: str,
+        target: sqlite3.Row,
+    ) -> None:
+        if target["author_id"] == self.profile_id:
+            return
+        notifications_available = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notifications'"
+        ).fetchone()
+        if notifications_available is None:
+            return
+        label = "论坛主题" if target_type == "topic" else "论坛回复"
+        title = target["title"] if target_type == "topic" else target["topic_title"]
+        connection.execute(
+            """
+            INSERT INTO notifications(
+                notification_id, profile_id, kind, actor_id,
+                comment_id, body, created_at
+            ) VALUES (?, ?, 'agree', ?, ?, ?, ?)
+            """,
+            (
+                f"ntf_{secrets.token_hex(10)}",
+                target["author_id"],
+                self.profile_id,
+                target_id,
+                f"赞同了你的{label}：{display_text(title)[:140]}",
+                _utc_now(),
+            ),
+        )
+
     def _topic_summary(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["preview"] = display_text(row["body"])[:160]
@@ -405,3 +563,10 @@ class ForumStore:
             payload["body"] = "该回复已被删除"
         payload["can_manage"] = row["author_id"] == self.profile_id or viewer_is_admin
         return payload
+
+
+def _reaction_target(value: object) -> str:
+    target = display_text(value).lower()
+    if target not in {"topic", "reply"}:
+        raise ValueError("论坛互动目标无效")
+    return target

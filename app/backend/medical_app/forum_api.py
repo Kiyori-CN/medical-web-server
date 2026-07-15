@@ -85,6 +85,19 @@ def create_forum_blueprint(database_path) -> Blueprint:
     def delete_topic(topic_id: str):
         return jsonify({"removed": store().delete_topic(topic_id, viewer_is_admin=is_admin())})
 
+    @blueprint.put("/topics/<topic_id>/reaction")
+    @login_required
+    @csrf_required
+    def react_topic(topic_id: str):
+        data = _json_object()
+        return jsonify(store().set_reaction("topic", topic_id, data.get("reaction", "")))
+
+    @blueprint.delete("/topics/<topic_id>/reaction")
+    @login_required
+    @csrf_required
+    def clear_topic_reaction(topic_id: str):
+        return jsonify(store().clear_reaction("topic", topic_id))
+
     @blueprint.post("/topics/<topic_id>/replies")
     @login_required
     @csrf_required
@@ -115,6 +128,19 @@ def create_forum_blueprint(database_path) -> Blueprint:
     @csrf_required
     def delete_reply(reply_id: str):
         return jsonify({"removed": store().delete_reply(reply_id, viewer_is_admin=is_admin())})
+
+    @blueprint.put("/replies/<reply_id>/reaction")
+    @login_required
+    @csrf_required
+    def react_reply(reply_id: str):
+        data = _json_object()
+        return jsonify(store().set_reaction("reply", reply_id, data.get("reaction", "")))
+
+    @blueprint.delete("/replies/<reply_id>/reaction")
+    @login_required
+    @csrf_required
+    def clear_reply_reaction(reply_id: str):
+        return jsonify(store().clear_reaction("reply", reply_id))
 
     return blueprint
 

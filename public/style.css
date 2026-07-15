@@ -982,6 +982,11 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 .forum-author strong { font-size: 11px; }
 .forum-author small { color: var(--muted); font-size: 9px; }
 .forum-body { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--ink); font-size: 14px; line-height: 1.85; overflow-wrap: anywhere; }
+.forum-reactions { display: flex; align-items: center; gap: 7px; margin-top: 14px; }
+.forum-reactions button { min-height: 32px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 9px; padding: 0 10px; color: var(--muted); background: var(--surface); cursor: pointer; font-size: 10px; font-weight: 700; }
+.forum-reactions button:hover, .forum-reactions button.active { border-color: #bfdccc; color: #27624b; background: #edf8f2; }
+.forum-reactions button.active.disagree { border-color: #efc3c5; color: #99464a; background: #fff2f2; }
+.forum-reactions button span { font-variant-numeric: tabular-nums; }
 .forum-replies { display: grid; gap: 9px; margin-top: 22px; }
 .forum-replies-head { display: flex; align-items: center; justify-content: space-between; padding: 0 2px; }
 .forum-replies-head h2 { margin: 0; font-size: 17px; }
@@ -989,6 +994,7 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 .forum-reply { padding: 15px 17px; }
 .forum-reply-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .forum-reply > p { margin: 13px 0 0 43px; color: var(--ink-soft); font-size: 13px; line-height: 1.75; overflow-wrap: anywhere; }
+.forum-reply > .forum-reactions { margin-left: 43px; }
 .forum-reply-empty { padding: 42px 20px; color: var(--muted); text-align: center; font-size: 12px; }
 .forum-reply-form { display: grid; gap: 11px; margin-top: 15px; padding: 17px; }
 .forum-reply-form > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -1016,6 +1022,7 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
   .forum-topic-card, .forum-topic-detail { padding: 15px; }
   .forum-topic-detail h1 { font-size: 23px; }
   .forum-reply > p { margin-left: 0; }
+  .forum-reply > .forum-reactions { margin-left: 0; }
   .forum-composer-actions, .forum-reply-form > div { align-items: flex-end; }
   .forum-composer-actions > span, .forum-reply-form small { max-width: 56%; line-height: 1.5; }
 }

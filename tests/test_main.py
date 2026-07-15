@@ -172,6 +172,15 @@ def test_main_auth_roles_health_assets_and_practice(
         headers=_csrf(client),
         json={},
     ).status_code == 200
+    forum_topic = client.post(
+        "/api/forum/topics",
+        headers=_csrf(client),
+        json={
+            "section_id": "study",
+            "title": "集成测试论坛主题",
+            "body": "验证论坛互动 API 的鉴权与计数。",
+        },
+    ).get_json()
     search = client.post(
         "/api/search",
         json={"query": "细胞膜运输", "include_solution": False},
@@ -199,6 +208,21 @@ def test_main_auth_roles_health_assets_and_practice(
     assert ordinary.get("/api/admin/vectors").status_code == 403
     assert ordinary.get("/api/admin/catalog/export?format=jsonl").status_code == 403
     assert ordinary.get("/api/admin/catalog/imports").status_code == 403
+    assert ordinary.put(
+        f"/api/forum/topics/{forum_topic['topic_id']}/reaction",
+        json={"reaction": "agree"},
+    ).status_code == 403
+    forum_reaction = ordinary.put(
+        f"/api/forum/topics/{forum_topic['topic_id']}/reaction",
+        headers=_csrf(ordinary),
+        json={"reaction": "agree"},
+    )
+    assert forum_reaction.status_code == 200
+    assert forum_reaction.get_json()["agree_count"] == 1
+    forum_detail = client.get(
+        f"/api/forum/topics/{forum_topic['topic_id']}"
+    ).get_json()
+    assert forum_detail["topic"]["agree_count"] == 1
     assert ordinary.get("/api/settings").status_code == 200
     wrong_password = ordinary.post(
         "/api/auth/password",
