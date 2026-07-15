@@ -88,7 +88,7 @@ erDiagram
 
 禁止把操作系统、SQLite 或普通字符串排序直接暴露为题库顺序。
 
-`/api/library/tree` 从 catalog 内存目录缓存生成指定父路径下的只读嵌套子树，目录与文件的每一层仍调用同一医学排序规则。前端分类导航的考试与题库类型使用固定宽度、自动换行的多行标签，每组可独立展开或收起且手机端不使用横向滑动；只有用户展开某个学科时才请求对应子树，避免一次传输全部 2,127 个文件。树节点继续保留完整相对路径、collection ID、题数和文件扩展名。题库顶层路径固定使用“专硕考研、学硕考研、执业医师、三基考试”，不附加括号内的考试说明。
+`/api/library/tree` 从 catalog 内存目录缓存生成指定父路径下的只读嵌套子树，目录与文件的每一层仍调用同一医学排序规则。前端分类导航的考试与题库类型使用固定宽度、自动换行的多行标签，每组可独立展开或收起且手机端不使用横向滑动；只有用户展开某个学科时才请求对应子树，避免一次传输全部 2,127 个文件。异步切换标签或展开目录时保留原内容直至新数据就绪，并恢复用户当前滚动位置，不能因临时加载占位导致页面跳回顶部。树节点继续保留完整相对路径、collection ID、题数和文件扩展名。题库顶层路径固定使用“专硕考研、学硕考研、执业医师、三基考试”，不附加括号内的考试说明。
 
 ## Catalog 构建
 
@@ -159,6 +159,8 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 
 收藏切换以 `(profile_id, kind, item_key)` 唯一键为事实源，重复操作不能生成重复记录。删除收藏或错题只修改当前账号的 `study_items`，不修改题库、历史答题记录或其他账号数据。密码修改与管理员密码重置会删除该用户的全部登录会话。
 
+前端将错题、收藏、笔记、评论和点赞视为同一组个人学习页面，但五个入口只在题库顶部呈现，二级页不再重复五项导航。题库返回目标写入二级页 hash；从个人内容进入原题时再把完整列表 hash 写入会话地址，使刷新后的显式返回仍按“原题 → 列表 → 题库”恢复。评论、笔记和点赞 feed 使用 `limit + offset` 分批读取；任何收藏、错题、笔记、评论或赞同增删都会使前端今日统计缓存失效。
+
 `collection_question_progress` 以 `(profile_id, collection_id, occurrence_id)` 唯一定位题号目录状态。提交答案时同步更新该投影；点击题库重置只删除当前账号在当前 collection 的投影行。`practice_sessions` 和 `practice_session_questions` 仍保留为历史试卷，`question_progress`、`study_items` 和 `question_comments` 均不随文件重置删除。同一道规范题出现在其他文件时也不会被连带重置。
 
 `question_comments` 绑定具体 `occurrence_id`，同时保存 `question_id`、作者账号 ID、作者名快照、正文和时间。评论不写入 catalog、不依赖用户外键；所有登录用户可查看和发表，只有作者本人或管理员可以删除，正文去除首尾空白且最长 2000 字。
@@ -167,7 +169,7 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 
 社区状态补充实体：`comment_reactions` 以 `(comment_id, profile_id)` 保存赞同或反对；`question_comments.parent_comment_id` 保存回复关系；`user_follows` 保存单向关注与粉丝关系；`direct_messages` 保存账号间私信；`notifications` 保存系统通知、回复和收到赞同。五类数据都只在本地 state 中按账号隔离，评论正文仍不进入 FTS 或向量文本。`users` 的 birthday/gender/school/major/ip_location 与 privacy_json 用于公开个人资料和字段可见控制。
 
-题库根目录的今日统计通过 `/api/study/today-summary` 从当前账号的会话、答题、收藏、错题、笔记、评论和赞同记录实时聚合；管理员运行概览继续从 catalog 读取全库统计，普通题库页面不会展示 64,078 等全局数字。
+题库页的紧凑今日统计通过 `/api/study/today-summary` 从当前账号的会话、答题、收藏、错题、笔记、评论和赞同记录实时聚合；目录模式的所有文件夹层级和分类模式共用同一顶部统计与五个入口。更新时间紧邻标题右侧，分类导航只保留标题和分类数量。管理员运行概览继续从 catalog 读取全库统计，普通题库页面不会展示 64,078 等全局数字。
 
 管理员构建通过 `medical_app.vector_task` 独立进程执行，`state/vector-operation.json` 记录 queued/running/complete/failed 与已完成数量。相同 API URL、模型、维度和文本版本的旧 manifest 可作为增量源；按 `question_id` 复制未变化行，只有新增或变化题目进入上游批次。删除向量只处理 `vector-current.json` 和 `vector-indexes/`，catalog、原始数据与用户 state 永不删除。
 

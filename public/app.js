@@ -19,6 +19,7 @@ const state = {
   libraryGuideExpanded: new Set(),
   libraryGuideCache: {},
   libraryGuideLoading: new Set(),
+  libraryRenderToken: 0,
   outline: null,
   outlineMode: "practice",
   session: null,
@@ -26,6 +27,8 @@ const state = {
   sessionReturnTarget: null,
   adminReturnHash: "#library",
   accountReturnHash: "#library",
+  studyReturnHash: "#library",
+  profileReturnHash: "#profile",
   drafts: {},
   timerHandle: null,
   selectionTimer: null,
@@ -50,6 +53,9 @@ const state = {
   myComments: null,
   myNotes: null,
   myLikes: null,
+  messageTab: "system",
+  messageData: null,
+  theme: window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light",
   avatarCrop: null,
   providerModels: {
     embedding: { status: "idle", items: [], open: false, error: "" },
@@ -70,6 +76,7 @@ document.addEventListener("keydown", handlePracticeKeydown);
 window.addEventListener("resize", handlePracticeResize);
 
 async function boot() {
+  applyTheme();
   try {
     const [setup, me] = await Promise.all([
       api("/auth/setup", { authRedirect: false }),
@@ -173,6 +180,7 @@ async function enterApp(user) {
   state.myComments = null;
   state.myNotes = null;
   state.myLikes = null;
+  state.messageData = null;
   $("#auth-page").hidden = true;
   $("#app-shell").hidden = false;
   syncUserChrome(user);
@@ -201,7 +209,7 @@ async function route() {
     setActiveNav("");
     const sessionId = target.slice("session/".length);
     if (!state.session || state.session.session_id !== sessionId) {
-      await loadSession(sessionId);
+      await loadSession(sessionId, { returnHash: descriptor.returnHash });
     } else {
       renderPractice();
       startTimer();
@@ -221,7 +229,13 @@ async function route() {
   }
   stopTimer();
   showPage(page);
-  setActiveNav(["profile-detail", "settings", "messages", "my-comments", "notes", "my-likes", "favorites", "wrong"].includes(page) ? "profile" : page);
+  const studyPages = ["my-comments", "notes", "my-likes", "favorites", "wrong"];
+  const accountPages = ["profile-detail", "settings", "messages"];
+  if (studyPages.includes(page)) {
+    state.studyReturnHash = descriptor.returnHash || "#library";
+  }
+  const studyNav = state.studyReturnHash.startsWith("#library") ? "library" : "profile";
+  setActiveNav(studyPages.includes(page) ? studyNav : accountPages.includes(page) ? "profile" : page);
   if (page === "library" || page === "favorites" || page === "wrong") {
     state.sessionReturnTarget = null;
     state.libraryPath[page] = descriptor.path;
@@ -229,7 +243,7 @@ async function route() {
       renderLibraryShell(page);
       await openCollection(page, descriptor.collectionId, descriptor.path);
     } else {
-      if (page === "library" && !descriptor.path) {
+      if (page === "library") {
         try { state.todaySummary = await api("/study/today-summary"); } catch (error) { state.todaySummary = null; }
       }
       await renderLibrary(page);
@@ -275,10 +289,27 @@ function setActiveNav(name) {
 }
 
 function syncUserChrome(user) {
-  $("#profile-name").textContent = user.username;
-  $("#profile-role").textContent = user.role === "admin" ? "管理员" : "普通用户";
-  $("#profile-avatar").innerHTML = avatarVisual(user, user.username);
-  $("#admin-entry").hidden = user.role !== "admin";
+  document.body.dataset.userRole = user.role === "admin" ? "admin" : "user";
+}
+
+function applyTheme() {
+  const dark = state.theme === "dark";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  document.documentElement.style.colorScheme = dark ? "dark" : "light";
+  const color = $("meta[name='theme-color']");
+  if (color) color.content = dark ? "#0f1218" : "#f5f6fa";
+  const button = $("#theme-toggle");
+  if (button) {
+    const label = dark ? "切换日间模式" : "切换夜间模式";
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  }
+}
+
+function toggleTheme() {
+  state.theme = state.theme === "dark" ? "light" : "dark";
+  applyTheme();
+  savePreferences();
 }
 
 function avatarVisual(entity, fallbackName = "用户") {
@@ -298,7 +329,35 @@ function parseRouteHash() {
     path: params.get("path") || "",
     collectionId: params.get("collection") || "",
     userId: params.get("user") || "",
+    returnHash: normalizeStudyReturnHash(params.get("return") || ""),
   };
+}
+
+function normalizeStudyReturnHash(value, fallback = "") {
+  const candidate = String(value || "").trim();
+  if (!candidate.startsWith("#")) return fallback;
+  const target = candidate.slice(1).split("?", 1)[0];
+  const allowed = new Set(["library", "profile", "favorites", "wrong", "my-comments", "notes", "my-likes"]);
+  return allowed.has(target) ? candidate : fallback;
+}
+
+function studyReturnLabel(hash = state.studyReturnHash) {
+  const target = String(hash || "").replace(/^#/, "").split("?", 1)[0];
+  return ({
+    library: "题库",
+    profile: "我的",
+    favorites: "收藏",
+    wrong: "错题",
+    "my-comments": "我的评论",
+    notes: "我的笔记",
+    "my-likes": "我的点赞",
+  })[target] || "上一页";
+}
+
+function internalReturnLabel(hash) {
+  const target = String(hash || "").replace(/^#/, "").split("?", 1)[0];
+  if (target.startsWith("session/")) return "题目";
+  return ({ search: "搜题", "profile-detail": "个人资料", messages: "消息" })[target] || studyReturnLabel(hash);
 }
 
 function libraryRouteHash(kind, path = "", collectionId = "") {
@@ -337,32 +396,46 @@ function emptyMarkup(title, copy, icon = "·") {
   return `<div class="card empty-state"><span class="empty-icon" aria-hidden="true">${icon}</span><h3>${escapeHtml(title)}</h3><p>${escapeHtml(copy)}</p></div>`;
 }
 
-async function renderLibrary(kind) {
+async function renderLibrary(kind, { preserveContent = false, preserveScroll = false } = {}) {
   state.outline = null;
-  renderLibraryShell(kind);
+  const scrollTop = preserveScroll ? window.scrollY : null;
+  const requestToken = kind === "library" ? ++state.libraryRenderToken : null;
+  if (preserveContent) syncLibraryViewToolbar();
+  else renderLibraryShell(kind);
   if (kind === "library" && state.libraryViewMode === "guided") {
-    await renderGuidedLibrary();
+    await renderGuidedLibrary({ preserveScroll, requestToken });
     return;
   }
-  const container = $(`#page-${kind}`);
   const parent = state.libraryPath[kind] || "";
   try {
     const path = kind === "library"
       ? `/library?parent=${encodeURIComponent(parent)}`
       : `/study/${kind}/library?parent=${encodeURIComponent(parent)}`;
     const payload = await api(path);
+    if (kind === "library" && (requestToken !== state.libraryRenderToken || state.libraryViewMode !== "folders")) return;
     renderLibraryPayload(kind, payload);
+    restoreLibraryScroll(scrollTop);
   } catch (error) {
+    if (kind === "library" && (requestToken !== state.libraryRenderToken || state.libraryViewMode !== "folders")) return;
     $(`#${kind}-content`).innerHTML = emptyMarkup("目录读取失败", error.message, "!");
+    restoreLibraryScroll(scrollTop);
   }
 }
 
 function renderLibraryShell(kind) {
   const container = $(`#page-${kind}`);
   const meta = libraryMeta(kind);
-  const heading = kind === "library" ? "" : `<div class="page-header page-header-compact"><div class="page-title"><p class="eyebrow">${meta.eyebrow}</p></div></div>`;
+  const heading = kind === "library" ? "" : secondaryPageHeader(meta.eyebrow);
   const viewToggle = kind === "library" ? `<div class="library-view-toolbar"><span>浏览方式</span><div class="library-view-switch" role="group" aria-label="题库浏览方式"><button class="${state.libraryViewMode === "folders" ? "active" : ""}" type="button" data-action="library-view-mode" data-mode="folders"><span aria-hidden="true">▦</span>目录</button><button class="${state.libraryViewMode === "guided" ? "active" : ""}" type="button" data-action="library-view-mode" data-mode="guided"><span aria-hidden="true">☷</span>分类</button></div></div>` : "";
   container.innerHTML = `${heading}${viewToggle}<div id="${kind}-content">${loadingMarkup("正在读取题库目录")}</div>`;
+}
+
+function syncLibraryViewToolbar() {
+  $$('[data-action="library-view-mode"]').forEach((button) => {
+    const active = button.dataset.mode === state.libraryViewMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
 }
 
 function libraryMeta(kind) {
@@ -373,15 +446,20 @@ function libraryMeta(kind) {
 
 function renderLibraryPayload(kind, payload) {
   const content = $(`#${kind}-content`);
-  const stats = kind === "library" && !payload.parent ? renderTodaySummary() : "";
+  const stats = kind === "library" ? renderTodaySummary() : "";
+  const meta = libraryMeta(kind);
   const breadcrumbs = (payload.breadcrumbs || []).map((item, index) => `
     ${index ? "<span>/</span>" : ""}
-    <button type="button" data-action="library-breadcrumb" data-kind="${kind}" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</button>`).join("");
+    <button type="button" data-action="library-breadcrumb" data-kind="${kind}" data-path="${escapeAttr(item.path)}">${escapeHtml(index === 0 && kind !== "library" ? `全部${meta.eyebrow}` : item.name)}</button>`).join("");
   const items = [
     ...(payload.directories || []).map((item) => libraryItem(item, kind, "directory")),
     ...(payload.collections || []).map((item) => libraryItem(item, kind, "collection")),
   ].join("");
-  const total = kind === "library" ? "" : `<span>${formatNumber(payload.total_saved || 0)} 道已归档</span>`;
+  const currentSaved = kind === "library" ? 0 : [
+    ...(payload.directories || []).map((item) => Number(item.question_count || 0)),
+    ...(payload.collections || []).map((item) => Number(item.saved_count ?? item.question_count ?? 0)),
+  ].reduce((sum, value) => sum + value, 0);
+  const total = kind === "library" ? "" : `<span>${payload.parent ? `当前 ${formatNumber(currentSaved)} · ` : ""}共 ${formatNumber(payload.total_saved || 0)} 道</span>`;
   content.innerHTML = `${stats}
     <div class="breadcrumbs">${breadcrumbs}${total}</div>
     ${items ? `<div class="library-grid">${items}</div>` : emptyMarkup(
@@ -391,22 +469,39 @@ function renderLibraryPayload(kind, payload) {
     )}`;
 }
 
-async function renderGuidedLibrary() {
+function restoreLibraryScroll(scrollTop) {
+  if (!Number.isFinite(scrollTop)) return;
+  requestAnimationFrame(() => {
+    const maximum = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    window.scrollTo({ top: Math.min(scrollTop, maximum), behavior: "auto" });
+  });
+}
+
+async function renderGuidedLibrary({ preserveScroll = false, requestToken = null } = {}) {
+  if (state.libraryViewMode !== "guided") return;
+  const activeToken = requestToken ?? ++state.libraryRenderToken;
+  const isCurrent = () => activeToken === state.libraryRenderToken && state.libraryViewMode === "guided";
   const content = $("#library-content");
   if (!content) return;
-  content.innerHTML = loadingMarkup("正在整理分类导航");
+  const scrollTop = preserveScroll ? window.scrollY : null;
+  if (!preserveScroll || !content.firstElementChild) {
+    content.innerHTML = loadingMarkup("正在整理分类导航");
+  }
   try {
     const currentParts = String(state.libraryPath.library || "").split("/").filter(Boolean);
     const root = await api("/library?parent=");
+    if (!isCurrent()) return;
     const exams = root.directories || [];
     const requestedExam = state.libraryGuideExam || currentParts[0] || exams[0]?.path || "";
     const exam = exams.find((item) => item.path === requestedExam) || exams[0];
     if (!exam) {
       content.innerHTML = emptyMarkup("暂无题库分类", "当前题库没有可用目录。", "▦");
+      restoreLibraryScroll(scrollTop);
       return;
     }
     state.libraryGuideExam = exam.path;
     const examPayload = await api(`/library?parent=${encodeURIComponent(exam.path)}`);
+    if (!isCurrent()) return;
     const kinds = examPayload.directories || [];
     const requestedKind = state.libraryGuideKind || (currentParts[0] === exam.name && currentParts[1] ? `${exam.path}/${currentParts[1]}` : "") || kinds[0]?.path || "";
     const collectionKind = kinds.find((item) => item.path === requestedKind) || kinds[0];
@@ -414,10 +509,14 @@ async function renderGuidedLibrary() {
     const branchPayload = collectionKind
       ? await api(`/library?parent=${encodeURIComponent(collectionKind.path)}`)
       : examPayload;
-    const lead = !state.libraryPath.library ? renderTodaySummary() : "";
-    content.innerHTML = `${lead}<section class="card guided-library"><div class="guided-library-head"><div><h2>分类导航</h2><p>按考试与题库类型定位，再展开学科查看原始文件。</p></div><span>${formatNumber(branchPayload.directories?.length || branchPayload.collections?.length || 0)} 个分类</span></div>${renderGuideRail("考试", exams, exam.path, "exam")}${renderGuideRail("题库", kinds, collectionKind?.path || "", "kind")}<div class="guided-library-body">${renderGuideBranches(branchPayload)}</div></section>`;
+    if (!isCurrent()) return;
+    const lead = renderTodaySummary();
+    content.innerHTML = `${lead}<section class="card guided-library"><div class="guided-library-head"><h2>分类导航</h2><span>${formatNumber(branchPayload.directories?.length || branchPayload.collections?.length || 0)} 个分类</span></div>${renderGuideRail("考试", exams, exam.path, "exam")}${renderGuideRail("题库", kinds, collectionKind?.path || "", "kind")}<div class="guided-library-body">${renderGuideBranches(branchPayload)}</div></section>`;
+    restoreLibraryScroll(scrollTop);
   } catch (error) {
+    if (!isCurrent()) return;
     content.innerHTML = emptyMarkup("分类导航读取失败", error.message, "!");
+    restoreLibraryScroll(scrollTop);
   }
 }
 
@@ -451,7 +550,7 @@ function renderGuideTreeNode(node, depth = 0) {
 
 function renderGuideFiles(collections) {
   if (!collections.length) return "";
-  return `<div class="guide-file-list">${collections.map((item) => `<button type="button" data-action="open-collection" data-kind="library" data-parent-path="${escapeAttr(collectionParentPath(item.relative_path || ""))}" data-id="${escapeAttr(item.collection_id || "")}"><span class="guide-file-icon" aria-hidden="true">卷</span><span><strong>${escapeHtml(String(item.name || "").replace(/\.xlsx$/i, ""))}</strong><small>${formatNumber(item.question_count || 0)} 题</small></span><b aria-hidden="true">›</b></button>`).join("")}</div>`;
+  return `<div class="guide-file-list">${collections.map((item) => `<button type="button" data-action="open-collection" data-kind="library" data-parent-path="${escapeAttr(collectionParentPath(item.relative_path || ""))}" data-id="${escapeAttr(item.collection_id || "")}"><span class="guide-file-copy"><strong>${escapeHtml(String(item.name || "").replace(/\.xlsx$/i, ""))}</strong><small>${formatNumber(item.question_count || 0)} 题</small></span><b aria-hidden="true">›</b></button>`).join("")}</div>`;
 }
 
 async function selectGuideLevel(level, path) {
@@ -464,20 +563,20 @@ async function selectGuideLevel(level, path) {
     state.libraryGuideKind = path;
     state.libraryGuideExpanded.clear();
   }
-  await renderGuidedLibrary();
+  await renderGuidedLibrary({ preserveScroll: true });
 }
 
 async function toggleGuideBranch(path) {
   if (!path) return;
   if (state.libraryGuideExpanded.has(path)) {
     state.libraryGuideExpanded.delete(path);
-    await renderGuidedLibrary();
+    await renderGuidedLibrary({ preserveScroll: true });
     return;
   }
   state.libraryGuideExpanded.add(path);
   if (!state.libraryGuideCache[path]) {
     state.libraryGuideLoading.add(path);
-    await renderGuidedLibrary();
+    await renderGuidedLibrary({ preserveScroll: true });
     try {
       state.libraryGuideCache[path] = await api(`/library/tree?parent=${encodeURIComponent(path)}`);
     } catch (error) {
@@ -487,7 +586,7 @@ async function toggleGuideBranch(path) {
       state.libraryGuideLoading.delete(path);
     }
   }
-  await renderGuidedLibrary();
+  await renderGuidedLibrary({ preserveScroll: true });
 }
 
 function renderTodaySummary() {
@@ -508,16 +607,28 @@ function renderTodaySummary() {
     ["my-likes", "点赞", "♧", "likes", "likes"],
   ];
   return `<section class="today-summary-card card" aria-label="今日统计">
-    <div class="today-summary-head"><div><h2>今日统计</h2><span>更新时间 ${updated}</span></div><span class="today-summary-arrow" aria-hidden="true">›</span></div>
+    <div class="today-summary-head"><h2>今日统计</h2><time>更新时间 ${updated}</time></div>
     <div class="today-summary-metrics">${metrics.map(([key, value, label], index) => index === 0
       ? `<div class="today-score"><span>${escapeHtml(String(value))}</span><small>${label}</small></div>`
       : `<div class="today-metric"><strong>${escapeHtml(String(value))}</strong><small>${label}</small></div>`).join("")}</div>
   </section>
-  <nav class="today-shortcuts card" aria-label="学习入口">${shortcuts.map(([page, label, icon, palette, metricKey]) => `<a class="today-shortcut" href="#${page}" data-nav="${page}"><span class="today-shortcut-icon shortcut-${palette}">${icon}</span><strong>${label}</strong><small>${formatNumber(summary.totals?.[metricKey] || 0)}</small></a>`).join("")}</nav>`;
+  <nav class="today-shortcuts card" aria-label="学习入口">${shortcuts.map(([page, label, icon, palette, metricKey]) => `<a class="today-shortcut" href="${escapeAttr(studyPageHash(page, "#library"))}" data-action="open-personal-page" data-page="${page}" data-return-hash="#library"><span class="today-shortcut-icon shortcut-${palette}">${icon}</span><strong>${label}</strong><small>${formatNumber(summary.totals?.[metricKey] || 0)}</small></a>`).join("")}</nav>`;
+}
+
+function secondaryPageHeader(label, copy = "") {
+  return `<div class="secondary-page-header"><div><p class="eyebrow">${escapeHtml(label)}</p>${copy ? `<span>${escapeHtml(copy)}</span>` : ""}</div><button class="button button-secondary button-small" type="button" data-action="return-from-study">‹ 返回${escapeHtml(studyReturnLabel())}</button></div>`;
+}
+
+function studyPageHash(page, returnHash = "#library") {
+  return `#${page}?return=${encodeURIComponent(normalizeStudyReturnHash(returnHash, "#library"))}`;
 }
 
 function statCard(label, value, copy) {
   return `<div class="stat-card"><small>${label}</small><strong>${formatNumber(value || 0)}</strong>${copy ? `<span>${copy}</span>` : ""}</div>`;
+}
+
+function invalidateStudySummary() {
+  state.todaySummary = null;
 }
 
 function libraryItem(item, kind, type) {
@@ -530,7 +641,7 @@ function libraryItem(item, kind, type) {
     ? `${formatNumber(item.collection_count || 0)} 个文件 · ${formatNumber(item.question_count || 0)} 道题`
     : `${formatNumber(count)} 道题${extension && extension !== "xlsx" ? ` · ${escapeHtml(extension.toUpperCase())}` : ""}`;
   return `<button class="library-item ${isDirectory ? "" : "collection"}" type="button" data-action="${action}" data-kind="${kind}" data-path="${escapeAttr(item.path || "")}" data-id="${escapeAttr(item.collection_id || "")}">
-    <span class="library-icon" aria-hidden="true">${isDirectory ? "▦" : "卷"}</span>
+    ${isDirectory ? `<span class="library-icon" aria-hidden="true">▦</span>` : ""}
     <span class="library-main"><strong>${escapeHtml(displayName)}</strong><small>${copy}</small></span>
     <span class="library-arrow" aria-hidden="true">›</span>
   </button>`;
@@ -559,7 +670,9 @@ function renderOutline() {
   const { kind, payload } = state.outline;
   const content = $(`#${kind}-content`);
   const collection = payload.collection;
-  const groups = groupOutlineItems(payload.items || []);
+  const outlineItems = payload.items || [];
+  const hasItems = outlineItems.length > 0;
+  const groups = groupOutlineItems(outlineItems);
   const groupMarkup = groups.map(([label, items]) => `
     <section class="outline-group">
       <h3 class="outline-group-title"><span class="type-dot ${typeClass(label)}"></span><span>${escapeHtml(label)}</span><span>${items.length} 题</span></h3>
@@ -575,9 +688,9 @@ function renderOutline() {
     <div class="breadcrumbs"><button type="button" data-action="close-outline" data-kind="${kind}">‹ 返回当前目录</button></div>
     <div class="page-header">
       <div class="page-title"><h1>${escapeHtml(fileTitle(collection.relative_path))}</h1><p class="section-copy">${escapeHtml(displaySourcePath(collection.relative_path))} · ${formatNumber((payload.items || []).length)} 题</p></div>
-      <div class="header-actions"><button class="button button-primary" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${payload.items?.[0]?.collection_position || 1}">${modeMeta(state.outlineMode).cta}</button></div>
+      ${hasItems ? `<div class="header-actions"><button class="button button-primary" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${outlineItems[0].collection_position}">${modeMeta(state.outlineMode).cta}</button></div>` : ""}
     </div>
-    <div class="card outline-card">
+    ${hasItems ? `<div class="card outline-card">
       <div class="outline-toolbar">
         <div class="outline-mode-row">
           <div class="segmented" aria-label="学习模式">
@@ -588,8 +701,8 @@ function renderOutline() {
         <p class="mode-description">${modeMeta(state.outlineMode).description}</p>
         <span class="outline-summary">已答 ${summary.answered || 0} · 正确 ${summary.correct || 0} · 错误 ${summary.wrong || 0} · 未答 ${Math.max(0, (summary.total || payload.items.length) - (summary.answered || 0))}</span>
       </div>
-      <div class="outline-groups">${groupMarkup || emptyMarkup("没有可练习题目", "该文件没有匹配的题目。")}</div>
-    </div>`;
+      <div class="outline-groups">${groupMarkup}</div>
+    </div>` : emptyMarkup(kind === "wrong" ? "该文件已没有错题" : kind === "favorites" ? "该文件已没有收藏" : "没有可练习题目", kind === "library" ? "该文件当前没有可练习题目。" : "返回当前目录继续查看其他文件。", kind === "wrong" ? "!" : kind === "favorites" ? "☆" : "▦")}`;
 }
 
 async function resetCollectionProgress(button) {
@@ -945,7 +1058,7 @@ function renderSolutionSection(kind, label, content, textRenderer = escapeHtml) 
   </section>`;
 }
 
-async function startSession({ collectionId, position = 1, kind = "library", mode = state.outlineMode, path = "" }) {
+async function startSession({ collectionId, position = 1, kind = "library", mode = state.outlineMode, path = "", returnHash = "" }) {
   const returnPath = path
     || state.libraryPath[kind]
     || collectionParentPath(state.outline?.payload?.collection?.relative_path);
@@ -959,22 +1072,26 @@ async function startSession({ collectionId, position = 1, kind = "library", mode
   if (kind === "wrong") body.saved_kind = "wrong";
   try {
     const session = await api("/practice/sessions", { method: "POST", body });
+    const normalizedReturnHash = normalizeStudyReturnHash(returnHash);
     state.session = session;
     state.sessionIndex = 0;
     state.drafts = {};
     state.sessionReturnTarget = {
-      kind,
+      kind: normalizedReturnHash ? "personal" : kind,
       collectionId,
       path: returnPath,
-      hash: libraryRouteHash(kind, returnPath, collectionId),
+      hash: normalizedReturnHash || libraryRouteHash(kind, returnPath, collectionId),
     };
-    await navigateHash(`#session/${session.session_id}`);
+    const sessionParams = new URLSearchParams();
+    if (normalizedReturnHash) sessionParams.set("return", normalizedReturnHash);
+    const sessionQuery = sessionParams.toString();
+    await navigateHash(`#session/${session.session_id}${sessionQuery ? `?${sessionQuery}` : ""}`);
   } catch (error) {
     showToast(error.message, "error");
   }
 }
 
-async function loadSession(sessionId) {
+async function loadSession(sessionId, { returnHash = "" } = {}) {
   const container = $("#page-practice");
   container.innerHTML = loadingMarkup("正在恢复练习进度");
   try {
@@ -984,7 +1101,15 @@ async function loadSession(sessionId) {
       state.session.items.findIndex((item) => !item.submission)
     );
     state.drafts = {};
-    if (!state.sessionReturnTarget) {
+    const restoredReturnHash = normalizeStudyReturnHash(returnHash);
+    if (restoredReturnHash) {
+      state.sessionReturnTarget = {
+        kind: "personal",
+        collectionId: state.session.collection_id,
+        path: "",
+        hash: restoredReturnHash,
+      };
+    } else if (!state.sessionReturnTarget) {
       const kind = state.session.saved_kind === "favorite"
         ? "favorites"
         : state.session.saved_kind === "wrong" ? "wrong" : "library";
@@ -1029,9 +1154,11 @@ function renderPractice() {
   const finishButton = ["practice", "test"].includes(mode)
     ? `<button class="button button-danger button-small" type="button" data-action="finish-session" ${isComplete ? "disabled" : ""}>${isComplete ? "已交卷" : "交卷"}</button>`
     : "";
-  const returnKind = session.saved_kind === "favorite"
-    ? "收藏"
-    : session.saved_kind === "wrong" ? "错题" : "题库";
+  const returnKind = state.sessionReturnTarget?.kind === "personal"
+    ? studyReturnLabel(state.sessionReturnTarget.hash)
+    : session.saved_kind === "favorite"
+      ? "收藏"
+      : session.saved_kind === "wrong" ? "错题" : "题库";
   const statusNote = mode === "speed" && submitted && submitted.is_correct === false
     ? `<p class="practice-feedback-note wrong">未选中正确答案，答案与解析已展开；确认后可继续下一题。</p>`
     : mode === "test" && !isComplete
@@ -1211,6 +1338,7 @@ async function submitQuestionNote(form) {
     });
     state.notes[String(occurrenceId)] = { loading: false, item, error: "" };
     state.myNotes = null;
+    invalidateStudySummary();
     updateQuestionNote(occurrenceId);
     showToast("笔记已保存");
   } catch (error) {
@@ -1226,6 +1354,7 @@ async function deleteQuestionNote(occurrenceId, { fromList = false } = {}) {
     await api(`/study/notes/${encodeURIComponent(occurrenceId)}`, { method: "DELETE", body: {} });
     state.notes[String(occurrenceId)] = { loading: false, item: { occurrence_id: occurrenceId, body: "", exists: false }, error: "" };
     state.myNotes = null;
+    invalidateStudySummary();
     if (fromList) await renderMyNotesPage({ force: true });
     else updateQuestionNote(occurrenceId);
     showToast("笔记已删除");
@@ -1243,6 +1372,7 @@ async function editPersonalNote(occurrenceId) {
     await api(`/study/notes/${encodeURIComponent(occurrenceId)}`, { method: "PUT", body: { body } });
     state.notes[String(occurrenceId)] = null;
     state.myNotes = null;
+    invalidateStudySummary();
     await renderMyNotesPage({ force: true });
     showToast("笔记已更新");
   } catch (error) {
@@ -1317,6 +1447,7 @@ async function submitQuestionComment(form) {
     const items = state.comments[key]?.items || [];
     state.comments[key] = { loading: false, items: [...items, item], error: "" };
     state.myComments = null;
+    invalidateStudySummary();
     updateQuestionComments(occurrenceId);
     showToast("评论已发表");
   } catch (error) {
@@ -1340,6 +1471,8 @@ async function deleteQuestionComment(commentId, occurrenceId) {
       state.myComments.items = (state.myComments.items || []).filter((item) => item.comment_id !== commentId);
       state.myComments.total = Math.max(0, Number(state.myComments.total || 0) - 1);
     }
+    state.myLikes = null;
+    invalidateStudySummary();
     updateQuestionComments(occurrenceId);
     if (location.hash.startsWith("#my-comments")) await renderMyCommentsPage({ force: true });
     showToast("评论已删除");
@@ -1362,6 +1495,7 @@ async function editQuestionComment(commentId, occurrenceId) {
     const record = state.comments[String(occurrenceId)];
     if (record) record.items = record.items.map((item) => item.comment_id === commentId ? updated : item);
     if (state.myComments) state.myComments.items = state.myComments.items.map((item) => item.comment_id === commentId ? { ...item, ...updated } : item);
+    state.myLikes = null;
     updateQuestionComments(occurrenceId);
     if (location.hash.startsWith("#my-comments")) await renderMyCommentsPage({ force: true });
     showToast("评论已更新");
@@ -1376,7 +1510,12 @@ async function reactComment(commentId, reaction, occurrenceId) {
     const record = state.comments[String(occurrenceId)];
     if (record) record.items = record.items.map((item) => item.comment_id === commentId ? { ...item, ...result } : item);
     state.myLikes = null;
+    invalidateStudySummary();
     updateQuestionComments(occurrenceId);
+    if (location.hash.startsWith("#my-likes")) {
+      await renderMyLikesPage({ force: true });
+      showToast(result.my_reaction === "agree" ? "已赞同" : "已取消赞同");
+    }
   } catch (error) { showToast(error.message, "error"); }
 }
 
@@ -1385,6 +1524,8 @@ async function replyToComment(commentId, occurrenceId) {
   if (!body) return;
   try {
     await api("/study/comments", { method: "POST", body: { occurrence_id: occurrenceId, parent_comment_id: commentId, body } });
+    state.myComments = null;
+    invalidateStudySummary();
     await ensureQuestionComments(occurrenceId, { force: true });
     showToast("回复已发表");
   } catch (error) { showToast(error.message, "error"); }
@@ -1401,6 +1542,7 @@ async function submitCurrentAnswer({ autoAdvance = false } = {}) {
       method: "POST",
       body: { position: item.position, answer, elapsed_ms: sessionElapsedMs() },
     });
+    invalidateStudySummary();
     state.session = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}`);
     state.sessionIndex = Math.min(index, state.session.items.length - 1);
     const canAdvance = autoAdvance && index < state.session.items.length - 1 && state.session.status !== "complete";
@@ -1501,13 +1643,12 @@ async function renderMyHomePage() {
     const profile = await api(`/profiles/${encodeURIComponent(user.user_id)}`);
     state.publicProfile = profile;
     const stats = profile.stats || {};
-    const summary = state.todaySummary || await api("/study/today-summary").catch(() => ({}));
-    state.todaySummary = summary;
+    const commonActions = `${user.role === "admin" ? homeUtility("系统管理", "admin", "admin", "open-admin") : ""}${homeUtility("下载", "download", "download")}`;
     container.innerHTML = `<div class="my-home">
       <section class="my-home-hero" data-action="open-own-profile" role="button" tabindex="0"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div><h1>${escapeHtml(profile.username || "我的")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div><span class="my-home-chevron">›</span></section>
-      <nav class="my-home-stats card" aria-label="个人数据">${profileStatLink("dynamics", "动态", stats.dynamics || 0, "▤", "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "＋", "profile-detail")}${profileStatLink("followers", "粉丝", stats.followers || 0, "◎", "profile-detail")}</nav>
-      <section class="my-home-section"><h2>常用功能</h2><div class="my-home-actions">${homeAction("wrong", "错题", "!", summary.totals?.wrong || 0)}${homeAction("favorites", "收藏", "♡", summary.totals?.favorites || 0)}${homeAction("notes", "笔记", "▢", summary.totals?.notes || 0)}${homeAction("my-comments", "评论", "▱", summary.totals?.comments || 0)}${homeAction("my-likes", "点赞", "♧", summary.totals?.likes || 0)}</div></section>
-      <section class="my-home-section"><h2>其他功能</h2><div class="my-home-actions four">${homeUtility("帮助中心", "?", "help")}${homeUtility("联系客服", "◌", "contact")}${homeUtility("意见反馈", "✎", "feedback")}${homeUtility("设置", "⚙", "settings")}</div></section>
+      <nav class="my-home-stats card" aria-label="个人数据">${profileStatLink("dynamics", "动态", stats.dynamics || 0, "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "profile-detail")}${profileStatLink("followers", "粉丝", stats.followers || 0, "profile-detail")}</nav>
+      <section class="my-home-section"><h2>常用功能</h2><div class="my-home-actions">${commonActions}</div></section>
+      <section class="my-home-section"><h2>其他功能</h2><div class="my-home-actions">${homeUtility("帮助中心", "help", "help")}${homeUtility("联系客服", "contact", "contact")}${homeUtility("意见反馈", "feedback", "feedback")}${homeUtility("设置", "settings", "settings")}</div></section>
       <button class="button button-danger logout-wide" type="button" data-action="logout">退出登录</button>
     </div>`;
   } catch (error) {
@@ -1515,17 +1656,25 @@ async function renderMyHomePage() {
   }
 }
 
-function profileStatLink(key, label, value, icon, page, userId = "") {
+function profileStatLink(key, label, value, page, userId = "") {
   const targetId = userId || state.publicProfile?.user_id || state.user.user_id;
-  return `<a class="my-home-stat" href="#${page}?user=${encodeURIComponent(targetId)}&tab=${key}"><span class="my-home-stat-icon">${icon}</span><strong>${formatNumber(value)}</strong><small>${label}</small></a>`;
+  return `<a class="my-home-stat" href="#${page}?user=${encodeURIComponent(targetId)}&tab=${key}"><strong>${formatNumber(value)}</strong><small>${label}</small></a>`;
 }
 
-function homeAction(page, label, icon, count) {
-  return `<a class="my-home-action" href="#${page}"><span class="my-home-action-icon shortcut-${page === "my-comments" ? "comments" : page === "my-likes" ? "likes" : page}">${icon}</span><strong>${label}</strong><small>${formatNumber(count)}</small></a>`;
+function utilityIcon(name) {
+  const paths = {
+    admin: '<rect x="4" y="3" width="16" height="18" rx="3"></rect><path d="M8 8h8M8 12h8M8 16h5"></path>',
+    download: '<path d="M12 3v12M7.5 10.5 12 15l4.5-4.5"></path><path d="M5 20h14"></path>',
+    help: '<circle cx="12" cy="12" r="9"></circle><path d="M9.8 9a2.4 2.4 0 1 1 3.1 2.3c-.9.4-.9 1.2-.9 1.7M12 17h.01"></path>',
+    contact: '<path d="M5 15v-3a7 7 0 0 1 14 0v3"></path><path d="M5 14H4a2 2 0 0 0-2 2v1a2 2 0 0 0 2 2h2v-5H5ZM19 14h1a2 2 0 0 1 2 2v1a2 2 0 0 1-2 2h-2v-5h1ZM18 19c-1 1.3-2.7 2-5 2"></path>',
+    feedback: '<path d="M4 5h16v11H9l-5 4V5Z"></path><path d="M8 9h8M8 12h5"></path>',
+    settings: '<circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"></path>',
+  };
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.help}</svg>`;
 }
 
-function homeUtility(label, icon, action) {
-  return `<button class="my-home-action" type="button" data-action="home-utility" data-utility="${action}"><span class="my-home-action-icon utility-icon">${icon}</span><strong>${label}</strong></button>`;
+function homeUtility(label, icon, utility, action = "home-utility") {
+  return `<button class="my-home-action" type="button" data-action="${action}" data-utility="${utility}"><span class="my-home-action-icon utility-icon">${utilityIcon(icon)}</span><strong>${label}</strong></button>`;
 }
 
 async function renderPublicProfilePage(userId) {
@@ -1536,9 +1685,9 @@ async function renderPublicProfilePage(userId) {
     state.publicProfile = profile;
     if (state.profileEditing && profile.is_self) return renderProfileEditorPage(profile);
     const stats = profile.stats || {};
-    container.innerHTML = `<div class="public-profile"><button class="profile-back-button" type="button" data-action="back-to-my-home">‹ 我的</button><section class="public-profile-card card"><div class="public-profile-head"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div class="public-profile-identity"><h1>${escapeHtml(profile.username || "用户")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div>${profile.is_self ? `<button class="button button-secondary button-small" type="button" data-action="edit-profile">编辑</button>` : ""}</div><nav class="public-profile-stats">${profileStatLink("followers", "粉丝", stats.followers || 0, "◎", "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "＋", "profile-detail")}${profileStatLink("likes", "获赞", stats.likes || 0, "♧", "profile-detail")}</nav><div class="public-profile-actions">${profile.is_self ? "" : `<button class="button ${stats.is_following ? "button-secondary" : "button-primary"} button-small" type="button" data-action="toggle-follow" data-user-id="${escapeAttr(profile.user_id)}" data-following="${stats.is_following ? "true" : "false"}">${stats.is_following ? "已关注" : "关注"}</button><button class="button button-secondary button-small" type="button" data-action="message-profile" data-user-id="${escapeAttr(profile.user_id)}" data-name="${escapeAttr(profile.username)}">私信</button>`}</div></section><section class="public-profile-dynamics"><div class="section-heading"><div><h2>动态</h2><p>评论与学习讨论</p></div></div>${(profile.dynamics || []).length ? profile.dynamics.map(profileDynamicCard).join("") : emptyMarkup("暂无动态", "发表评论后会显示在这里。", "▤")}</section></div>`;
+    container.innerHTML = `<div class="public-profile"><button class="profile-back-button" type="button" data-action="return-from-profile">‹ 返回${escapeHtml(internalReturnLabel(state.profileReturnHash))}</button><section class="public-profile-card card"><div class="public-profile-head"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div class="public-profile-identity"><h1>${escapeHtml(profile.username || "用户")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div>${profile.is_self ? `<button class="button button-secondary button-small" type="button" data-action="edit-profile">编辑</button>` : ""}</div><nav class="public-profile-stats">${profileStatLink("followers", "粉丝", stats.followers || 0, "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "profile-detail")}${profileStatLink("likes", "获赞", stats.likes || 0, "profile-detail")}</nav><div class="public-profile-actions">${profile.is_self ? "" : `<button class="button ${stats.is_following ? "button-secondary" : "button-primary"} button-small" type="button" data-action="toggle-follow" data-user-id="${escapeAttr(profile.user_id)}" data-following="${stats.is_following ? "true" : "false"}">${stats.is_following ? "已关注" : "关注"}</button><button class="button button-secondary button-small" type="button" data-action="message-profile" data-user-id="${escapeAttr(profile.user_id)}" data-name="${escapeAttr(profile.username)}">私信</button>`}</div></section><section class="public-profile-dynamics"><div class="section-heading"><div><h2>动态</h2><p>评论与学习讨论</p></div></div>${(profile.dynamics || []).length ? profile.dynamics.map(profileDynamicCard).join("") : emptyMarkup("暂无动态", "发表评论后会显示在这里。", "▤")}</section></div>`;
   } catch (error) {
-    container.innerHTML = emptyMarkup("个人资料读取失败", error.message, "!");
+    container.innerHTML = `<button class="profile-back-button" type="button" data-action="return-from-profile">‹ 返回${escapeHtml(internalReturnLabel(state.profileReturnHash))}</button>${emptyMarkup("个人资料读取失败", error.message, "!")}`;
   }
 }
 
@@ -1573,41 +1722,55 @@ async function messageProfile(userId, name) {
   if (!body) return;
   try {
     await api("/messages", { method: "POST", body: { receiver_id: userId, body } });
+    state.messageData = null;
     showToast("私信已发送");
   } catch (error) { showToast(error.message, "error"); }
 }
 
 function handleHomeUtility(utility) {
   if (utility === "settings") return navigateHash("#settings");
-  const labels = { help: "帮助中心", contact: "联系客服", feedback: "意见反馈" };
+  const labels = { download: "下载", help: "帮助中心", contact: "联系客服", feedback: "意见反馈" };
   return showToast(`${labels[utility] || "该功能"}即将开放`);
 }
 
 async function renderMessagesPage() {
   const container = $("#page-messages");
-  container.innerHTML = `
-    <div class="page-header account-page-header">
-      <div class="page-title"><p class="eyebrow">我的消息</p><h1>消息中心</h1><p class="section-copy">系统通知与学习互动消息会集中显示在这里。</p></div>
-      <div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div>
-    </div>
-    ${loadingMarkup("正在读取消息")}`;
-  try {
-    const payload = await api("/messages");
-    const notifications = payload.notifications || [];
-    const direct = payload.messages || [];
-    const groups = [
-      ["系统通知", notifications.filter((item) => item.kind === "system")],
-      ["私信对话", direct],
-      ["回复与 @", notifications.filter((item) => item.kind === "reply" || item.kind === "mention")],
-      ["收到赞同", notifications.filter((item) => item.kind === "agree")],
-    ];
-    container.innerHTML = `
-      <div class="page-header account-page-header"><div class="page-title"><p class="eyebrow">我的消息</p><h1>消息中心</h1><p class="section-copy">系统通知、私信和互动提醒。</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div></div>
-      <div class="message-category-grid">${groups.map(([label, items]) => `<section class="card message-category"><div class="message-category-head"><h2>${label}</h2><span>${items.length}</span></div>${items.length ? `<div class="message-list">${items.slice(0, 20).map((item) => `<article><strong>${escapeHtml(item.sender_name || label)}</strong><p>${escapeHtml(item.body || (item.kind === "agree" ? "赞同了你的评论" : "你收到一条新消息"))}</p><time>${escapeHtml(formatDate(item.created_at))}</time></article>`).join("")}</div>` : `<p class="message-empty">暂无消息</p>`}</section>`).join("")}</div>
-      `;
-  } catch (error) {
-    container.innerHTML += emptyMarkup("消息读取失败", error.message, "!");
+  if (state.messageData) {
+    renderMessageCenter(state.messageData);
+    return;
   }
+  container.innerHTML = `${messagePageHeader()}${loadingMarkup("正在读取消息")}`;
+  try {
+    state.messageData = await api("/messages");
+    renderMessageCenter(state.messageData);
+  } catch (error) {
+    container.innerHTML = `${messagePageHeader()}${emptyMarkup("消息读取失败", error.message, "!")}`;
+  }
+}
+
+function messagePageHeader() {
+  return `<div class="page-header account-page-header"><div class="page-title"><p class="eyebrow">我的消息</p><h1>消息中心</h1></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div></div>`;
+}
+
+function messageGroups(payload) {
+  const notifications = payload.notifications || [];
+  return [
+    { key: "system", label: "系统通知", items: notifications.filter((item) => item.kind === "system") },
+    { key: "direct", label: "私信对话", items: payload.messages || [] },
+    { key: "replies", label: "回复与@", items: notifications.filter((item) => item.kind === "reply" || item.kind === "mention") },
+    { key: "agreements", label: "收到赞同", items: notifications.filter((item) => item.kind === "agree") },
+  ];
+}
+
+function renderMessageCenter(payload) {
+  const container = $("#page-messages");
+  if (!container) return;
+  const groups = messageGroups(payload);
+  const active = groups.find((group) => group.key === state.messageTab) || groups[0];
+  state.messageTab = active.key;
+  container.innerHTML = `${messagePageHeader()}
+    <nav class="message-tabs card" aria-label="消息分类">${groups.map((group) => `<button class="message-tab ${group.key === active.key ? "active" : ""}" type="button" data-action="message-tab" data-tab="${group.key}" aria-pressed="${group.key === active.key}"><span>${group.label}</span><small>${formatNumber(group.items.length)}</small></button>`).join("")}</nav>
+    <section class="card message-panel" aria-live="polite"><div class="message-panel-head"><h2>${active.label}</h2><span>${formatNumber(active.items.length)} 条</span></div>${active.items.length ? `<div class="message-list">${active.items.slice(0, 50).map((item) => `<article><strong>${escapeHtml(item.sender_name || active.label)}</strong><p>${escapeHtml(item.body || (item.kind === "agree" ? "赞同了你的评论" : "你收到一条新消息"))}</p><time>${escapeHtml(formatDate(item.created_at))}</time></article>`).join("")}</div>` : `<p class="message-empty">暂无${active.label}</p>`}</section>`;
 }
 
 function renderPlaceholderPage(page) {
@@ -1617,56 +1780,94 @@ function renderPlaceholderPage(page) {
 
 async function renderMyCommentsPage({ force = false } = {}) {
   const container = $("#page-my-comments");
-  container.innerHTML = `${personalPageHeader("我的评论", "已发表的评论", "管理自己的讨论内容。")}${loadingMarkup("正在读取评论")}`;
+  if (!state.myComments || force) container.innerHTML = `${personalPageHeader("评论", "正在读取评论")}${loadingMarkup("正在读取评论")}`;
   try {
-    if (!state.myComments || force) state.myComments = await api("/study/comments/mine?limit=100");
+    if (!state.myComments || force) state.myComments = await api("/study/comments/mine?limit=50&offset=0");
     const items = state.myComments.items || [];
-    container.innerHTML = `${personalPageHeader("我的评论", "已发表的评论", `共 ${formatNumber(state.myComments.total || 0)} 条`)}${items.length ? `<div class="personal-feed">${items.map((item) => personalContentCard(item, "comment")).join("")}</div>` : emptyMarkup("暂无评论", "完成题目后，可在标准解析下方参与讨论。", "◌")}`;
+    container.innerHTML = `${personalPageHeader("评论", `共 ${formatNumber(state.myComments.total || 0)} 条`)}${items.length ? personalFeedMarkup(items, "comment", state.myComments.total) : emptyMarkup("暂无评论", "完成题目后，可在标准解析下方参与讨论。", "◌")}`;
   } catch (error) {
-    container.innerHTML = `${personalPageHeader("我的评论", "已发表的评论", "管理自己的讨论内容。")}${emptyMarkup("评论读取失败", error.message, "!")}`;
+    container.innerHTML = `${personalPageHeader("评论", "管理自己的讨论内容")}${emptyMarkup("评论读取失败", error.message, "!")}`;
   }
 }
 
 async function renderMyNotesPage({ force = false } = {}) {
   const container = $("#page-notes");
-  container.innerHTML = `${personalPageHeader("我的笔记", "个人复习笔记", "仅当前账号可见，不参与搜题。")}${loadingMarkup("正在读取笔记")}`;
+  if (!state.myNotes || force) container.innerHTML = `${personalPageHeader("笔记", "仅自己可见")}${loadingMarkup("正在读取笔记")}`;
   try {
-    if (!state.myNotes || force) state.myNotes = await api("/study/notes?limit=100");
+    if (!state.myNotes || force) state.myNotes = await api("/study/notes?limit=50&offset=0");
     const items = state.myNotes.items || [];
-    container.innerHTML = `${personalPageHeader("我的笔记", "个人复习笔记", `共 ${formatNumber(state.myNotes.total || 0)} 条 · 不参与搜题`)}${items.length ? `<div class="personal-feed">${items.map((item) => personalContentCard(item, "note")).join("")}</div>` : emptyMarkup("暂无笔记", "答案解析解锁后，可在每道题下方保存个人笔记。", "□")}`;
+    container.innerHTML = `${personalPageHeader("笔记", `共 ${formatNumber(state.myNotes.total || 0)} 条 · 仅自己可见`)}${items.length ? personalFeedMarkup(items, "note", state.myNotes.total) : emptyMarkup("暂无笔记", "答案解析解锁后，可在每道题下方保存个人笔记。", "□")}`;
   } catch (error) {
-    container.innerHTML = `${personalPageHeader("我的笔记", "个人复习笔记", "仅当前账号可见，不参与搜题。")}${emptyMarkup("笔记读取失败", error.message, "!")}`;
+    container.innerHTML = `${personalPageHeader("笔记", "仅自己可见")}${emptyMarkup("笔记读取失败", error.message, "!")}`;
   }
 }
 
 async function renderMyLikesPage({ force = false } = {}) {
   const container = $("#page-my-likes");
-  container.innerHTML = `${personalPageHeader("我的点赞", "赞同过的评论", "集中查看你认可的讨论。")}${loadingMarkup("正在读取点赞")}`;
+  if (!state.myLikes || force) container.innerHTML = `${personalPageHeader("点赞", "赞同过的评论")}${loadingMarkup("正在读取点赞")}`;
   try {
-    if (!state.myLikes || force) state.myLikes = await api("/study/comments/likes/mine?limit=100");
+    if (!state.myLikes || force) state.myLikes = await api("/study/comments/likes/mine?limit=50&offset=0");
     const items = state.myLikes.items || [];
-    container.innerHTML = `${personalPageHeader("我的点赞", "赞同过的评论", `共 ${formatNumber(state.myLikes.total || 0)} 条`)}${items.length ? `<div class="personal-feed">${items.map((item) => personalContentCard(item, "like")).join("")}</div>` : emptyMarkup("暂无点赞", "在评论区点击赞同后，内容会集中显示在这里。", "♡")}`;
+    container.innerHTML = `${personalPageHeader("点赞", `共 ${formatNumber(state.myLikes.total || 0)} 条`)}${items.length ? personalFeedMarkup(items, "like", state.myLikes.total) : emptyMarkup("暂无点赞", "在评论区点击赞同后，内容会集中显示在这里。", "♡")}`;
   } catch (error) {
-    container.innerHTML = `${personalPageHeader("我的点赞", "赞同过的评论", "集中查看你认可的讨论。")}${emptyMarkup("点赞读取失败", error.message, "!")}`;
+    container.innerHTML = `${personalPageHeader("点赞", "赞同过的评论")}${emptyMarkup("点赞读取失败", error.message, "!")}`;
   }
 }
 
-function personalPageHeader(eyebrow, title, copy) {
-  return `<div class="page-header account-page-header"><div class="page-title"><p class="eyebrow">${escapeHtml(eyebrow)}</p><h1>${escapeHtml(title)}</h1><p class="section-copy">${escapeHtml(copy)}</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-to-profile">‹ 个人中心</button></div></div>`;
+function personalPageHeader(label, copy) {
+  return secondaryPageHeader(label, copy);
+}
+
+function personalFeedMarkup(items, kind, total) {
+  const shown = items.length;
+  const totalCount = Number(total || shown);
+  return `<div class="personal-feed">${items.map((item) => personalContentCard(item, kind)).join("")}</div>${shown < totalCount ? `<div class="personal-feed-footer"><span>已显示 ${formatNumber(shown)} / ${formatNumber(totalCount)}</span><button class="button button-secondary button-small" type="button" data-action="load-more-personal" data-kind="${kind}">加载更多</button></div>` : ""}`;
+}
+
+async function loadMorePersonalFeed(kind, button) {
+  const config = {
+    comment: { key: "myComments", endpoint: "/study/comments/mine", render: renderMyCommentsPage, identity: "comment_id" },
+    note: { key: "myNotes", endpoint: "/study/notes", render: renderMyNotesPage, identity: "occurrence_id" },
+    like: { key: "myLikes", endpoint: "/study/comments/likes/mine", render: renderMyLikesPage, identity: "comment_id" },
+  }[kind];
+  if (!config) return;
+  const current = state[config.key];
+  if (!current || (current.items || []).length >= Number(current.total || 0)) return;
+  setButtonBusy(button, true, "加载中");
+  try {
+    const next = await api(`${config.endpoint}?limit=50&offset=${(current.items || []).length}`);
+    const seen = new Set((current.items || []).map((item) => String(item[config.identity])));
+    const appended = (next.items || []).filter((item) => !seen.has(String(item[config.identity])));
+    state[config.key] = {
+      ...current,
+      ...next,
+      items: [...(current.items || []), ...appended],
+      total: Number(next.total ?? current.total ?? 0),
+      offset: 0,
+    };
+    await config.render();
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
 }
 
 function personalContentCard(item, kind) {
   const question = item.question || {};
   const occurrenceId = Number(item.occurrence_id || question.occurrence_id) || 0;
   const canOpen = Boolean(question.collection_id && question.collection_position);
+  const timestamp = kind === "like" ? item.liked_at : item.updated_at;
+  const sourcePath = displaySourcePath(question.relative_path || "");
+  const sourceMeta = [sourcePath, question.source_code || (question.collection_position ? `第 ${question.collection_position} 题` : "")].filter(Boolean).join(" · ");
   return `<article class="card personal-content-card">
-    <div class="personal-content-meta"><span class="badge badge-neutral">${escapeHtml(question.type_label || "题目")}</span><time datetime="${escapeAttr(item.updated_at || "")}">${escapeHtml(formatDate(item.updated_at))}</time></div>
+    <div class="personal-content-meta"><span class="badge badge-neutral">${escapeHtml(question.type_label || "题目")}</span>${kind === "like" ? `<button class="personal-content-author" type="button" data-action="open-profile" data-user-id="${escapeAttr(item.author_id || "")}">评论者 ${escapeHtml(item.author_name || "用户")}</button>` : ""}<time datetime="${escapeAttr(timestamp || "")}">${escapeHtml(formatDate(timestamp))}</time></div>
     <h2>${escapeHtml(question.stem || "原题已不可用")}</h2>
-    <p class="personal-content-path">${escapeHtml(displaySourcePath(question.relative_path || ""))}</p>
+    ${sourceMeta ? `<p class="personal-content-path">${escapeHtml(sourceMeta)}</p>` : ""}
     <div class="personal-content-body ${kind}">${escapeHtml(item.body || "")}</div>
+    ${kind !== "note" ? `<div class="personal-content-stats"><span>赞同 ${formatNumber(item.agree_count || 0)}</span><span>反对 ${formatNumber(item.disagree_count || 0)}</span><span>回复 ${formatNumber(item.reply_count || 0)}</span></div>` : ""}
     <div class="question-actions">
-      ${canOpen ? `<button class="button button-secondary button-small" type="button" data-action="open-personal-source" data-collection="${escapeAttr(question.collection_id)}" data-position="${Number(question.collection_position)}" data-path="${escapeAttr(question.relative_path || "")}">查看原题</button>` : ""}
-      ${kind === "comment" ? `<button class="button button-secondary button-small" type="button" data-action="edit-comment" data-comment-id="${escapeAttr(item.comment_id)}" data-occurrence="${occurrenceId}">编辑</button><button class="button button-danger button-small" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(item.comment_id)}" data-occurrence="${occurrenceId}" data-from-list="true">删除</button>` : kind === "note" ? `<button class="button button-secondary button-small" type="button" data-action="edit-personal-note" data-occurrence="${occurrenceId}">编辑</button><button class="button button-danger button-small" type="button" data-action="delete-note" data-occurrence="${occurrenceId}" data-from-list="true">删除</button>` : `<span class="badge badge-neutral">已赞同</span>`}
+      ${canOpen ? `<button class="button button-secondary button-small" type="button" data-action="open-personal-source" data-collection="${escapeAttr(question.collection_id)}" data-position="${Number(question.collection_position)}" data-path="${escapeAttr(question.relative_path || "")}">进入原题</button>` : `<span class="badge badge-neutral">原题不可用</span>`}
+      ${kind === "comment" ? `<button class="button button-secondary button-small" type="button" data-action="edit-comment" data-comment-id="${escapeAttr(item.comment_id)}" data-occurrence="${occurrenceId}">编辑</button><button class="button button-danger button-small" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(item.comment_id)}" data-occurrence="${occurrenceId}" data-from-list="true">删除</button>` : kind === "note" ? `<button class="button button-secondary button-small" type="button" data-action="edit-personal-note" data-occurrence="${occurrenceId}">编辑</button><button class="button button-danger button-small" type="button" data-action="delete-note" data-occurrence="${occurrenceId}" data-from-list="true">删除</button>` : `<button class="button button-danger button-small" type="button" data-action="react-comment" data-comment-id="${escapeAttr(item.comment_id)}" data-reaction="agree" data-occurrence="${occurrenceId}">取消赞同</button>`}
     </div>
   </article>`;
 }
@@ -1918,13 +2119,25 @@ async function handleClick(event) {
   if (action === "auth-mode") return showAuth(target.dataset.mode);
   if (action === "open-messages") {
     if (!location.hash.startsWith("#messages")) state.accountReturnHash = location.hash || "#library";
+    state.messageData = null;
     return navigateHash("#messages");
   }
-  if (action === "open-personal-page") {
-    state.accountReturnHash = "#profile";
-    return navigateHash(`#${target.dataset.page}`);
+  if (action === "toggle-theme") return toggleTheme();
+  if (action === "message-tab") {
+    state.messageTab = target.dataset.tab || "system";
+    if (state.messageData) renderMessageCenter(state.messageData);
+    return;
   }
-  if (action === "open-own-profile") { state.profileEditing = false; return navigateHash(`#profile-detail?user=${encodeURIComponent(state.user.user_id)}`); }
+  if (action === "open-personal-page") {
+    event.preventDefault();
+    const page = String(target.dataset.page || "");
+    if (!["favorites", "wrong", "notes", "my-comments", "my-likes"].includes(page)) return;
+    state.studyReturnHash = normalizeStudyReturnHash(target.dataset.returnHash, "#library");
+    const destination = studyPageHash(page, state.studyReturnHash);
+    if (location.hash === destination) return;
+    return navigateHash(destination);
+  }
+  if (action === "open-own-profile") { state.profileEditing = false; state.profileReturnHash = "#profile"; return navigateHash(`#profile-detail?user=${encodeURIComponent(state.user.user_id)}`); }
   if (action === "back-to-my-home") { state.profileEditing = false; return navigateHash("#profile"); }
   if (action === "edit-profile") { state.profileEditing = true; return renderPublicProfilePage(state.user.user_id); }
   if (action === "cancel-profile-edit") { state.profileEditing = false; return renderPublicProfilePage(state.user.user_id); }
@@ -1932,9 +2145,11 @@ async function handleClick(event) {
   if (action === "message-profile") return messageProfile(target.dataset.userId, target.dataset.name);
   if (action === "home-utility") return handleHomeUtility(target.dataset.utility);
   if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
-  if (action === "open-profile") { state.profileEditing = false; return navigateHash(`#profile-detail?user=${encodeURIComponent(target.dataset.userId || state.user.user_id)}`); }
+  if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(`#profile-detail?user=${encodeURIComponent(target.dataset.userId || state.user.user_id)}`); }
+  if (action === "return-from-profile") return navigateHash(state.profileReturnHash || "#profile");
   if (action === "return-from-account") return navigateHash(state.accountReturnHash || "#library");
   if (action === "return-to-profile") return navigateHash("#profile");
+  if (action === "return-from-study") return navigateHash(state.studyReturnHash || "#library");
   if (action === "select-avatar") {
     state.profileAvatarDraft = target.dataset.avatar || "";
     renderProfileEditorPage(state.user);
@@ -1968,7 +2183,7 @@ async function handleClick(event) {
       state.libraryGuideExpanded.clear();
     }
     savePreferences();
-    return renderLibrary("library");
+    return renderLibrary("library", { preserveContent: true, preserveScroll: true });
   }
   if (action === "guide-select") return selectGuideLevel(target.dataset.level, target.dataset.path);
   if (action === "toggle-guide-tags") {
@@ -2062,6 +2277,7 @@ async function handleClick(event) {
   if (action === "reload-note") return ensureQuestionNote(Number(target.dataset.occurrence), { force: true });
   if (action === "delete-note") return deleteQuestionNote(Number(target.dataset.occurrence), { fromList: target.dataset.fromList === "true" });
   if (action === "edit-personal-note") return editPersonalNote(Number(target.dataset.occurrence));
+  if (action === "load-more-personal") return loadMorePersonalFeed(target.dataset.kind, target);
   if (action === "toggle-model-list") return toggleProviderModelList(target.dataset.provider);
   if (action === "discover-models") return discoverProviderModels(target.dataset.provider);
   if (action === "select-provider-model") return selectProviderModel(target.dataset.provider, target.dataset.model);
@@ -2308,6 +2524,7 @@ async function toggleFavorite(button) {
         question_id: button.dataset.question || "",
       },
     });
+    invalidateStudySummary();
     applyFavoriteState(result.occurrence_id, Boolean(result.favorited));
     showToast(result.favorited ? "已收藏，并按原文件路径归档" : "已取消收藏");
   } catch (error) {
@@ -2355,6 +2572,14 @@ async function removeSavedOutlineItem(kind, itemKey) {
       total: state.outline.payload.items.length,
       saved: state.outline.payload.items.length,
     };
+    invalidateStudySummary();
+    if (!state.outline.payload.items.length) {
+      const returnHash = libraryRouteHash(kind, state.libraryPath[kind]);
+      state.outline = null;
+      showToast(kind === "wrong" ? "错题已删除" : "收藏已取消");
+      await navigateHash(returnHash);
+      return;
+    }
     renderOutline();
     showToast(kind === "wrong" ? "错题已删除" : "收藏已取消");
   } catch (error) {
@@ -2366,10 +2591,11 @@ async function removeCurrentWrong(itemKey) {
   if (!itemKey || itemKey.endsWith("undefined")) return;
   try {
     await api(`/study/wrong/${encodeURIComponent(itemKey)}`, { method: "DELETE", body: {} });
+    invalidateStudySummary();
     showToast("已从错题中移除");
     state.session.items.splice(state.sessionIndex, 1);
     if (!state.session.items.length) {
-      await navigateHash("#wrong");
+      await navigateHash(state.sessionReturnTarget?.hash || "#wrong");
       return;
     }
     state.sessionIndex = Math.min(state.sessionIndex, state.session.items.length - 1);
@@ -2682,6 +2908,9 @@ async function adminDeleteComment(commentId) {
     payload.items = (payload.items || []).filter((item) => item.comment_id !== commentId);
     payload.total = Math.max(0, Number(payload.total || 0) - 1);
     if (state.adminData.dashboard.activity) state.adminData.dashboard.activity.comments = Math.max(0, Number(state.adminData.dashboard.activity.comments || 0) - 1);
+    state.myComments = null;
+    state.myLikes = null;
+    invalidateStudySummary();
     renderAdminContent();
     showToast("评论已删除");
   } catch (error) {
@@ -2693,8 +2922,15 @@ async function openPersonalSource(target) {
   const collectionId = target.dataset.collection;
   const position = Number(target.dataset.position);
   if (!collectionId || !position) return;
-  state.accountReturnHash = location.hash || "#profile";
-  await startSession({ collectionId, position, path: collectionParentPath(target.dataset.path || ""), kind: "library", mode: "practice" });
+  const returnHash = normalizeStudyReturnHash(location.hash, "#library");
+  await startSession({
+    collectionId,
+    position,
+    path: collectionParentPath(target.dataset.path || ""),
+    kind: "library",
+    mode: "practice",
+    returnHash,
+  });
 }
 
 function setButtonBusy(button, busy, label = "处理中") {
@@ -2940,6 +3176,7 @@ function savePreferences() {
       searchSolutionVisibility: state.searchSolutionVisibility,
       searchSettingsExpanded: state.searchSettingsExpanded,
       libraryViewMode: state.libraryViewMode,
+      theme: state.theme,
     }));
   } catch (_) {
     // 浏览器禁用本地存储时仍可在当前会话使用设置。
@@ -2949,6 +3186,7 @@ function savePreferences() {
 try {
   const preferences = JSON.parse(localStorage.getItem(PREFERENCE_KEY) || "{}");
   if (preferences.searchMode) state.searchMode = preferences.searchMode;
+  if (["light", "dark"].includes(preferences.theme)) state.theme = preferences.theme;
   if (["folders", "guided"].includes(preferences.libraryViewMode)) state.libraryViewMode = preferences.libraryViewMode;
   if (Array.isArray(preferences.searchQuestionTypes)) {
     state.searchQuestionTypes = [...new Set(preferences.searchQuestionTypes.map((value) => String(value || "").trim()).filter(Boolean))];
