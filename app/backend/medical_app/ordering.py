@@ -9,8 +9,8 @@ from typing import Any
 # Product rules rather than locale collation. They keep the learning sequence
 # stable across Windows, Linux and SQLite versions.
 ROOT_ORDER = (
-    "专硕考研（306临床医学综合能力）",
-    "学硕考研（699联考西医综合）",
+    "专硕考研",
+    "学硕考研",
     "执业医师",
     "三基考试",
 )
