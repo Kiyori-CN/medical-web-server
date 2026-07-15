@@ -172,7 +172,7 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 
 AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` 保存标题和更新时间，`ai_messages` 保存 user/assistant 内容与引用 JSON。所有查询都带当前 profile 条件，删除会话通过外键级联删除消息；最多将 6 条题库检索结果拼入一次非流式 LLM 请求，引用只保存题目 ID、occurrence 和来源路径，不复制私有笔记或私信。
 
-论坛状态补充实体：`forum_sections` 保存本地分区，`forum_topics` 保存作者快照、标题、正文和状态，`forum_replies` 保存楼层回复、可选父回复和状态，`forum_reactions` 以 `(target_type, target_id, profile_id)` 保存赞同/反对唯一状态。列表按分区/关键词/最后活动分页，删除使用软删除状态；任何更新、删除都由服务端验证当前作者或管理员角色，已删除或隐藏内容不可再次编辑或互动，作者本人不能给自己的内容表态。回复通知复用 `notifications(kind='reply')`，楼主与父回复作者去重后写入；首次切换为赞同时复用 `kind='agree'`，相同状态重复提交不重复通知。公开个人资料的动态在读取时合并题目评论、可见论坛主题和可见论坛回复，获赞统计合并非本人给予的评论与论坛赞同。
+论坛状态补充实体：`forum_sections` 保存本地分区，`forum_topics` 保存作者快照、标题、正文和状态，`forum_replies` 保存楼层回复、可选父回复和状态，`forum_reactions` 以 `(target_type, target_id, profile_id)` 保存赞同/反对唯一状态。`parent_reply_id` 只能指向同主题内仍可见的回复，详情通过父回复作者快照返回 `parent_author_name`。列表按分区/关键词/最后活动分页，删除使用软删除状态；任何更新、删除都由服务端验证当前作者或管理员角色，已删除或隐藏内容不可再次编辑或互动，作者本人不能给自己的内容表态。回复通知复用 `notifications(kind='reply')`，楼主与父回复作者去重后写入；回复正文按账号用户名规则最多解析 20 个唯一 `@用户名`，只向有效账号写入 `kind='mention'`，并排除作者自己以及已经收到本次回复通知的账号。首次切换为赞同时复用 `kind='agree'`，相同状态重复提交不重复通知。公开个人资料的动态在读取时合并题目评论、可见论坛主题和可见论坛回复，获赞统计合并非本人给予的评论与论坛赞同。
 
 题库导出不创建新的事实源或状态表。`medical_app.catalog_export` 通过 SQLite `mode=ro` 与 `query_only` 读取当前激活 catalog，按 `collection_questions → question_occurrences → question_versions` 输出原题版本，并携带 collection 路径及位置。JSONL 使用结构化 `options`，CSV 使用 A–H 平铺列并中和电子表格公式前缀；生成器逐行读取，响应不缓存、不经 Nginx 缓冲，也不读取 `state/`。
 

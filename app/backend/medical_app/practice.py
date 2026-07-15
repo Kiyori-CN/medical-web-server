@@ -1752,7 +1752,7 @@ class PracticeStore:
             actor = row["actor_name"] or "用户"
             message = {
                 "system": row["body"] or "有一条新的系统通知",
-                "replies": f"{actor} {row['body']}" if row["body"].startswith("论坛回复：") else f"{actor} 回复或提到了你",
+                "replies": f"{actor} {row['body']}" if row["body"].startswith(("论坛回复：", "论坛提及：")) else f"{actor} 回复或提到了你",
                 "agreements": f"{actor} {row['body']}" if row["body"].startswith("赞同了你的论坛") else f"{actor} 赞同了你的评论",
             }[category]
             items.append(

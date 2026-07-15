@@ -19,6 +19,24 @@ def _forum_services(tmp_path: Path):
     return alice, bob, alice_store, bob_store
 
 
+def _initialize_notifications(database_path: Path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE notifications (
+                notification_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                actor_id TEXT NOT NULL DEFAULT '',
+                comment_id TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                read_at TEXT
+            )
+            """
+        )
+
+
 def test_forum_topic_reply_search_and_permissions(tmp_path: Path):
     alice, bob, alice_store, bob_store = _forum_services(tmp_path)
     sections = alice_store.sections()
@@ -34,21 +52,7 @@ def test_forum_topic_reply_search_and_permissions(tmp_path: Path):
         "study": 0,
         "questions": 1,
     }
-    with sqlite3.connect(alice_store.database_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE notifications (
-                notification_id TEXT PRIMARY KEY,
-                profile_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                actor_id TEXT NOT NULL DEFAULT '',
-                comment_id TEXT NOT NULL DEFAULT '',
-                body TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                read_at TEXT
-            )
-            """
-        )
+    _initialize_notifications(alice_store.database_path)
     listing = bob_store.list_topics(section_id="questions", query="主动转运")
     assert listing["total"] == 1
     assert listing["items"][0]["topic_id"] == topic["topic_id"]
@@ -154,4 +158,64 @@ def test_forum_validates_lengths_and_parent_topic(tmp_path: Path):
             body="尝试按章节拆分。",
             author_name="Alice",
             parent_reply_id="missing",
+        )
+
+
+def test_forum_nested_replies_and_mentions_are_deduplicated(tmp_path: Path):
+    alice, bob, alice_store, bob_store = _forum_services(tmp_path)
+    charlie = AuthStore(alice_store.database_path).register(
+        "CharlieUser", "StrongPass3!"
+    )
+    charlie_store = ForumStore(alice_store.database_path, charlie["user_id"])
+    _initialize_notifications(alice_store.database_path)
+    topic = alice_store.create_topic(
+        section_id="study",
+        title="如何安排错题复习节奏",
+        body="想把错题回顾安排进每日复习计划。",
+        author_name="Alice",
+    )
+    parent = alice_store.create_reply(
+        topic["topic_id"],
+        body="可以先按知识点分组。",
+        author_name="Alice",
+    )
+    child = bob_store.create_reply(
+        topic["topic_id"],
+        body="请@CharlieUser @CharlieUser 补充；@Alice 谢谢。@MissingUser @BobUser",
+        author_name="BobUser",
+        parent_reply_id=parent["reply_id"],
+    )
+
+    assert child["parent_reply_id"] == parent["reply_id"]
+    detail = alice_store.get_topic(topic["topic_id"], viewer_is_admin=True)
+    nested = next(item for item in detail["replies"] if item["reply_id"] == child["reply_id"])
+    assert nested["parent_reply_id"] == parent["reply_id"]
+    assert nested["parent_author_name"] == "Alice"
+
+    with sqlite3.connect(alice_store.database_path) as connection:
+        notifications = connection.execute(
+            """
+            SELECT profile_id, kind, actor_id, comment_id, body
+            FROM notifications
+            WHERE comment_id = ?
+            ORDER BY profile_id, kind
+            """,
+            (child["reply_id"],),
+        ).fetchall()
+    assert len(notifications) == 2
+    assert {
+        (row[0], row[1], row[2], row[3]) for row in notifications
+    } == {
+        (alice["user_id"], "reply", bob["user_id"], child["reply_id"]),
+        (charlie["user_id"], "mention", bob["user_id"], child["reply_id"]),
+    }
+    assert all(row[4].startswith("论坛") for row in notifications)
+
+    assert alice_store.delete_reply(parent["reply_id"]) is True
+    with pytest.raises(ForumNotFound, match="回复目标"):
+        charlie_store.create_reply(
+            topic["topic_id"],
+            body="不能回复已经删除的楼层。",
+            author_name="CharlieUser",
+            parent_reply_id=parent["reply_id"],
         )

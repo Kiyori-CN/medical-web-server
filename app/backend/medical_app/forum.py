@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 import secrets
 import sqlite3
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -67,6 +69,8 @@ DEFAULT_SECTIONS = (
     ("study", "学习交流", "复习方法、知识梳理与备考经验", 10),
     ("questions", "题目讨论", "围绕原题、解析和易错点展开讨论", 20),
 )
+_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_.@-])@([\w.-]{3,32})(?![\w.-])", re.UNICODE)
+_MENTION_LIMIT = 20
 
 
 class ForumNotFound(LookupError):
@@ -241,6 +245,7 @@ class ForumStore:
                 """
                 SELECT r.reply_id, r.topic_id, r.author_id, r.author_name, r.body,
                        r.parent_reply_id, r.status, r.created_at, r.updated_at,
+                       COALESCE(p.author_name, '') AS parent_author_name,
                        (SELECT COUNT(*) FROM forum_reactions fr
                         WHERE fr.target_type = 'reply' AND fr.target_id = r.reply_id
                           AND fr.reaction = 'agree') AS agree_count,
@@ -251,6 +256,7 @@ class ForumStore:
                                  WHERE fr.target_type = 'reply' AND fr.target_id = r.reply_id
                                    AND fr.profile_id = ?), '') AS my_reaction
                 FROM forum_replies r
+                LEFT JOIN forum_replies p ON p.reply_id = r.parent_reply_id
                 WHERE r.topic_id = ? AND (r.status = 'visible' OR r.author_id = ? OR ? = 1)
                 ORDER BY r.created_at, r.rowid
                 LIMIT 500
@@ -319,13 +325,21 @@ class ForumStore:
             connection.execute(
                 "UPDATE forum_topics SET updated_at = ? WHERE topic_id = ?", (now, topic_id)
             )
-            self._notify_reply(
+            notified = self._notify_reply(
                 connection,
                 reply_id=reply_id,
                 topic_author_id=topic["author_id"],
                 parent_author_id=parent_author_id,
                 topic_title=topic["title"],
                 created_at=now,
+            )
+            self._notify_mentions(
+                connection,
+                reply_id=reply_id,
+                body=body,
+                topic_title=topic["title"],
+                created_at=now,
+                excluded_recipients=notified,
             )
             connection.commit()
         return {
@@ -483,12 +497,12 @@ class ForumStore:
         parent_author_id: str,
         topic_title: str,
         created_at: str,
-    ) -> None:
+    ) -> set[str]:
         notifications_available = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notifications'"
         ).fetchone()
         if notifications_available is None:
-            return
+            return set()
         recipients = {
             user_id
             for user_id in (topic_author_id, parent_author_id)
@@ -508,6 +522,65 @@ class ForumStore:
                     self.profile_id,
                     reply_id,
                     f"论坛回复：{display_text(topic_title)[:160]}",
+                    created_at,
+                ),
+            )
+        return recipients
+
+    def _notify_mentions(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        reply_id: str,
+        body: str,
+        topic_title: str,
+        created_at: str,
+        excluded_recipients: set[str],
+    ) -> None:
+        required_tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('notifications', 'users')"
+            )
+        }
+        if required_tables != {"notifications", "users"}:
+            return
+        usernames: list[str] = []
+        seen: set[str] = set()
+        for match in _MENTION_RE.finditer(body):
+            username = unicodedata.normalize("NFKC", match.group(1)).casefold()
+            if username in seen:
+                continue
+            seen.add(username)
+            usernames.append(username)
+            if len(usernames) >= _MENTION_LIMIT:
+                break
+        if not usernames:
+            return
+        placeholders = ", ".join("?" for _ in usernames)
+        recipients = {
+            row["user_id"]
+            for row in connection.execute(
+                f"SELECT user_id FROM users WHERE status = 'active' AND normalized_username IN ({placeholders})",
+                usernames,
+            )
+            if row["user_id"] != self.profile_id
+            and row["user_id"] not in excluded_recipients
+        }
+        for recipient_id in sorted(recipients):
+            connection.execute(
+                """
+                INSERT INTO notifications(
+                    notification_id, profile_id, kind, actor_id,
+                    comment_id, body, created_at
+                ) VALUES (?, ?, 'mention', ?, ?, ?, ?)
+                """,
+                (
+                    f"ntf_{secrets.token_hex(10)}",
+                    recipient_id,
+                    self.profile_id,
+                    reply_id,
+                    f"论坛提及：{display_text(topic_title)[:160]}",
                     created_at,
                 ),
             )
