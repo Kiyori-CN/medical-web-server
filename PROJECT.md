@@ -14,6 +14,7 @@
 - 服务：`medical-exam.service`
 - 端口：`8080`
 - 环境文件：`/etc/medical-exam.env`
+- Nginx：直接提供 `public/` 静态文件并在 HTTPS 层统一返回 HSTS、nosniff、DENY、Referrer-Policy 与 CSP；
 - 部署命令：`projectsctl update medical-web-server <artifact.tar.gz>`
 
 本地工作区是唯一源码编辑位置，GitHub `main` 是唯一发布源，服务器仓库只作为干净部署镜像。不得直接修改运行目录并把服务器临时文件反向作为源码。

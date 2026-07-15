@@ -37,6 +37,16 @@ C:\Users\admin\.codex\skills\tencent-cloud\scripts\tencent-cloud.ps1
 - 公网：`https://medical.newapi.com.cn/`；
 - 环境文件：`/etc/medical-exam.env`，权限 `600`。
 
+Nginx 直接从 `/srv/projects/medical-web-server/public` 提供首页和静态资源，不能依赖 Flask 的 `after_request` 为这些响应补安全头。`medical.newapi.com.cn` 的 HTTPS server 必须统一设置：
+
+- `Strict-Transport-Security: max-age=31536000`；
+- `X-Content-Type-Options: nosniff`；
+- `X-Frame-Options: DENY`；
+- `Referrer-Policy: strict-origin-when-cross-origin`；
+- 与应用一致的 `Content-Security-Policy`。
+
+修改站点配置前先执行环境配置备份和 `nginx -t`，修改后只在全局 Nginx 配置可安全热重载时 reload，并从公网逐项核对响应头。若其他站点的活动 `proxy_cache` 共享区路径发生漂移，必须先按对应项目规范完成缓存路径迁移，不能用重建旧目录绕过问题。
+
 ## 本次全新重建
 
 用户已明确授权删除 `/srv/projects/medical-web-server` 内的旧代码、旧数据库、旧题库、旧向量和旧状态，并重新部署当前项目；不保留旧项目回滚数据。域名、正式根目录、Nginx 入口和项目名保持不变。
@@ -178,6 +188,7 @@ curl -fsS -X POST http://127.0.0.1:8080/api/search \
 最终检查：
 
 - 公网 HTTPS 正常；
+- 公网首页和静态资源返回 HSTS、nosniff、DENY、Referrer-Policy 与 CSP；
 - 首次管理员初始化只有一次；
 - 普通用户无管理权限；
 - 真实统计与本地一致；

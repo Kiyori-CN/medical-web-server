@@ -203,6 +203,7 @@ python -m pytest
 - 生产站点：`https://medical.newapi.com.cn/`
 - 服务：`medical-exam.service`
 - 服务停止超时：`TimeoutStopSec=45s`（systemd drop-in），确保 Gunicorn 优雅退出；
+- Nginx 静态层：公网首页与资源统一返回 HSTS、nosniff、DENY、Referrer-Policy 和 CSP；
 - 端口：`8080`
 - 运行目录：`/srv/projects/medical-web-server/app/backend`
 - 题库目录：`/srv/projects/medical-web-server/knowledge-base`

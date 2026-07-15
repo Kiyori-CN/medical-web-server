@@ -188,4 +188,6 @@ curl -fsS -X POST http://127.0.0.1:8080/api/search \
 
 `medical-exam.service` 必须通过 `/etc/systemd/system/medical-exam.service.d/timeout.conf` 设置 `TimeoutStopSec=45s`，不得短于 Gunicorn 的 30 秒 `graceful_timeout`。每次部署都要确认旧主进程显示 `Deactivated successfully`，不得出现 `stop-sigterm timed out`、`status=9/KILL` 或 `Failed with result 'timeout'`。
 
+生产 Nginx 直接提供 `public/` 静态文件，因此 HTTPS server 必须在 Nginx 层返回 HSTS、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: strict-origin-when-cross-origin` 和与 Flask 一致的 CSP。修改后必须先 `nginx -t`，再热重载并从公网逐项核对响应头；不得只验证 8080 直连响应。
+
 还要验证公网域名、首次管理员初始化、普通用户权限、模型密钥掩码、真实搜题、四种刷题模式、服务日志、内存和延迟。
