@@ -98,6 +98,10 @@ def test_main_auth_roles_health_assets_and_practice(
     assert client.get("/api/admin/dashboard").status_code == 200
     assert client.get("/api/admin/comments").status_code == 200
     assert client.get("/api/admin/vectors").get_json()["operation"]["status"] == "idle"
+    personal_export = client.get("/api/study/export?format=jsonl")
+    assert personal_export.status_code == 200
+    assert personal_export.headers["Cache-Control"] == "private, no-store"
+    assert personal_export.headers["X-Accel-Buffering"] == "no"
     stats = client.get("/api/stats").get_json()
     assert stats["questions"] == 5
     jsonl_export = client.get("/api/admin/catalog/export?format=jsonl")

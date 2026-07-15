@@ -1708,7 +1708,7 @@ async function renderMyHomePage() {
     const profile = await api(`/profiles/${encodeURIComponent(user.user_id)}`);
     state.publicProfile = profile;
     const stats = profile.stats || {};
-    const commonActions = `${user.role === "admin" ? homeUtility("系统管理", "admin", "admin", "open-admin") : ""}${homeUtility("下载", "download", "download")}`;
+    const commonActions = `${user.role === "admin" ? homeUtility("系统管理", "admin", "admin", "open-admin") : ""}${homeUtility("下载数据", "download", "download")}`;
     container.innerHTML = `<div class="my-home">
       <section class="my-home-hero" data-action="open-own-profile" role="button" tabindex="0"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div><h1>${escapeHtml(profile.username || "我的")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div><span class="my-home-chevron">›</span></section>
       <nav class="my-home-stats card" aria-label="个人数据">${profileStatLink("dynamics", "动态", stats.dynamics || 0, "profile-detail", profile.user_id, "#profile")}${profileStatLink("following", "关注", stats.following || 0, "connections", profile.user_id, "#profile")}${profileStatLink("followers", "粉丝", stats.followers || 0, "connections", profile.user_id, "#profile")}</nav>
@@ -1999,6 +1999,7 @@ async function messageProfile(userId, name) {
 
 function handleHomeUtility(utility) {
   if (utility === "settings") return navigateHash("#settings");
+  if (utility === "download") return exportPersonalStudy();
   const labels = { download: "下载", help: "帮助中心", contact: "联系客服", feedback: "意见反馈" };
   return showToast(`${labels[utility] || "该功能"}即将开放`);
 }
@@ -2759,6 +2760,36 @@ function exportAdminCatalog(form) {
   link.click();
   link.remove();
   showToast("题库导出已开始");
+}
+
+async function exportPersonalStudy() {
+  try {
+    const response = await fetch(`${API}/study/export?format=jsonl`, {
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      let message = `导出失败（${response.status}）`;
+      try {
+        const payload = await response.json();
+        message = payload.error || message;
+      } catch (_) {
+        // Keep the status-based message when the server did not return JSON.
+      }
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "medical-study-jsonl.jsonl";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast("个人学习数据导出已开始");
+  } catch (error) {
+    showToast(error.message || "学习数据导出失败", "error");
+  }
 }
 
 function renderCatalogImportWorkspace(activeImport, imports) {

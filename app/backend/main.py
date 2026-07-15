@@ -27,6 +27,7 @@ from medical_app.practice_api import create_practice_blueprint
 from medical_app.semantic import SemanticSearchService
 from medical_app.settings import SettingsStore
 from medical_app.settings_api import create_settings_blueprint
+from medical_app.study_export import create_study_export_blueprint
 from medical_app.vector_admin import VectorOperationManager, create_vector_admin_blueprint
 
 
@@ -81,6 +82,7 @@ def create_app() -> Flask:
     application.register_blueprint(create_catalog_blueprint(catalog_path, semantic_service))
     application.register_blueprint(create_forum_blueprint(config.APP_DB))
     application.register_blueprint(create_forum_admin_blueprint(config.APP_DB))
+    application.register_blueprint(create_study_export_blueprint(config.APP_DB))
     application.register_blueprint(
         create_ai_blueprint(
             config.APP_DB,

@@ -32,7 +32,7 @@ knowledge-base/
     build-state.json            可恢复构建进度
 
 state/
-  app.sqlite3                   账号、资料隐私、头像、会话、文件刷题状态、收藏、错题、私有笔记、评论、关注、反应、通知、私信、AI 会话消息、论坛主题回复与审核审计
+  app.sqlite3                   账号、资料隐私、头像、会话、文件刷题状态、收藏、错题、私有笔记、评论、关注、反应、通知、私信、AI 会话消息、论坛主题回复与审核审计；个人导出只读这些账号状态
   import-staging/               管理员通用题库导入预检源文件与 manifest；不进入 catalog 或 Git
   settings.sqlite3              网站与模型设置
   settings.key                  设置加密密钥
@@ -175,6 +175,8 @@ AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` �
 论坛状态补充实体：`forum_sections` 保存本地分区，`forum_topics` 保存作者快照、标题、正文和 `open/hidden/deleted` 状态，`forum_replies` 保存楼层回复、可选父回复和 `visible/hidden/deleted` 状态，`forum_reactions` 以 `(target_type, target_id, profile_id)` 保存赞同/反对唯一状态。`parent_reply_id` 只能指向同主题内仍可见的回复，详情通过父回复作者快照返回 `parent_author_name`。列表按分区/关键词/最后活动分页，删除使用软删除状态；任何更新、删除都由服务端验证当前作者或管理员角色，已删除或隐藏内容不可再次编辑或互动，作者本人不能给自己的内容表态。`forum_moderation_log` 是只追加审核记录，保存目标、主题、管理员快照、动作、前后状态、原因和时间；管理员审核状态转换使用 `BEGIN IMMEDIATE`，恢复回复前验证所属主题公开，既有管理员跨作者编辑/删除也自动留痕。回复通知复用 `notifications(kind='reply')`，楼主与父回复作者去重后写入；回复正文按账号用户名规则最多解析 20 个唯一 `@用户名`，只向有效账号写入 `kind='mention'`，并排除作者自己以及已经收到本次回复通知的账号。首次切换为赞同时复用 `kind='agree'`，相同状态重复提交不重复通知。公开个人资料的动态在读取时合并题目评论、可见论坛主题和可见论坛回复，获赞统计合并非本人给予的评论与论坛赞同。
 
 题库导出不创建新的事实源或状态表。`medical_app.catalog_export` 通过 SQLite `mode=ro` 与 `query_only` 读取当前激活 catalog，按 `collection_questions → question_occurrences → question_versions` 输出原题版本，并携带 collection 路径及位置。JSONL 使用结构化 `options`，CSV 使用 A–H 平铺列并中和电子表格公式前缀；生成器逐行读取，响应不缓存、不经 Nginx 缓冲，也不读取 `state/`。
+
+个人学习数据导出不创建新表。`medical_app.study_export` 通过 SQLite `mode=ro` 与 `query_only` 读取 `study_items`、`question_notes`、`question_progress`、`collection_question_progress`、`practice_sessions` 和 `practice_session_questions`，每条查询都绑定当前会话的 `profile_id`。JSONL 以 `record_type` 区分收藏/错题、笔记、进度、文件进度、会话和逐题作答；CSV 使用固定列并中和公式前缀。生成器逐行输出并返回 `private, no-store` 与 `X-Accel-Buffering: no`，不读取 catalog、设置密钥或其他账号状态。
 
 导入预检由 `medical_app.catalog_import` 管理权限固定为 `0700` 的 `state/import-staging/imp_*/`。目录内只保存随机命名的 `source.csv|jsonl|json` 和原子写入的 `manifest.json`；manifest 记录安全文件名、哈希、大小、字段、映射、行数、有限错误摘要与最多 10 条标准化样例。CSV/JSONL 逐行读取，JSON 受 16 MB 硬上限约束；任何预检都不调用 builder、不写 catalog、不改变激活指针或向量。后续正式导入必须从 staging 构建新的不可变 catalog 并在完整性检查后原子激活。
 

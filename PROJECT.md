@@ -27,14 +27,14 @@
 - 管理员可选配第三方大模型与嵌入 API；
 - 管理员和普通用户界面、权限明确分离；
 - 登录用户可验证当前密码后修改密码，修改或管理员重置密码都会撤销既有会话；
-- AI 对话复用现有本地账号、模型设置和秘密存储边界；会话与消息写入 `state/app.sqlite3`，回答使用有限题库检索上下文并附来源引用。
+- AI 对话复用现有本地账号、模型设置和秘密存储边界；会话与消息写入 `state/app.sqlite3`，回答使用有限题库检索上下文并附来源引用；登录用户可导出自己的学习状态。
 
 ## 数据事实源
 
 1. 原始 Excel/Word 是审计与重建输入，不由应用修改。
 2. `catalog.sqlite3` 是只读规范题库事实源。
 3. FTS 和向量是可重建派生索引。
-4. `state/app.sqlite3` 是账号、头像、会话、文件刷题状态、收藏、错题、私有笔记、原题评论、AI 会话消息、论坛主题回复与论坛审核审计事实源。
+4. `state/app.sqlite3` 是账号、头像、会话、文件刷题状态、收藏、错题、私有笔记、原题评论、AI 会话消息、论坛主题回复与论坛审核审计事实源；个人学习导出只读其中当前账号的数据。
 5. `state/settings.sqlite3` 保存网站和模型配置，API 密钥使用 `state/settings.key` 加密。
 
 每个具体源文件是独立 collection。`question_id` 用于规范题、搜索和向量，`occurrence_id` 用于原文件展示、排序、会话和判分。同名但扩展名不同的文件不得合并。
@@ -58,6 +58,7 @@
 - 练习和测试允许未答交卷；
 - 手机端进入会话后隐藏全站导航，提供左右滑动和可下拉关闭的题号抽屉；
 - 收藏是可取消的账号状态，错题可以在原路径目录或错题会话中删除。
+- 个人学习数据导出只读取当前账号的收藏、错题、私有笔记、规范题/文件题进度、练习会话和逐题作答记录；JSONL/CSV 均流式输出，禁止跨账号读取或写入 catalog。
 - 题号目录重置只删除当前账号、当前 collection 的 `collection_question_progress` 投影，不删除历史会话、收藏、错题或评论；同一规范题在其他文件中的状态不受影响；
 - 评论绑定具体 `occurrence_id` 并保存 `question_id` 和作者名快照；评论仅在答案解析解锁后显示于标准解析下方，所有登录用户可读写，作者可删除自己的评论，管理员可删除任意评论；
 - 私有笔记以 `(profile_id, occurrence_id)` 唯一保存，位于标准解析与评论之间；只允许当前账号读写，不进入 catalog、FTS、向量或搜题结果；
@@ -120,3 +121,5 @@ AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conve
 题库导出 API 为 `GET /api/admin/catalog/export?format=jsonl|csv`，可选 `collection_id` 精确限制到单个题库文件。接口仅允许管理员，使用 SQLite 只读连接逐行输出，并返回 `Cache-Control: private, no-store` 与 `X-Accel-Buffering: no`。
 
 题库导入预检 API 为 `GET/POST /api/admin/catalog/imports`、`POST /api/admin/catalog/imports/<id>/analyze` 和 `DELETE /api/admin/catalog/imports/<id>`。上传与重新分析/删除要求管理员和 CSRF；暂存源文件与 manifest 位于生产 `state/`，不进入 Git、发布包、catalog 或向量。
+
+个人学习数据 API 为 `GET /api/study/export?format=jsonl|csv`，仅登录用户可读，按 `profile_id` 导出收藏、错题、笔记、进度、会话和作答记录，响应禁止缓存和代理缓冲，CSV 公式前缀会被中和。
