@@ -3,6 +3,7 @@ from pathlib import Path
 from medical_app.auth import AuthStore
 from medical_app.builder import build_catalog
 from medical_app.catalog import Catalog
+from medical_app.forum import ForumStore
 import pytest
 
 from medical_app.practice import PracticeForbidden, PracticeStore
@@ -93,6 +94,26 @@ def test_public_profile_follow_messages_and_comment_interactions(
     assert parent["agree_count"] == 1
     assert parent["reply_count"] == 1
     assert bob_store.my_likes()["total"] == 1
+
+    alice_forum = ForumStore(alice_store.database_path, alice["user_id"])
+    alice_forum.initialize()
+    bob_forum = ForumStore(alice_store.database_path, bob["user_id"])
+    topic = alice_forum.create_topic(
+        section_id="study",
+        title="如何安排每日复习计划",
+        body="希望把章节练习拆成稳定的每日任务。",
+        author_name="Alice",
+    )
+    bob_forum.create_reply(
+        topic["topic_id"], body="可以按章节和错题数量分配。", author_name="BobUser"
+    )
+    alice_dynamics = bob_store.public_profile(alice["user_id"])["dynamics"]
+    bob_dynamics = alice_store.public_profile(bob["user_id"])["dynamics"]
+    assert {item["kind"] for item in alice_dynamics} >= {"comment", "forum_topic"}
+    assert any(
+        item["kind"] == "forum_reply" and item["topic_id"] == topic["topic_id"]
+        for item in bob_dynamics
+    )
 
     message = bob_store.send_message(alice["user_id"], "一起复习这道题。")
     assert message["receiver_id"] == alice["user_id"]

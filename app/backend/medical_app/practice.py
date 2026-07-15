@@ -1569,20 +1569,83 @@ class PracticeStore:
         return profile
 
     def _public_dynamics(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
         connection = self.connect()
         try:
-            rows = connection.execute(
+            comment_rows = connection.execute(
                 """
                 SELECT comment_id, occurrence_id, question_id, author_id, author_name,
                        body, parent_comment_id, created_at, updated_at
                 FROM question_comments WHERE author_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 """,
-                (user_id, max(1, min(int(limit), 100))),
+                (user_id, limit),
             ).fetchall()
+            has_forum = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'forum_topics'"
+            ).fetchone()
+            if has_forum:
+                topic_rows = connection.execute(
+                    """
+                    SELECT t.topic_id, t.title, t.body, t.created_at, t.updated_at,
+                           (SELECT COUNT(*) FROM forum_replies r
+                            WHERE r.topic_id = t.topic_id AND r.status = 'visible') AS reply_count
+                    FROM forum_topics t
+                    WHERE t.author_id = ? AND t.status = 'open'
+                    ORDER BY t.created_at DESC LIMIT ?
+                    """,
+                    (user_id, limit),
+                ).fetchall()
+                reply_rows = connection.execute(
+                    """
+                    SELECT r.reply_id, r.topic_id, r.body, r.created_at, r.updated_at,
+                           t.title AS topic_title
+                    FROM forum_replies r
+                    JOIN forum_topics t ON t.topic_id = r.topic_id
+                    WHERE r.author_id = ? AND r.status = 'visible' AND t.status = 'open'
+                    ORDER BY r.created_at DESC LIMIT ?
+                    """,
+                    (user_id, limit),
+                ).fetchall()
+            else:
+                topic_rows = []
+                reply_rows = []
         finally:
             connection.close()
-        return self._decorate_comments(rows, viewer_is_admin=False, include_question=True)
+        items = self._decorate_comments(
+            comment_rows, viewer_is_admin=False, include_question=True
+        )
+        for item in items:
+            item["kind"] = "comment"
+        items.extend(
+            {
+                "kind": "forum_topic",
+                "topic_id": row["topic_id"],
+                "title": row["title"],
+                "body": row["body"],
+                "reply_count": int(row["reply_count"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in topic_rows
+        )
+        items.extend(
+            {
+                "kind": "forum_reply",
+                "reply_id": row["reply_id"],
+                "topic_id": row["topic_id"],
+                "topic_title": row["topic_title"],
+                "body": row["body"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in reply_rows
+        )
+        items.sort(
+            key=lambda item: (item.get("created_at", ""), item.get("kind", "")),
+            reverse=True,
+        )
+        return items[:limit]
 
     def list_messages(self, category: str = "all") -> dict[str, Any]:
         connection = self.connect()

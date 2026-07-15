@@ -226,6 +226,8 @@ class ForumStore:
         with self._connect() as connection:
             row = self._topic_row(connection, topic_id)
             self._require_owner(row["author_id"], viewer_is_admin)
+            if row["status"] != "open":
+                raise ForumForbidden("已删除或隐藏的主题不能编辑")
             now = _utc_now()
             connection.execute(
                 "UPDATE forum_topics SET title = ?, body = ?, updated_at = ? WHERE topic_id = ?",
@@ -262,19 +264,29 @@ class ForumStore:
             topic = self._topic_row(connection, topic_id)
             if topic["status"] != "open":
                 raise ForumForbidden("该主题不可回复")
+            parent_author_id = ""
             if parent_reply_id:
                 parent = connection.execute(
-                    "SELECT reply_id FROM forum_replies WHERE reply_id = ? AND topic_id = ? AND status = 'visible'",
+                    "SELECT reply_id, author_id FROM forum_replies WHERE reply_id = ? AND topic_id = ? AND status = 'visible'",
                     (parent_reply_id, topic_id),
                 ).fetchone()
                 if parent is None:
                     raise ForumNotFound("回复目标不存在")
+                parent_author_id = parent["author_id"]
             connection.execute(
                 "INSERT INTO forum_replies(reply_id, topic_id, author_id, author_name, body, parent_reply_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (reply_id, topic_id, self.profile_id, author_name, body, parent_reply_id or None, now, now),
             )
             connection.execute(
                 "UPDATE forum_topics SET updated_at = ? WHERE topic_id = ?", (now, topic_id)
+            )
+            self._notify_reply(
+                connection,
+                reply_id=reply_id,
+                topic_author_id=topic["author_id"],
+                parent_author_id=parent_author_id,
+                topic_title=topic["title"],
+                created_at=now,
             )
             connection.commit()
         return {
@@ -295,6 +307,8 @@ class ForumStore:
         with self._connect() as connection:
             row = self._reply_row(connection, reply_id)
             self._require_owner(row["author_id"], viewer_is_admin)
+            if row["status"] != "visible":
+                raise ForumForbidden("已删除或隐藏的回复不能编辑")
             now = _utc_now()
             connection.execute(
                 "UPDATE forum_replies SET body = ?, updated_at = ? WHERE reply_id = ?",
@@ -334,6 +348,44 @@ class ForumStore:
     def _require_owner(self, author_id: str, viewer_is_admin: bool) -> None:
         if author_id != self.profile_id and not viewer_is_admin:
             raise ForumForbidden("只能管理自己的论坛内容")
+
+    def _notify_reply(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        reply_id: str,
+        topic_author_id: str,
+        parent_author_id: str,
+        topic_title: str,
+        created_at: str,
+    ) -> None:
+        notifications_available = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notifications'"
+        ).fetchone()
+        if notifications_available is None:
+            return
+        recipients = {
+            user_id
+            for user_id in (topic_author_id, parent_author_id)
+            if user_id and user_id != self.profile_id
+        }
+        for recipient_id in recipients:
+            connection.execute(
+                """
+                INSERT INTO notifications(
+                    notification_id, profile_id, kind, actor_id,
+                    comment_id, body, created_at
+                ) VALUES (?, ?, 'reply', ?, ?, ?, ?)
+                """,
+                (
+                    f"ntf_{secrets.token_hex(10)}",
+                    recipient_id,
+                    self.profile_id,
+                    reply_id,
+                    f"论坛回复：{display_text(topic_title)[:160]}",
+                    created_at,
+                ),
+            )
 
     def _topic_summary(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)

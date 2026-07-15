@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -33,6 +34,21 @@ def test_forum_topic_reply_search_and_permissions(tmp_path: Path):
         "study": 0,
         "questions": 1,
     }
+    with sqlite3.connect(alice_store.database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE notifications (
+                notification_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                actor_id TEXT NOT NULL DEFAULT '',
+                comment_id TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                read_at TEXT
+            )
+            """
+        )
     listing = bob_store.list_topics(section_id="questions", query="主动转运")
     assert listing["total"] == 1
     assert listing["items"][0]["topic_id"] == topic["topic_id"]
@@ -45,15 +61,43 @@ def test_forum_topic_reply_search_and_permissions(tmp_path: Path):
     assert detail["topic"]["reply_count"] == 1
     assert detail["replies"][0]["reply_id"] == reply["reply_id"]
     assert detail["replies"][0]["can_manage"] is True
+    with sqlite3.connect(alice_store.database_path) as connection:
+        notification = connection.execute(
+            "SELECT profile_id, kind, actor_id, comment_id, body FROM notifications"
+        ).fetchone()
+    assert notification[:4] == (
+        alice["user_id"],
+        "reply",
+        bob["user_id"],
+        reply["reply_id"],
+    )
+    assert notification[4].startswith("论坛回复：细胞膜运输方式")
+
+    updated_topic = alice_store.update_topic(
+        topic["topic_id"],
+        title="细胞膜运输方式如何区分",
+        body="请结合能量消耗和转运方向说明关键区别。",
+    )
+    assert updated_topic["title"] == "细胞膜运输方式如何区分"
+    updated_reply = bob_store.update_reply(
+        reply["reply_id"], body="关键是能量消耗、载体参与和转运方向。"
+    )
+    assert updated_reply["body"].startswith("关键是能量消耗")
 
     with pytest.raises(ForumForbidden):
         bob_store.delete_topic(topic["topic_id"])
     assert alice_store.delete_reply(reply["reply_id"], viewer_is_admin=True) is True
+    with pytest.raises(ForumForbidden, match="不能编辑"):
+        bob_store.update_reply(reply["reply_id"], body="不能更新已删除回复")
     assert alice_store.delete_topic(topic["topic_id"], viewer_is_admin=True) is True
     assert {item["section_id"]: item["topic_count"] for item in alice_store.sections()} == {
         "study": 0,
         "questions": 0,
     }
+    with pytest.raises(ForumForbidden, match="不能编辑"):
+        alice_store.update_topic(
+            topic["topic_id"], title="不能更新已删除主题", body="删除后不允许编辑。"
+        )
     with pytest.raises(ForumNotFound):
         bob_store.get_topic(topic["topic_id"])
 

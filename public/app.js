@@ -1905,6 +1905,10 @@ function submitProfileConnectionsSearch(form) {
 }
 
 function profileDynamicCard(item) {
+  if (item.kind === "forum_topic" || item.kind === "forum_reply") {
+    const topicTitle = item.kind === "forum_topic" ? item.title : item.topic_title;
+    return `<article class="card profile-dynamic-card"><div class="profile-dynamic-meta"><span>${item.kind === "forum_topic" ? "论坛主题" : "论坛回复"}</span><time>${escapeHtml(formatDate(item.created_at))}</time></div><p>${escapeHtml(item.body || "")}</p>${topicTitle ? `<small>${escapeHtml(topicTitle)}</small>` : ""}<div class="profile-dynamic-actions"><span>${item.kind === "forum_topic" ? `回复 ${formatNumber(item.reply_count || 0)}` : "参与讨论"}</span><button class="text-button" type="button" data-action="open-forum-dynamic" data-topic="${escapeAttr(item.topic_id)}">查看主题</button></div></article>`;
+  }
   const question = item.question || {};
   return `<article class="card profile-dynamic-card"><div class="profile-dynamic-meta"><span>评论</span><time>${escapeHtml(formatDate(item.created_at))}</time></div><p>${escapeHtml(item.body || "")}</p>${question.stem ? `<small>${escapeHtml(question.stem)}</small>` : ""}<div class="profile-dynamic-actions"><span>赞同 ${item.agree_count || 0}</span><span>回复 ${item.reply_count || 0}</span></div></article>`;
 }
@@ -2238,11 +2242,13 @@ async function sendAIMessage(form) {
   finally { state.ai.sending = false; renderAIContent(); }
 }
 
-function forumRouteHash({ topic = "", section = "", query = "" } = {}) {
+function forumRouteHash({ topic = "", section = "", query = "", returnHash = "" } = {}) {
   const params = new URLSearchParams();
   if (topic) params.set("topic", topic);
   if (section) params.set("section", section);
   if (query) params.set("query", query);
+  const safeReturn = normalizeStudyReturnHash(returnHash);
+  if (safeReturn) params.set("return", safeReturn);
   return `#forum${params.size ? `?${params}` : ""}`;
 }
 
@@ -2281,7 +2287,7 @@ async function renderForumPage(descriptor = parseRouteHash(), { force = false } 
     if (descriptor.topicId) {
       const payload = await api(`/forum/topics/${encodeURIComponent(descriptor.topicId)}`);
       state.forum.topic = payload;
-      renderForumTopic(payload);
+      renderForumTopic(payload, descriptor);
       return;
     }
     const params = new URLSearchParams({ limit: "20", offset: "0", sort: "latest" });
@@ -2305,13 +2311,14 @@ function renderForumListing(descriptor = parseRouteHash()) {
     ${(payload.items || []).length < Number(payload.total || 0) ? `<div class="forum-load-more"><span>已显示 ${formatNumber(payload.items.length)} / ${formatNumber(payload.total)}</span><button class="button button-secondary button-small" type="button" data-action="forum-load-more">加载更多</button></div>` : ""}`;
 }
 
-function renderForumTopic(payload) {
+function renderForumTopic(payload, descriptor = parseRouteHash()) {
   const container = $("#page-forum");
   const topic = payload.topic;
   const replies = payload.replies || [];
-  container.innerHTML = `<div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back">‹ 返回论坛</button>${topic.can_manage ? `<button class="text-button danger" type="button" data-action="forum-delete-topic" data-topic="${escapeAttr(topic.topic_id)}">删除主题</button>` : ""}</div>
-    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span><time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><div class="forum-author">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主</small></span></div><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div></article>
-    <section class="forum-replies"><div class="forum-replies-head"><h2>全部回复</h2><span>${formatNumber(topic.reply_count || replies.length)}</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><div class="forum-author">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${index + 1} 楼 · ${escapeHtml(formatDate(reply.created_at))}</small></span></div>${reply.can_manage && reply.status === "visible" ? `<button class="text-button danger" type="button" data-action="forum-delete-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">删除</button>` : ""}</div><p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p></article>`).join("") : `<div class="forum-reply-empty">还没有回复，来说说你的看法。</div>`}</section>
+  const returnHash = descriptor.returnHash || "#forum";
+  container.innerHTML = `<div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back" data-return="${escapeAttr(returnHash)}">‹ 返回${descriptor.returnHash ? "个人主页" : "论坛"}</button>${topic.can_manage ? `<div class="forum-manage-actions"><button class="text-button" type="button" data-action="forum-edit-topic" data-topic="${escapeAttr(topic.topic_id)}">编辑主题</button><button class="text-button danger" type="button" data-action="forum-delete-topic" data-topic="${escapeAttr(topic.topic_id)}">删除主题</button></div>` : ""}</div>
+    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span><time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(topic.author_id)}" aria-label="查看${escapeAttr(topic.author_name)}的个人资料">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主 · 查看主页</small></span></button><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div></article>
+    <section class="forum-replies"><div class="forum-replies-head"><h2>全部回复</h2><span>${formatNumber(topic.reply_count || replies.length)}</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(reply.author_id)}" aria-label="查看${escapeAttr(reply.author_name)}的个人资料">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${index + 1} 楼 · ${escapeHtml(formatDate(reply.created_at))}</small></span></button>${reply.can_manage && reply.status === "visible" ? `<div class="forum-manage-actions"><button class="text-button" type="button" data-action="forum-edit-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">编辑</button><button class="text-button danger" type="button" data-action="forum-delete-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">删除</button></div>` : ""}</div><p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p></article>`).join("") : `<div class="forum-reply-empty">还没有回复，来说说你的看法。</div>`}</section>
     <form id="forum-reply-form" class="card forum-reply-form" data-form="forum-reply" data-topic="${escapeAttr(topic.topic_id)}"><label><span>参与讨论</span><textarea name="body" rows="4" minlength="2" maxlength="5000" required placeholder="写下你的观点、解题思路或补充"></textarea></label><div><small>回复对所有登录用户可见</small><button class="button button-primary" type="submit">发表回复</button></div></form>`;
 }
 
@@ -2365,6 +2372,30 @@ async function deleteForumReply(id, topicId) {
   if (!window.confirm("删除这条回复？")) return;
   try { await api(`/forum/replies/${encodeURIComponent(id)}`, { method: "DELETE", body: {} }); await renderForumPage({ ...parseRouteHash(), topicId }); }
   catch (error) { showToast(error.message, "error"); }
+}
+
+async function editForumTopic(id) {
+  const topic = state.forum.topic?.topic;
+  if (!topic || topic.topic_id !== id) return;
+  const values = await forumTopicEditorModal(topic.title, topic.body);
+  if (!values) return;
+  try {
+    await api(`/forum/topics/${encodeURIComponent(id)}`, { method: "PATCH", body: values });
+    await renderForumPage({ ...parseRouteHash(), topicId: id });
+    showToast("主题已更新");
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function editForumReply(id, topicId) {
+  const reply = (state.forum.topic?.replies || []).find((item) => item.reply_id === id);
+  if (!reply) return;
+  const body = await textEditorModal("编辑论坛回复", reply.body, 5000, "保存回复");
+  if (body === null) return;
+  try {
+    await api(`/forum/replies/${encodeURIComponent(id)}`, { method: "PATCH", body: { body } });
+    await renderForumPage({ ...parseRouteHash(), topicId });
+    showToast("回复已更新");
+  } catch (error) { showToast(error.message, "error"); }
 }
 
 async function renderMyCommentsPage({ force = false } = {}) {
@@ -2910,6 +2941,7 @@ async function handleClick(event) {
   if (action === "home-utility") return handleHomeUtility(target.dataset.utility);
   if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
   if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(publicProfileRouteHash(target.dataset.userId || state.user.user_id, state.profileReturnHash)); }
+  if (action === "open-forum-dynamic") return navigateHash(forumRouteHash({ topic: target.dataset.topic, returnHash: location.hash || "#profile" }));
   if (action === "return-from-profile") return navigateHash(state.profileReturnHash || "#profile");
   if (action === "return-from-account") return navigateHash(state.accountReturnHash || "#library");
   if (action === "return-to-profile") return navigateHash("#profile");
@@ -3083,9 +3115,11 @@ async function handleClick(event) {
   if (action === "forum-toggle-composer") { state.forum.composerOpen = !state.forum.composerOpen; renderForumListing(parseRouteHash()); return; }
   if (action === "forum-section") return navigateHash(forumRouteHash({ section: target.dataset.section || "" }));
   if (action === "forum-open-topic") return navigateHash(forumRouteHash({ topic: target.dataset.topic || "" }));
-  if (action === "forum-back") return navigateHash("#forum");
+  if (action === "forum-back") return navigateHash(target.dataset.return || "#forum");
   if (action === "forum-load-more") return loadMoreForumTopics(target);
+  if (action === "forum-edit-topic") return editForumTopic(target.dataset.topic);
   if (action === "forum-delete-topic") return deleteForumTopic(target.dataset.topic);
+  if (action === "forum-edit-reply") return editForumReply(target.dataset.reply, target.dataset.topic);
   if (action === "forum-delete-reply") return deleteForumReply(target.dataset.reply, target.dataset.topic);
 }
 
@@ -3881,6 +3915,22 @@ async function uploadCroppedAvatar(canvas) {
       setButtonBusy(button, false);
     }
   }, "image/webp", 0.86);
+}
+
+function forumTopicEditorModal(title, body) {
+  return new Promise((resolve) => {
+    const root = $("#modal-root");
+    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal forum-topic-editor-modal" role="dialog" aria-modal="true" aria-labelledby="forum-editor-title"><div class="modal-heading"><h2 id="forum-editor-title">编辑论坛主题</h2><button class="icon-button" type="button" data-modal="cancel" aria-label="取消">×</button></div><form id="forum-topic-editor-form" class="stack-form"><label class="field"><span>标题</span><input name="title" value="${escapeAttr(title || "")}" minlength="4" maxlength="120" required></label><label class="field"><span>正文</span><textarea name="body" maxlength="20000" minlength="4" rows="9" required>${escapeHtml(body || "")}</textarea></label><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="submit">保存主题</button></div></form></section></div>`;
+    const finish = (value) => { root.innerHTML = ""; resolve(value); };
+    $$('[data-modal="cancel"]', root).forEach((button) => button.addEventListener("click", () => finish(null)));
+    $("#forum-topic-editor-form", root).addEventListener("submit", (event) => {
+      event.preventDefault();
+      const values = Object.fromEntries(new FormData(event.target));
+      finish({ title: String(values.title || "").trim(), body: String(values.body || "").trim() });
+    });
+    $(".modal-backdrop", root).addEventListener("click", (event) => { if (event.target.classList.contains("modal-backdrop")) finish(null); });
+    $('input[name="title"]', root).focus();
+  });
 }
 
 function textEditorModal(title, value, maxLength, confirmLabel) {

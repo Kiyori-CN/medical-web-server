@@ -11,6 +11,7 @@
 | `medical_app/catalog.py` | 只读 SQLite/FTS 访问 |
 | `medical_app/catalog_export.py` | 管理员 JSONL/CSV occurrence 流式导出 |
 | `medical_app/catalog_import.py` | 管理员 CSV/JSONL/JSON 隔离导入预检与字段映射 |
+| `medical_app/forum.py` | 本地论坛主题/回复、权限、软删除与回复通知 |
 | `medical_app/practice.py` | 会话、四种刷题模式、文件进度重置、收藏、错题和评论 |
 | `medical_app/settings.py` | 网站/模型设置与秘密加密 |
 | `medical_app/semantic.py` | keyword、semantic、hybrid 编排 |

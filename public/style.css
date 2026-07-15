@@ -971,9 +971,12 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 .forum-load-more { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 18px; color: var(--muted); font-size: 10px; }
 .forum-detail-head { min-height: 42px; display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .forum-detail-head .danger, .forum-reply-head .danger { color: var(--danger); }
+.forum-manage-actions { display: inline-flex; align-items: center; gap: 10px; }
 .forum-topic-detail { padding: 22px; }
 .forum-topic-detail h1 { margin: 12px 0 16px; font-size: clamp(23px, 3vw, 32px); line-height: 1.35; }
 .forum-author { display: flex; align-items: center; gap: 9px; }
+.forum-author-link { max-width: 100%; border: 0; padding: 0; color: var(--ink); text-align: left; background: transparent; cursor: pointer; }
+.forum-author-link:hover strong { color: var(--brand-dark); }
 .forum-author > img, .forum-author > span:first-child { width: 34px; height: 34px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 50%; background: var(--brand-soft); object-fit: cover; font-size: 11px; }
 .forum-author > span:last-child { display: grid; gap: 2px; }
 .forum-author strong { font-size: 11px; }
