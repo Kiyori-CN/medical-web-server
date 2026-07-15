@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from flask import Blueprint, g, jsonify, request
 
-from .auth import csrf_required, login_required
+from .auth import admin_required, csrf_required, login_required
 from .catalog import Catalog, CatalogUnavailable
 from .practice import (
     PracticeConflict,
@@ -179,6 +179,24 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
         )
         return jsonify(item), 201
 
+    @blueprint.get("/study/comments/mine")
+    @login_required
+    def my_comments():
+        return jsonify(
+            store().my_comments(
+                query=request.args.get("query", ""),
+                limit=request.args.get("limit", 50),
+                offset=request.args.get("offset", 0),
+            )
+        )
+
+    @blueprint.patch("/study/comments/<comment_id>")
+    @login_required
+    @csrf_required
+    def update_comment(comment_id: str):
+        data = _json_object()
+        return jsonify(store().update_comment(comment_id, data.get("body")))
+
     @blueprint.delete("/study/comments/<comment_id>")
     @login_required
     @csrf_required
@@ -187,6 +205,46 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
             comment_id, is_admin=g.current_user.get("role") == "admin"
         )
         return jsonify({"removed": removed})
+
+    @blueprint.get("/admin/comments")
+    @admin_required
+    def admin_comments():
+        return jsonify(
+            store().all_comments(
+                query=request.args.get("query", ""),
+                limit=request.args.get("limit", 100),
+                offset=request.args.get("offset", 0),
+            )
+        )
+
+    @blueprint.get("/study/notes")
+    @login_required
+    def my_notes():
+        return jsonify(
+            store().my_notes(
+                query=request.args.get("query", ""),
+                limit=request.args.get("limit", 50),
+                offset=request.args.get("offset", 0),
+            )
+        )
+
+    @blueprint.get("/study/notes/<int:occurrence_id>")
+    @login_required
+    def get_note(occurrence_id: int):
+        return jsonify(store().get_note(occurrence_id))
+
+    @blueprint.put("/study/notes/<int:occurrence_id>")
+    @login_required
+    @csrf_required
+    def save_note(occurrence_id: int):
+        data = _json_object()
+        return jsonify(store().save_note(occurrence_id, data.get("body")))
+
+    @blueprint.delete("/study/notes/<int:occurrence_id>")
+    @login_required
+    @csrf_required
+    def delete_note(occurrence_id: int):
+        return jsonify({"removed": store().delete_note(occurrence_id)})
 
     return blueprint
 

@@ -106,3 +106,55 @@ def test_provider_url_rejects_embedded_credentials(tmp_path):
         store.update(
             {"providers": {"embedding": {"api_url": "https://example.invalid/v1/embeddings?api_key=secret"}}}
         )
+
+
+def test_model_discovery_accepts_unsaved_key_and_separates_provider_models(tmp_path, monkeypatch):
+    store = SettingsStore(
+        tmp_path / "state" / "settings.sqlite3",
+        tmp_path / "state" / "settings.key",
+    )
+    store.initialize()
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"data": [{"id": "Qwen/Qwen3-Embedding-0.6B"}, {"id": "Qwen/Qwen2.5-7B-Instruct"}, {"id": "BAAI/bge-reranker-v2-m3"}]}
+
+    monkeypatch.setattr("medical_app.providers.requests.get", lambda *args, **kwargs: Response())
+    app = _app(store)
+    app.config["ROLE"] = "admin"
+    client = app.test_client()
+    client.set_cookie("medical_csrf", "csrf-test")
+    headers = {"X-CSRF-Token": "csrf-test"}
+
+    embedding = client.post(
+        "/api/admin/settings/models",
+        headers=headers,
+        json={
+            "provider": "embedding",
+            "api_url": "https://example.invalid/v1/embeddings",
+            "api_key": "sk-unsaved-preview",
+            "model": "Qwen/Qwen3-Embedding-0.6B",
+            "dimensions": 1024,
+        },
+    )
+    assert [item["id"] for item in embedding.get_json()["models"]] == [
+        "Qwen/Qwen3-Embedding-0.6B"
+    ]
+    assert store.provider_config("embedding", include_secret=True)["api_key"] == ""
+
+    llm = client.post(
+        "/api/admin/settings/models",
+        headers=headers,
+        json={
+            "provider": "llm",
+            "api_url": "https://example.invalid/v1/chat/completions",
+            "api_key": "sk-unsaved-preview",
+            "model": "Qwen/Qwen2.5-7B-Instruct",
+        },
+    )
+    assert [item["id"] for item in llm.get_json()["models"]] == [
+        "Qwen/Qwen2.5-7B-Instruct"
+    ]

@@ -36,6 +36,16 @@ const state = {
   adminData: null,
   profileAvatarDraft: null,
   comments: {},
+  notes: {},
+  myComments: null,
+  myNotes: null,
+  avatarCrop: null,
+  providerModels: {
+    embedding: { status: "idle", items: [], open: false, error: "" },
+    llm: { status: "idle", items: [], open: false, error: "" },
+  },
+  providerDiscoveryTimers: {},
+  vectorPollHandle: null,
 };
 
 document.addEventListener("DOMContentLoaded", boot);
@@ -148,6 +158,9 @@ function setAuthError(message) {
 async function enterApp(user) {
   state.user = user;
   state.comments = {};
+  state.notes = {};
+  state.myComments = null;
+  state.myNotes = null;
   $("#auth-page").hidden = true;
   $("#app-shell").hidden = false;
   syncUserChrome(user);
@@ -169,6 +182,7 @@ async function route() {
   if (!state.user) return;
   const descriptor = parseRouteHash();
   const target = descriptor.target;
+  if (target !== "admin") stopVectorPoll();
   if (target.startsWith("session/")) {
     document.body.classList.add("in-session");
     showPage("practice");
@@ -183,7 +197,7 @@ async function route() {
     return;
   }
   document.body.classList.remove("in-session", "outline-open");
-  const allowed = ["library", "search", "favorites", "wrong", "profile", "messages", "admin"];
+  const allowed = ["library", "search", "favorites", "wrong", "profile", "messages", "my-comments", "notes", "admin"];
   if (!allowed.includes(target)) {
     await navigateHash("#library", { replace: true });
     return;
@@ -216,6 +230,10 @@ async function route() {
     renderProfilePage();
   } else if (page === "messages") {
     renderMessagesPage();
+  } else if (page === "my-comments") {
+    await renderMyCommentsPage();
+  } else if (page === "notes") {
+    await renderMyNotesPage();
   } else if (page === "admin") {
     await renderAdminPage();
   }
@@ -236,9 +254,15 @@ function setActiveNav(name) {
 function syncUserChrome(user) {
   $("#profile-name").textContent = user.username;
   $("#profile-role").textContent = user.role === "admin" ? "管理员" : "普通用户";
-  const glyph = user.avatar || [...user.username][0]?.toUpperCase() || "U";
-  $("#profile-avatar-glyph").textContent = glyph;
+  $("#profile-avatar").innerHTML = avatarVisual(user, user.username);
   $("#admin-entry").hidden = user.role !== "admin";
+}
+
+function avatarVisual(entity, fallbackName = "用户") {
+  if (entity?.avatar_url) {
+    return `<img src="${escapeAttr(entity.avatar_url)}" alt="" loading="lazy" decoding="async">`;
+  }
+  return `<span>${escapeHtml(entity?.avatar || [...String(fallbackName || "用户")][0]?.toUpperCase() || "用")}</span>`;
 }
 
 function parseRouteHash() {
@@ -908,6 +932,7 @@ function renderPractice() {
           point: submitted.point,
           explanation: submitted.explanation,
         } : question)}</div>` : ""}
+        ${reveal ? `<div class="question-note-slot" data-note-occurrence="${occurrenceId || ""}">${renderQuestionNote(occurrenceId)}</div>` : ""}
         ${reveal ? `<div class="question-comments-slot" data-comments-occurrence="${occurrenceId || ""}">${renderQuestionComments(occurrenceId)}</div>` : ""}
         <div class="practice-footer" data-action-count="${4 + Number(showSubmit) + Number(session.saved_kind === "wrong")}">
           <button class="button button-secondary practice-footer-button practice-footer-prev" type="button" data-action="session-prev" aria-label="上一题" ${canPrev ? "" : "disabled"}><span class="practice-footer-icon" aria-hidden="true">←</span><span class="practice-footer-label">上一题</span></button>
@@ -928,7 +953,10 @@ function renderPractice() {
   updateTimerText();
   state.navigationDirection = "";
   refreshFavoriteButtons();
-  if (reveal) ensureQuestionComments(occurrenceId);
+  if (reveal) {
+    ensureQuestionNote(occurrenceId);
+    ensureQuestionComments(occurrenceId);
+  }
 }
 
 function renderAnswerArea(item, draft, reveal, isComplete) {
@@ -990,6 +1018,97 @@ function renderSessionOutline(session, currentIndex) {
      </section>`).join("");
 }
 
+function renderQuestionNote(occurrenceId) {
+  if (!occurrenceId) return "";
+  const record = state.notes[String(occurrenceId)];
+  if (!record || record.loading) {
+    return `<section class="question-note"><div class="study-section-heading"><div><h2>笔记</h2><span>仅自己可见</span></div></div><div class="comments-loading"><span class="loading-spinner" aria-hidden="true"></span><span>正在加载笔记</span></div></section>`;
+  }
+  if (record.error) {
+    return `<section class="question-note"><div class="study-section-heading"><div><h2>笔记</h2><span>仅自己可见</span></div><button class="text-button" type="button" data-action="reload-note" data-occurrence="${occurrenceId}">重新加载</button></div><p class="comments-error">${escapeHtml(record.error)}</p></section>`;
+  }
+  const item = record.item || { body: "", exists: false };
+  return `<section class="question-note" aria-label="我的本题笔记">
+    <div class="study-section-heading"><div><h2>笔记</h2><span class="private-label">仅自己可见</span></div>${item.updated_at ? `<time datetime="${escapeAttr(item.updated_at)}">更新于 ${escapeHtml(formatDate(item.updated_at))}</time>` : ""}</div>
+    <form class="note-form" data-form="question-note" data-occurrence="${occurrenceId}">
+      <textarea name="body" maxlength="10000" rows="5" required placeholder="记录易错点、鉴别思路或复习提示">${escapeHtml(item.body || "")}</textarea>
+      <div class="note-form-actions"><small>笔记不会进入搜题索引 · 最多 10000 字</small><div>${item.exists ? `<button class="button button-quiet button-small" type="button" data-action="delete-note" data-occurrence="${occurrenceId}">删除</button>` : ""}<button class="button button-primary button-small" type="submit">保存笔记</button></div></div>
+    </form>
+  </section>`;
+}
+
+async function ensureQuestionNote(occurrenceId, { force = false } = {}) {
+  if (!occurrenceId) return;
+  const key = String(occurrenceId);
+  if (state.notes[key] && !force) return;
+  state.notes[key] = { loading: true, item: state.notes[key]?.item || null, error: "" };
+  updateQuestionNote(occurrenceId);
+  try {
+    const item = await api(`/study/notes/${encodeURIComponent(occurrenceId)}`);
+    state.notes[key] = { loading: false, item, error: "" };
+  } catch (error) {
+    state.notes[key] = { loading: false, item: null, error: error.message || "笔记加载失败" };
+  }
+  updateQuestionNote(occurrenceId);
+}
+
+function updateQuestionNote(occurrenceId) {
+  const slot = $(`[data-note-occurrence="${Number(occurrenceId)}"]`);
+  if (slot) slot.innerHTML = renderQuestionNote(Number(occurrenceId));
+}
+
+async function submitQuestionNote(form) {
+  const occurrenceId = Number(form.dataset.occurrence);
+  const body = String(new FormData(form).get("body") || "").trim();
+  if (!occurrenceId || !body) return;
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "保存中");
+  try {
+    const item = await api(`/study/notes/${encodeURIComponent(occurrenceId)}`, {
+      method: "PUT",
+      body: { body },
+    });
+    state.notes[String(occurrenceId)] = { loading: false, item, error: "" };
+    state.myNotes = null;
+    updateQuestionNote(occurrenceId);
+    showToast("笔记已保存");
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function deleteQuestionNote(occurrenceId, { fromList = false } = {}) {
+  const confirmed = await confirmModal("删除笔记", "确认删除这道题的个人笔记？删除后无法恢复。", "确认删除");
+  if (!confirmed) return;
+  try {
+    await api(`/study/notes/${encodeURIComponent(occurrenceId)}`, { method: "DELETE", body: {} });
+    state.notes[String(occurrenceId)] = { loading: false, item: { occurrence_id: occurrenceId, body: "", exists: false }, error: "" };
+    state.myNotes = null;
+    if (fromList) await renderMyNotesPage({ force: true });
+    else updateQuestionNote(occurrenceId);
+    showToast("笔记已删除");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function editPersonalNote(occurrenceId) {
+  const item = state.myNotes?.items?.find((entry) => Number(entry.occurrence_id) === Number(occurrenceId));
+  if (!item) return;
+  const body = await textEditorModal("编辑笔记", item.body, 10000, "保存笔记");
+  if (!body || body === item.body) return;
+  try {
+    await api(`/study/notes/${encodeURIComponent(occurrenceId)}`, { method: "PUT", body: { body } });
+    state.notes[String(occurrenceId)] = null;
+    state.myNotes = null;
+    await renderMyNotesPage({ force: true });
+    showToast("笔记已更新");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
 function renderQuestionComments(occurrenceId) {
   if (!occurrenceId) {
     return `<section class="question-comments"><div class="comments-heading"><h2>评论</h2></div><p class="comments-empty">当前题目没有可用的原题来源。</p></section>`;
@@ -1003,9 +1122,9 @@ function renderQuestionComments(occurrenceId) {
       : items.length
         ? `<div class="comment-list">${items.map((comment) => `
             <article class="comment-item">
-              <div class="comment-avatar" aria-hidden="true">${escapeHtml([...String(comment.author_name || "用户")][0] || "用")}</div>
+              <div class="comment-avatar" aria-hidden="true">${avatarVisual(comment, comment.author_name)}</div>
               <div class="comment-main">
-                <div class="comment-meta"><strong>${escapeHtml(comment.author_name || "用户")}</strong><time datetime="${escapeAttr(comment.created_at || "")}">${escapeHtml(formatDate(comment.created_at))}</time>${comment.can_delete ? `<button class="text-button comment-delete" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">删除</button>` : ""}</div>
+                <div class="comment-meta"><strong>${escapeHtml(comment.author_name || "用户")}</strong><time datetime="${escapeAttr(comment.created_at || "")}">${escapeHtml(formatDate(comment.created_at))}${comment.edited ? " · 已编辑" : ""}</time><span class="comment-actions">${comment.can_edit ? `<button class="text-button" type="button" data-action="edit-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">编辑</button>` : ""}${comment.can_delete ? `<button class="text-button comment-delete" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">删除</button>` : ""}</span></div>
                 <p>${escapeHtml(comment.body)}</p>
               </div>
             </article>`).join("")}</div>`
@@ -1014,7 +1133,7 @@ function renderQuestionComments(occurrenceId) {
     <div class="comments-heading"><h2>评论</h2><span>${items.length} 条</span></div>
     ${list}
     <form class="comment-form" data-form="question-comment" data-occurrence="${occurrenceId}">
-      <textarea name="body" maxlength="2000" rows="3" required placeholder="写下你的理解或疑问"></textarea>
+      <textarea name="body" maxlength="2000" rows="3" required placeholder="分享解题思路，或提出与本题相关的疑问"></textarea>
       <div class="comment-form-actions"><small>最多 2000 字</small><button class="button button-primary button-small" type="submit">发表评论</button></div>
     </form>
   </section>`;
@@ -1055,6 +1174,7 @@ async function submitQuestionComment(form) {
     const key = String(occurrenceId);
     const items = state.comments[key]?.items || [];
     state.comments[key] = { loading: false, items: [...items, item], error: "" };
+    state.myComments = null;
     updateQuestionComments(occurrenceId);
     showToast("评论已发表");
   } catch (error) {
@@ -1074,8 +1194,35 @@ async function deleteQuestionComment(commentId, occurrenceId) {
       ...record,
       items: (record.items || []).filter((item) => item.comment_id !== commentId),
     };
+    if (state.myComments) {
+      state.myComments.items = (state.myComments.items || []).filter((item) => item.comment_id !== commentId);
+      state.myComments.total = Math.max(0, Number(state.myComments.total || 0) - 1);
+    }
     updateQuestionComments(occurrenceId);
+    if (location.hash.startsWith("#my-comments")) await renderMyCommentsPage({ force: true });
     showToast("评论已删除");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function editQuestionComment(commentId, occurrenceId) {
+  const cached = state.comments[String(occurrenceId)]?.items?.find((item) => item.comment_id === commentId)
+    || state.myComments?.items?.find((item) => item.comment_id === commentId);
+  if (!cached) return;
+  const body = await textEditorModal("编辑评论", cached.body, 2000, "保存修改");
+  if (!body || body === cached.body) return;
+  try {
+    const updated = await api(`/study/comments/${encodeURIComponent(commentId)}`, {
+      method: "PATCH",
+      body: { body },
+    });
+    const record = state.comments[String(occurrenceId)];
+    if (record) record.items = record.items.map((item) => item.comment_id === commentId ? updated : item);
+    if (state.myComments) state.myComments.items = state.myComments.items.map((item) => item.comment_id === commentId ? { ...item, ...updated } : item);
+    updateQuestionComments(occurrenceId);
+    if (location.hash.startsWith("#my-comments")) await renderMyCommentsPage({ force: true });
+    showToast("评论已更新");
   } catch (error) {
     showToast(error.message, "error");
   }
@@ -1175,25 +1322,43 @@ function updateTimerText() {
   if (timer) timer.textContent = `◷ ${sessionDuration()}`;
 }
 
-const PROFILE_AVATARS = ["", "医", "学", "知", "🩺", "🧬", "🧠", "🫀", "🫁", "📚", "⭐", "🌿"];
+const PROFILE_AVATARS = [
+  { id: "preset-01", label: "珊瑚白袍" },
+  { id: "preset-02", label: "靛蓝听诊" },
+  { id: "preset-03", label: "青绿研究" },
+  { id: "preset-04", label: "暖金书卷" },
+  { id: "preset-05", label: "雾紫脑科学" },
+  { id: "preset-06", label: "天蓝临床" },
+];
 
 function renderProfilePage() {
   const user = state.user || {};
-  const selectedAvatar = state.profileAvatarDraft ?? user.avatar ?? "";
-  const glyph = selectedAvatar || [...String(user.username || "U")][0] || "U";
+  const selectedAvatar = (state.profileAvatarDraft ?? user.avatar) || "preset-01";
+  const preview = selectedAvatar === user.avatar
+    ? user
+    : { avatar: selectedAvatar, avatar_url: selectedAvatar.startsWith("preset-") ? `/avatars/${selectedAvatar}.svg` : "" };
   $("#page-profile").innerHTML = `
     <div class="page-header account-page-header">
-      <div class="page-title"><p class="eyebrow">个人中心</p><h1>账号与个人资料</h1><p class="section-copy">管理你的显示信息与登录安全。</p></div>
+      <div class="page-title"><p class="eyebrow">个人中心</p><h1>${escapeHtml(user.username || "个人中心")}</h1><p class="section-copy">资料、学习内容与账号安全。</p></div>
       <div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div>
     </div>
+    <nav class="profile-shortcuts" aria-label="我的学习内容">
+      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="my-comments"><span class="shortcut-icon shortcut-comments" aria-hidden="true">◌</span><span><strong>我的评论</strong><small>查看和管理已发表内容</small></span><b aria-hidden="true">›</b></button>
+      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="notes"><span class="shortcut-icon shortcut-notes" aria-hidden="true">□</span><span><strong>我的笔记</strong><small>按最近更新集中复习</small></span><b aria-hidden="true">›</b></button>
+      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="favorites"><span class="shortcut-icon shortcut-favorites" aria-hidden="true">☆</span><span><strong>我的收藏</strong><small>沿原题库路径查看</small></span><b aria-hidden="true">›</b></button>
+      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="wrong"><span class="shortcut-icon shortcut-wrong" aria-hidden="true">!</span><span><strong>我的错题</strong><small>回到原文件继续练习</small></span><b aria-hidden="true">›</b></button>
+    </nav>
     <div class="profile-layout">
       <section class="card profile-card">
-        <div class="profile-card-head"><div><h2>个人资料</h2><p>用户名会显示在练习记录和评论区。</p></div><span class="badge badge-neutral">${user.role === "admin" ? "管理员" : "普通用户"}</span></div>
+        <div class="profile-card-head"><div><h2>个人资料</h2><p>头像和用户名会显示在评论区。</p></div><span class="badge badge-neutral">${user.role === "admin" ? "管理员" : "普通用户"}</span></div>
         <form id="profile-form" class="profile-form">
           <div class="profile-avatar-editor">
-            <span class="profile-avatar profile-avatar-large"><span id="profile-preview-glyph">${escapeHtml(glyph)}</span></span>
-            <div><strong>选择头像</strong><small>使用简洁的医学主题标识</small><div class="avatar-picker" role="radiogroup" aria-label="头像">
-              ${PROFILE_AVATARS.map((avatar) => `<button class="avatar-choice ${avatar === selectedAvatar ? "active" : ""}" type="button" role="radio" aria-checked="${avatar === selectedAvatar}" data-action="select-avatar" data-avatar="${escapeAttr(avatar)}">${escapeHtml(avatar || (String(user.username || "U")[0] || "U"))}</button>`).join("")}
+            <span class="profile-avatar profile-avatar-large">${avatarVisual(preview, user.username)}</span>
+            <div class="avatar-editor-main"><div class="avatar-editor-copy"><strong>个人头像</strong><small>选择统一风格头像，或上传并裁剪自己的图片</small></div><div class="avatar-picker" role="radiogroup" aria-label="预设头像">
+              ${PROFILE_AVATARS.map((avatar) => `<button class="avatar-choice ${avatar.id === selectedAvatar ? "active" : ""}" type="button" role="radio" aria-label="${escapeAttr(avatar.label)}" aria-checked="${avatar.id === selectedAvatar}" data-action="select-avatar" data-avatar="${avatar.id}"><img src="/avatars/${avatar.id}.svg" alt=""></button>`).join("")}
+              ${user.avatar === "custom" ? `<button class="avatar-choice ${selectedAvatar === "custom" ? "active" : ""}" type="button" role="radio" aria-label="当前自定义头像" aria-checked="${selectedAvatar === "custom"}" data-action="select-avatar" data-avatar="custom">${avatarVisual(user, user.username)}</button>` : ""}
+              <button class="avatar-upload-button" type="button" data-action="choose-avatar-file"><span aria-hidden="true">＋</span>上传图片</button>
+              <input id="avatar-file-input" type="file" accept="image/jpeg,image/png,image/webp" hidden>
             </div></div>
           </div>
           <label class="field"><span>用户名</span><input name="username" minlength="3" maxlength="32" value="${escapeAttr(user.username || "")}" required></label>
@@ -1222,15 +1387,61 @@ function renderMessagesPage() {
     ${emptyMarkup("暂无消息", "目前没有新的系统通知或互动消息。", "·")}`;
 }
 
+async function renderMyCommentsPage({ force = false } = {}) {
+  const container = $("#page-my-comments");
+  container.innerHTML = `${personalPageHeader("我的评论", "已发表的评论", "管理自己的讨论内容。")}${loadingMarkup("正在读取评论")}`;
+  try {
+    if (!state.myComments || force) state.myComments = await api("/study/comments/mine?limit=100");
+    const items = state.myComments.items || [];
+    container.innerHTML = `${personalPageHeader("我的评论", "已发表的评论", `共 ${formatNumber(state.myComments.total || 0)} 条`)}${items.length ? `<div class="personal-feed">${items.map((item) => personalContentCard(item, "comment")).join("")}</div>` : emptyMarkup("暂无评论", "完成题目后，可在标准解析下方参与讨论。", "◌")}`;
+  } catch (error) {
+    container.innerHTML = `${personalPageHeader("我的评论", "已发表的评论", "管理自己的讨论内容。")}${emptyMarkup("评论读取失败", error.message, "!")}`;
+  }
+}
+
+async function renderMyNotesPage({ force = false } = {}) {
+  const container = $("#page-notes");
+  container.innerHTML = `${personalPageHeader("我的笔记", "个人复习笔记", "仅当前账号可见，不参与搜题。")}${loadingMarkup("正在读取笔记")}`;
+  try {
+    if (!state.myNotes || force) state.myNotes = await api("/study/notes?limit=100");
+    const items = state.myNotes.items || [];
+    container.innerHTML = `${personalPageHeader("我的笔记", "个人复习笔记", `共 ${formatNumber(state.myNotes.total || 0)} 条 · 不参与搜题`)}${items.length ? `<div class="personal-feed">${items.map((item) => personalContentCard(item, "note")).join("")}</div>` : emptyMarkup("暂无笔记", "答案解析解锁后，可在每道题下方保存个人笔记。", "□")}`;
+  } catch (error) {
+    container.innerHTML = `${personalPageHeader("我的笔记", "个人复习笔记", "仅当前账号可见，不参与搜题。")}${emptyMarkup("笔记读取失败", error.message, "!")}`;
+  }
+}
+
+function personalPageHeader(eyebrow, title, copy) {
+  return `<div class="page-header account-page-header"><div class="page-title"><p class="eyebrow">${escapeHtml(eyebrow)}</p><h1>${escapeHtml(title)}</h1><p class="section-copy">${escapeHtml(copy)}</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-to-profile">‹ 个人中心</button></div></div>`;
+}
+
+function personalContentCard(item, kind) {
+  const question = item.question || {};
+  const occurrenceId = Number(item.occurrence_id || question.occurrence_id) || 0;
+  const canOpen = Boolean(question.collection_id && question.collection_position);
+  return `<article class="card personal-content-card">
+    <div class="personal-content-meta"><span class="badge badge-neutral">${escapeHtml(question.type_label || "题目")}</span><time datetime="${escapeAttr(item.updated_at || "")}">${escapeHtml(formatDate(item.updated_at))}</time></div>
+    <h2>${escapeHtml(question.stem || "原题已不可用")}</h2>
+    <p class="personal-content-path">${escapeHtml(displaySourcePath(question.relative_path || ""))}</p>
+    <div class="personal-content-body ${kind}">${escapeHtml(item.body || "")}</div>
+    <div class="question-actions">
+      ${canOpen ? `<button class="button button-secondary button-small" type="button" data-action="open-personal-source" data-collection="${escapeAttr(question.collection_id)}" data-position="${Number(question.collection_position)}" data-path="${escapeAttr(question.relative_path || "")}">查看原题</button>` : ""}
+      ${kind === "comment" ? `<button class="button button-secondary button-small" type="button" data-action="edit-comment" data-comment-id="${escapeAttr(item.comment_id)}" data-occurrence="${occurrenceId}">编辑</button><button class="button button-danger button-small" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(item.comment_id)}" data-occurrence="${occurrenceId}" data-from-list="true">删除</button>` : `<button class="button button-secondary button-small" type="button" data-action="edit-personal-note" data-occurrence="${occurrenceId}">编辑</button><button class="button button-danger button-small" type="button" data-action="delete-note" data-occurrence="${occurrenceId}" data-from-list="true">删除</button>`}
+    </div>
+  </article>`;
+}
+
 async function saveProfile(form) {
   const username = String(new FormData(form).get("username") || "").trim();
   try {
     const result = await api("/auth/profile", {
       method: "PUT",
-      body: { username, avatar: state.profileAvatarDraft ?? state.user.avatar ?? "" },
+      body: { username, avatar: (state.profileAvatarDraft ?? state.user.avatar) || "preset-01" },
     });
     state.user = result.user;
     state.profileAvatarDraft = null;
+    state.comments = {};
+    state.myComments = null;
     syncUserChrome(state.user);
     renderProfilePage();
     showToast("个人资料已保存");
@@ -1254,6 +1465,9 @@ async function saveProfilePassword(form) {
     state.user = null;
     state.session = null;
     state.comments = {};
+    state.notes = {};
+    state.myComments = null;
+    state.myNotes = null;
     location.hash = "";
     showAuth("login");
     showToast("密码已修改，请重新登录");
@@ -1266,13 +1480,16 @@ async function renderAdminPage() {
   const container = $("#page-admin");
   container.innerHTML = `${adminHeaderMarkup()}${loadingMarkup("正在读取系统状态")}`;
   try {
-    const [dashboard, settings, users] = await Promise.all([
+    const [dashboard, settings, users, comments, vectors] = await Promise.all([
       api("/admin/dashboard"),
       api("/admin/settings"),
       api("/admin/users"),
+      api("/admin/comments?limit=100"),
+      api("/admin/vectors"),
     ]);
-    state.adminData = { dashboard, settings, users: users.users || [] };
+    state.adminData = { dashboard, settings, users: users.users || [], comments, vectors };
     renderAdminContent();
+    if (["queued", "running"].includes(vectors.operation?.status)) scheduleVectorPoll();
   } catch (error) {
     container.innerHTML += emptyMarkup("管理数据读取失败", error.message, "!");
   }
@@ -1285,7 +1502,7 @@ function renderAdminContent() {
     ${adminHeaderMarkup()}
     <div class="admin-layout">
       <nav class="card admin-nav" aria-label="管理导航">
-        ${adminTabButton("overview", "运行概览")}${adminTabButton("users", "账号管理")}${adminTabButton("models", "模型与检索")}${adminTabButton("site", "网站设置")}
+        ${adminTabButton("overview", "运行概览")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
       </nav>
       <div class="admin-content">${renderAdminTab()}</div>
     </div>`;
@@ -1300,8 +1517,9 @@ function adminTabButton(tab, label) {
 }
 
 function renderAdminTab() {
-  const { dashboard, settings, users } = state.adminData;
+  const { dashboard, settings, users, comments } = state.adminData;
   if (state.adminTab === "users") return renderUsers(users);
+  if (state.adminTab === "comments") return renderAdminComments(comments);
   if (state.adminTab === "models") return renderModelSettings(settings);
   if (state.adminTab === "site") return renderSiteSettings(settings);
   const vector = dashboard.vector_index || {};
@@ -1320,7 +1538,7 @@ function renderAdminTab() {
       ${statCard("规范题目", dashboard.catalog.questions, `${formatNumber(dashboard.catalog.collections)} 个题库文件`)}
     </div>
     <div class="settings-grid">
-      <div class="settings-group"><h3>学习数据</h3><div class="solution-row"><strong>收藏</strong><span>${formatNumber(dashboard.activity.favorites)}</span></div><div class="solution-row"><strong>错题</strong><span>${formatNumber(dashboard.activity.wrong_items)}</span></div><div class="solution-row"><strong>进行中</strong><span>${formatNumber(dashboard.activity.active_practice)}</span></div></div>
+      <div class="settings-group"><h3>学习数据</h3><div class="solution-row"><strong>收藏</strong><span>${formatNumber(dashboard.activity.favorites)}</span></div><div class="solution-row"><strong>错题</strong><span>${formatNumber(dashboard.activity.wrong_items)}</span></div><div class="solution-row"><strong>评论</strong><span>${formatNumber(dashboard.activity.comments)}</span></div><div class="solution-row"><strong>私有笔记</strong><span>${formatNumber(dashboard.activity.notes)}</span></div></div>
       <div class="settings-group"><h3>向量索引</h3><div class="solution-row"><strong>状态</strong><span>${escapeHtml(vector.status || "unavailable")}</span></div><div class="solution-row"><strong>模型</strong><span>${escapeHtml(vector.model || "尚未构建")}</span></div><div class="solution-row"><strong>向量数</strong><span>${formatNumber(vector.count || 0)}</span></div></div>
     </div>
   </section>`;
@@ -1338,7 +1556,7 @@ function renderUsers(users) {
       <div class="question-actions"><button class="button button-primary button-small" type="submit">创建账号</button></div>
     </form>
     <div class="table-wrap user-table-wrap"><table class="data-table user-table"><thead><tr><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody>${users.map((user) => `<tr>
-      <td data-label="用户"><div class="user-identity"><span>${escapeHtml(user.username.slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(user.username)}</strong></div></td>
+       <td data-label="用户"><div class="user-identity"><span>${avatarVisual(user, user.username)}</span><strong>${escapeHtml(user.username)}</strong></div></td>
       <td data-label="角色"><select class="compact-select" data-user-role="${escapeAttr(user.user_id)}" ${user.user_id === state.user.user_id ? "disabled" : ""}><option value="user" ${user.role === "user" ? "selected" : ""}>普通用户</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>管理员</option></select></td>
       <td data-label="状态"><span class="status-pill ${user.status}">${user.status === "active" ? "正常" : "已停用"}</span></td>
       <td data-label="最近登录">${formatDate(user.last_login_at)}</td>
@@ -1347,34 +1565,88 @@ function renderUsers(users) {
   </section>`;
 }
 
-function renderModelSettings(settings) {
-  const embedding = settings.embedding || {};
-  const llm = settings.llm || {};
-  const vector = settings.vector_index || {};
-  const vectorReady = vector.status === "ready";
+function renderAdminComments(payload = {}) {
+  const items = payload.items || [];
   return `<section class="card admin-section">
-    <div class="section-heading"><div><h2>模型与检索</h2><p>密钥加密保存在本机，仅管理员可更新或测试连接。</p></div></div>
-    <div class="model-status-grid">
-      <div><span class="status-dot ${embedding.api_key_configured ? "ready" : ""}"></span><small>嵌入模型</small><strong>${embedding.api_key_configured ? "已配置" : "未配置"}</strong></div>
-      <div><span class="status-dot ${vectorReady ? "ready" : ""}"></span><small>向量索引</small><strong>${vectorReady ? `${formatNumber(vector.count || 0)} 条` : "未构建"}</strong></div>
-      <div><span class="status-dot ${settings.semantic_enabled && vectorReady ? "ready" : ""}"></span><small>语义搜题</small><strong>${settings.semantic_enabled && vectorReady ? "可用" : "未启用"}</strong></div>
-    </div>
-    <form id="model-settings-form" class="stack-form">
-      <div class="settings-grid">
-        ${providerFields("embedding", "嵌入模型", embedding, true)}
-        ${providerFields("llm", "大模型", llm, false)}
-      </div>
-      <div class="settings-group">
-        <div class="switch-row"><div class="switch-copy"><strong>启用语义检索</strong><small>需要当前模型配置与已激活向量索引完全匹配</small></div><label class="switch"><input name="semantic_enabled" type="checkbox" ${settings.semantic_enabled ? "checked" : ""}><span></span></label></div>
-        <label class="field"><span>默认搜索模式</span><select name="default_search_mode"><option value="keyword" ${settings.default_search_mode === "keyword" ? "selected" : ""}>关键词</option><option value="hybrid" ${settings.default_search_mode === "hybrid" ? "selected" : ""}>混合</option><option value="semantic" ${settings.default_search_mode === "semantic" ? "selected" : ""}>语义</option></select></label>
-      </div>
-      <div class="question-actions"><button class="button button-secondary" type="button" data-action="test-provider" data-provider="embedding">测试嵌入模型</button><button class="button button-secondary" type="button" data-action="test-provider" data-provider="llm">测试大模型</button><button class="button button-primary" type="submit">保存配置</button></div>
-    </form>
+    <div class="section-heading"><div><h2>评论管理</h2><p>查看全站讨论，按用户或内容筛选，并处理不适当评论。</p></div></div>
+    <div class="admin-mini-stats"><span><strong>${formatNumber(payload.total || 0)}</strong>全部评论</span><span><strong>${formatNumber(items.length)}</strong>当前显示</span></div>
+    <form id="admin-comment-search" class="admin-comment-search"><label class="field"><span>筛选评论</span><input name="query" value="${escapeAttr(payload.query || "")}" placeholder="输入用户名或评论内容"></label><button class="button button-secondary" type="submit">筛选</button></form>
+    ${items.length ? `<div class="admin-comment-list">${items.map((item) => {
+      const question = item.question || {};
+      return `<article class="admin-comment-item">
+        <div class="comment-avatar">${avatarVisual(item, item.author_name)}</div>
+        <div class="admin-comment-main"><div class="comment-meta"><strong>${escapeHtml(item.author_name || "用户")}</strong><time>${escapeHtml(formatDate(item.updated_at))}${item.edited ? " · 已编辑" : ""}</time></div><p>${escapeHtml(item.body)}</p><div class="admin-comment-source"><span>${escapeHtml(question.stem || "原题已不可用")}</span><small>${escapeHtml(displaySourcePath(question.relative_path || ""))}</small></div></div>
+        <button class="button button-danger button-small" type="button" data-action="admin-delete-comment" data-comment-id="${escapeAttr(item.comment_id)}">删除</button>
+      </article>`;
+    }).join("")}</div>` : emptyMarkup("没有匹配的评论", "调整筛选条件后重试。", "◌")}
   </section>`;
 }
 
-function providerFields(prefix, title, provider, dimensions) {
-  return `<div class="settings-group"><h3>${title}</h3><label class="field"><span>API 地址</span><input name="${prefix}_api_url" type="url" value="${escapeAttr(provider.api_url || "")}" required></label><label class="field"><span>模型</span><input name="${prefix}_model" value="${escapeAttr(provider.model || "")}" required></label>${dimensions ? `<label class="field"><span>向量维度</span><input name="embedding_dimensions" type="number" min="64" max="1024" step="64" value="${provider.dimensions || 1024}" required></label>` : ""}<label class="field"><span>API 密钥</span><input name="${prefix}_api_key" type="password" autocomplete="new-password" placeholder="${provider.api_key_configured ? `已配置 ${escapeAttr(provider.api_key_masked || "")}` : "尚未配置"}"></label></div>`;
+function renderModelSettings(settings) {
+  const embedding = settings.embedding || {};
+  const llm = settings.llm || {};
+  const vectorPayload = state.adminData?.vectors || {};
+  const vector = vectorPayload.vector_index || settings.vector_index || {};
+  const operation = vectorPayload.operation || { status: "idle" };
+  const vectorReady = vector.status === "ready";
+  return `<section class="card admin-section">
+    <div class="section-heading"><div><h2>模型管理</h2><p>嵌入模型与大语言模型独立配置，未保存密钥只用于当前连接请求。</p></div></div>
+    <div class="model-status-grid">
+      <div><span class="status-dot ${embedding.api_key_configured ? "ready" : ""}"></span><small>嵌入模型</small><strong>${embedding.api_key_configured ? "已配置" : "未配置"}</strong></div>
+      <div><span class="status-dot ${vectorReady ? "ready" : ""}"></span><small>向量索引</small><strong>${vectorReady ? `${formatNumber(vector.count || 0)} 条` : "未构建"}</strong></div>
+      <div><span class="status-dot ${llm.api_key_configured ? "ready" : ""}"></span><small>大语言模型</small><strong>${llm.api_key_configured ? "已配置" : "未配置"}</strong></div>
+    </div>
+    <div class="provider-settings-grid">
+      ${providerPanel("embedding", "嵌入模型", embedding, true)}
+      ${providerPanel("llm", "大语言模型", llm, false)}
+    </div>
+    <form id="semantic-settings-form" class="settings-group semantic-settings-card">
+      <h3>检索策略</h3>
+      <div class="switch-row"><div class="switch-copy"><strong>启用语义检索</strong><small>需要当前嵌入配置与已激活向量索引完全匹配</small></div><label class="switch"><input name="semantic_enabled" type="checkbox" ${settings.semantic_enabled ? "checked" : ""}><span></span></label></div>
+      <label class="field"><span>默认搜索模式</span><select name="default_search_mode"><option value="keyword" ${settings.default_search_mode === "keyword" ? "selected" : ""}>关键词</option><option value="hybrid" ${settings.default_search_mode === "hybrid" ? "selected" : ""}>混合</option><option value="semantic" ${settings.default_search_mode === "semantic" ? "selected" : ""}>语义</option></select></label>
+      <div class="question-actions"><button class="button button-primary" type="submit">保存检索设置</button></div>
+    </form>
+    ${renderVectorManagement(vector, operation)}
+  </section>`;
+}
+
+function providerPanel(prefix, title, provider, dimensions) {
+  const modelState = state.providerModels[prefix] || { status: "idle", items: [], open: false, error: "" };
+  return `<form class="settings-group provider-settings-card" data-provider-form="${prefix}">
+    <div class="provider-card-heading"><div><h3>${title}</h3><span>${provider.api_key_configured ? `已保存 ${escapeHtml(provider.api_key_masked || "")}` : "尚未保存密钥"}</span></div><span class="status-dot ${provider.api_key_configured ? "ready" : ""}"></span></div>
+    <label class="field"><span>API 地址</span><input name="api_url" type="url" value="${escapeAttr(provider.api_url || "")}" required></label>
+    <div class="field model-select-field"><span>模型</span><div class="model-combobox"><input name="model" data-provider-model="${prefix}" value="${escapeAttr(provider.model || "")}" required autocomplete="off"><button type="button" data-action="toggle-model-list" data-provider="${prefix}" aria-label="展开上游模型" aria-expanded="${modelState.open ? "true" : "false"}">⌄</button></div>${renderProviderModelDropdown(prefix, modelState)}</div>
+    ${dimensions ? `<label class="field"><span>向量维度</span><input name="dimensions" type="number" min="64" max="1024" step="64" value="${provider.dimensions || 1024}" required></label>` : ""}
+    <label class="field"><span>API 密钥</span><input name="api_key" data-provider-key="${prefix}" type="password" autocomplete="new-password" placeholder="${provider.api_key_configured ? `留空则继续使用 ${escapeAttr(provider.api_key_masked || "")}` : "输入后自动读取上游模型"}"></label>
+    <div class="provider-card-actions"><button class="button button-secondary" type="button" data-action="test-provider" data-provider="${prefix}">测试连接</button><button class="button button-primary" type="submit">保存配置</button></div>
+  </form>`;
+}
+
+function renderProviderModelDropdown(provider, modelState) {
+  const items = modelState.items || [];
+  const content = modelState.status === "loading"
+    ? `<div class="model-dropdown-state"><span class="loading-spinner"></span>正在读取上游模型</div>`
+    : modelState.error
+      ? `<div class="model-dropdown-state error"><span>${escapeHtml(modelState.error)}</span><button class="text-button" type="button" data-action="discover-models" data-provider="${provider}">重试</button></div>`
+      : items.length
+        ? `<div class="model-option-list">${items.map((item) => `<button type="button" data-action="select-provider-model" data-provider="${provider}" data-model="${escapeAttr(item.id)}"><strong>${escapeHtml(item.id)}</strong>${item.owned_by ? `<small>${escapeHtml(item.owned_by)}</small>` : ""}</button>`).join("")}</div>`
+        : `<div class="model-dropdown-state">输入 API 密钥后自动读取，或点击刷新。</div>`;
+  return `<div id="${provider}-model-dropdown" class="model-dropdown" ${modelState.open ? "" : "hidden"}><div class="model-dropdown-head"><span>${provider === "embedding" ? "嵌入模型" : "大语言模型"} · ${formatNumber(items.length)} 个</span><button class="text-button" type="button" data-action="discover-models" data-provider="${provider}">刷新</button></div>${content}</div>`;
+}
+
+function renderVectorManagement(vector, operation) {
+  const running = ["queued", "running"].includes(operation.status);
+  const complete = Number(operation.completed || 0);
+  const total = Number(operation.total || 0);
+  const percent = total ? Math.min(100, Math.round((complete / total) * 100)) : 0;
+  const statusLabel = running ? "正在构建" : operation.status === "failed" ? "构建异常" : vector.status === "ready" ? "已激活" : "未构建";
+  return `<section id="vector-management-card" class="settings-group vector-management-card">
+    <div class="vector-management-head"><div><h3>向量索引</h3><p>支持中断续建；catalog 更新后会复用未变化题目的向量，仅补齐新增或变化内容。</p></div><span class="status-pill ${running ? "active" : vector.status === "ready" ? "complete" : "disabled"}">${statusLabel}</span></div>
+    ${running ? `<div class="vector-progress"><div><span style="width:${percent}%"></span></div><p><strong>${formatNumber(complete)} / ${formatNumber(total || 0)}</strong><span>${percent}%</span></p></div>` : ""}
+    ${operation.status === "failed" ? `<p class="vector-operation-error">${escapeHtml(operation.error || "构建失败，可重新开始以续建")}</p>` : ""}
+    <div class="vector-facts"><span><small>当前模型</small><strong>${escapeHtml(vector.model || "尚未构建")}</strong></span><span><small>向量数量</small><strong>${formatNumber(vector.count || 0)}</strong></span><span><small>维度</small><strong>${formatNumber(vector.dimensions || 0)}</strong></span></div>
+    <div class="provider-card-actions"><button class="button button-primary" type="button" data-action="build-vectors" ${running ? "disabled" : ""}>${operation.status === "failed" ? "继续构建" : vector.status === "ready" ? "检查并增量更新" : "构建向量索引"}</button><button class="button button-danger" type="button" data-action="delete-vectors" ${running || vector.status !== "ready" ? "disabled" : ""}>删除向量数据</button></div>
+  </section>`;
 }
 
 function renderSiteSettings(settings) {
@@ -1410,10 +1682,19 @@ async function handleClick(event) {
     closeProfileMenu();
     return navigateHash("#messages");
   }
+  if (action === "open-personal-page") {
+    state.accountReturnHash = "#profile";
+    return navigateHash(`#${target.dataset.page}`);
+  }
   if (action === "return-from-account") return navigateHash(state.accountReturnHash || "#library");
+  if (action === "return-to-profile") return navigateHash("#profile");
   if (action === "select-avatar") {
     state.profileAvatarDraft = target.dataset.avatar || "";
     renderProfilePage();
+    return;
+  }
+  if (action === "choose-avatar-file") {
+    $("#avatar-file-input")?.click();
     return;
   }
   if (action === "logout") return logout();
@@ -1501,6 +1782,17 @@ async function handleClick(event) {
   if (action === "remove-saved-outline") return removeSavedOutlineItem(target.dataset.kind, target.dataset.key);
   if (action === "reload-comments") return ensureQuestionComments(Number(target.dataset.occurrence), { force: true });
   if (action === "delete-comment") return deleteQuestionComment(target.dataset.commentId, Number(target.dataset.occurrence));
+  if (action === "edit-comment") return editQuestionComment(target.dataset.commentId, Number(target.dataset.occurrence));
+  if (action === "reload-note") return ensureQuestionNote(Number(target.dataset.occurrence), { force: true });
+  if (action === "delete-note") return deleteQuestionNote(Number(target.dataset.occurrence), { fromList: target.dataset.fromList === "true" });
+  if (action === "edit-personal-note") return editPersonalNote(Number(target.dataset.occurrence));
+  if (action === "toggle-model-list") return toggleProviderModelList(target.dataset.provider);
+  if (action === "discover-models") return discoverProviderModels(target.dataset.provider);
+  if (action === "select-provider-model") return selectProviderModel(target.dataset.provider, target.dataset.model);
+  if (action === "build-vectors") return buildVectors();
+  if (action === "delete-vectors") return deleteVectors();
+  if (action === "admin-delete-comment") return adminDeleteComment(target.dataset.commentId);
+  if (action === "open-personal-source") return openPersonalSource(target);
   if (action === "admin-tab") {
     state.adminTab = target.dataset.tab;
     renderAdminContent();
@@ -1525,18 +1817,32 @@ async function handleSubmit(event) {
   if (event.target.id === "search-form") return submitSearch(event.target);
   if (event.target.id === "profile-form") return saveProfile(event.target);
   if (event.target.id === "profile-password-form") return saveProfilePassword(event.target);
-  if (event.target.id === "model-settings-form") return saveModelSettings(event.target);
+  if (event.target.id === "semantic-settings-form") return saveSemanticSettings(event.target);
   if (event.target.id === "site-settings-form") return saveSiteSettings(event.target);
   if (event.target.id === "create-user-form") return createUser(event.target);
+  if (event.target.id === "admin-comment-search") return searchAdminComments(event.target);
+  if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);
+  if (event.target.dataset.form === "question-note") return submitQuestionNote(event.target);
 }
 
 document.addEventListener("input", (event) => {
+  if (event.target.dataset.providerKey) {
+    scheduleProviderDiscovery(event.target.dataset.providerKey);
+    return;
+  }
   if (event.target.dataset.action !== "subjective-draft" || !state.session) return;
   const item = state.session.items[state.sessionIndex];
   state.drafts[item.position] = event.target.value.trim();
   const submit = $('[data-action="submit-answer"]');
   if (submit) submit.disabled = !state.drafts[item.position];
+});
+
+document.addEventListener("change", (event) => {
+  if (event.target.id !== "avatar-file-input") return;
+  const file = event.target.files?.[0];
+  if (file) openAvatarCrop(file);
+  event.target.value = "";
 });
 
 async function submitAuth(form) {
@@ -1564,6 +1870,9 @@ async function logout() {
   state.user = null;
   state.session = null;
   state.comments = {};
+  state.notes = {};
+  state.myComments = null;
+  state.myNotes = null;
   $("#profile-menu").hidden = true;
   location.hash = "";
   showAuth("login");
@@ -1578,6 +1887,9 @@ async function changeOwnPassword() {
     state.user = null;
     state.session = null;
     state.comments = {};
+    state.notes = {};
+    state.myComments = null;
+    state.myNotes = null;
     showAuth("login");
     showToast("密码已修改，请重新登录");
   } catch (error) {
@@ -1894,34 +2206,128 @@ async function createUser(form) {
   }
 }
 
-async function saveModelSettings(form) {
+async function saveProviderSettings(form) {
+  const provider = form.dataset.providerForm;
   const values = Object.fromEntries(new FormData(form));
-  const body = {
-    app: {
-      semantic_enabled: form.elements.semantic_enabled.checked,
-      default_search_mode: values.default_search_mode,
-    },
-    providers: {
-      embedding: {
-        api_url: values.embedding_api_url,
-        model: values.embedding_model,
-        dimensions: Number(values.embedding_dimensions),
-      },
-      llm: {
-        api_url: values.llm_api_url,
-        model: values.llm_model,
-      },
-    },
-  };
-  if (values.embedding_api_key) body.providers.embedding.api_key = values.embedding_api_key;
-  if (values.llm_api_key) body.providers.llm.api_key = values.llm_api_key;
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "保存中");
   try {
-    state.adminData.settings = await api("/admin/settings", { method: "PUT", body });
+    const config = { api_url: values.api_url, model: values.model };
+    if (provider === "embedding") config.dimensions = Number(values.dimensions);
+    if (values.api_key) config.api_key = values.api_key;
+    state.adminData.settings = await api("/admin/settings", { method: "PUT", body: { providers: { [provider]: config } } });
     state.settings = state.adminData.settings;
+    state.providerModels[provider] = { status: "idle", items: [], open: false, error: "" };
     renderAdminContent();
-    showToast("模型与检索配置已保存");
+    showToast(`${provider === "embedding" ? "嵌入模型" : "大语言模型"}配置已保存`);
   } catch (error) {
     showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function saveSemanticSettings(form) {
+  try {
+    state.adminData.settings = await api("/admin/settings", {
+      method: "PUT",
+      body: {
+        app: {
+          semantic_enabled: form.elements.semantic_enabled.checked,
+          default_search_mode: form.elements.default_search_mode.value,
+        },
+      },
+    });
+    state.settings = state.adminData.settings;
+    renderAdminContent();
+    showToast("检索策略已保存");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function providerForm(provider) {
+  return $(`[data-provider-form="${provider}"]`);
+}
+
+function providerPreview(provider) {
+  const form = providerForm(provider);
+  if (!form) return { provider };
+  const values = Object.fromEntries(new FormData(form));
+  return {
+    provider,
+    api_url: values.api_url,
+    model: values.model,
+    api_key: values.api_key || undefined,
+    dimensions: provider === "embedding" ? Number(values.dimensions) : undefined,
+  };
+}
+
+function toggleProviderModelList(provider) {
+  const modelState = state.providerModels[provider] || { status: "idle", items: [], open: false, error: "" };
+  modelState.open = !modelState.open;
+  state.providerModels[provider] = modelState;
+  const dropdown = $(`#${provider}-model-dropdown`);
+  const trigger = $(`[data-action="toggle-model-list"][data-provider="${provider}"]`);
+  if (dropdown) dropdown.hidden = !modelState.open;
+  if (trigger) trigger.setAttribute("aria-expanded", String(modelState.open));
+  if (modelState.open && !modelState.items.length && modelState.status !== "loading") discoverProviderModels(provider);
+}
+
+async function discoverProviderModels(provider) {
+  const modelState = state.providerModels[provider] || { status: "idle", items: [], open: true, error: "" };
+  modelState.status = "loading";
+  modelState.open = true;
+  modelState.error = "";
+  state.providerModels[provider] = modelState;
+  updateProviderModelDropdown(provider);
+  try {
+    const result = await api("/admin/settings/models", { method: "POST", body: providerPreview(provider) });
+    modelState.status = "ready";
+    modelState.items = result.models || [];
+  } catch (error) {
+    modelState.status = "error";
+    modelState.error = error.message || "模型读取失败";
+  }
+  updateProviderModelDropdown(provider);
+}
+
+function scheduleProviderDiscovery(provider) {
+  if (state.providerDiscoveryTimers[provider]) clearTimeout(state.providerDiscoveryTimers[provider]);
+  state.providerDiscoveryTimers[provider] = setTimeout(() => {
+    const form = providerForm(provider);
+    const key = form?.elements.api_key?.value || "";
+    if (key.trim().length >= 8) discoverProviderModels(provider);
+  }, 700);
+}
+
+function updateProviderModelDropdown(provider) {
+  const slot = $(`#${provider}-model-dropdown`);
+  const stateValue = state.providerModels[provider] || { status: "idle", items: [], open: false, error: "" };
+  if (!slot) return;
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = renderProviderModelDropdown(provider, stateValue);
+  const next = wrapper.firstElementChild;
+  slot.replaceWith(next);
+  const trigger = $(`[data-action="toggle-model-list"][data-provider="${provider}"]`);
+  if (trigger) trigger.setAttribute("aria-expanded", String(stateValue.open));
+}
+
+function selectProviderModel(provider, model) {
+  const form = providerForm(provider);
+  if (form?.elements.model) form.elements.model.value = model;
+  state.providerModels[provider].open = false;
+  updateProviderModelDropdown(provider);
+}
+
+async function testProvider(provider, button) {
+  setButtonBusy(button, true, "测试中");
+  try {
+    const result = await api("/admin/settings/test", { method: "POST", body: providerPreview(provider) });
+    showToast(`${provider === "embedding" ? "嵌入模型" : "大语言模型"}连接正常${result.model ? ` · ${result.model}` : ""}`);
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
   }
 }
 
@@ -1947,16 +2353,99 @@ async function saveSiteSettings(form) {
   }
 }
 
-async function testProvider(provider, button) {
-  setButtonBusy(button, true, "测试中");
+async function refreshVectorOperation({ render = true } = {}) {
+  if (!state.adminData) return;
   try {
-    const result = await api("/admin/settings/test", { method: "POST", body: { provider } });
-    showToast(`${provider === "embedding" ? "嵌入模型" : "大模型"}连接正常${result.model ? ` · ${result.model}` : ""}`);
+    state.adminData.vectors = await api("/admin/vectors");
+    const vector = state.adminData.vectors.vector_index || {};
+    state.adminData.settings.vector_index = vector;
+    state.adminData.dashboard.vector_index = vector;
+    if (render && state.adminTab === "models" && location.hash.startsWith("#admin")) {
+      const current = $("#vector-management-card");
+      if (current) {
+        const wrapper = document.createElement("div");
+        wrapper.innerHTML = renderVectorManagement(vector, state.adminData.vectors.operation || {});
+        current.replaceWith(wrapper.firstElementChild);
+      } else {
+        renderAdminContent();
+      }
+    }
+    const operation = state.adminData.vectors.operation || {};
+    if (["queued", "running"].includes(operation.status)) scheduleVectorPoll();
+    else stopVectorPoll();
+  } catch (error) {
+    if (render) showToast(error.message, "error");
+  }
+}
+
+function scheduleVectorPoll() {
+  if (state.vectorPollHandle) return;
+  state.vectorPollHandle = setInterval(() => refreshVectorOperation(), 2500);
+}
+
+function stopVectorPoll() {
+  if (!state.vectorPollHandle) return;
+  clearInterval(state.vectorPollHandle);
+  state.vectorPollHandle = null;
+}
+
+async function buildVectors() {
+  const confirmed = await confirmModal("构建向量索引", "将使用当前嵌入配置构建或续建向量索引。已有题目的向量会复用，新增或变化的题目才会调用上游模型。确定开始？", "开始构建");
+  if (!confirmed) return;
+  try {
+    await api("/admin/vectors/build", { method: "POST", body: { confirmed: true } });
+    showToast("向量构建已启动，可离开页面，进度会在下次打开管理页时恢复");
+    await refreshVectorOperation();
+    scheduleVectorPoll();
   } catch (error) {
     showToast(error.message, "error");
-  } finally {
-    setButtonBusy(button, false);
   }
+}
+
+async function deleteVectors() {
+  const confirmed = await confirmModal("删除向量数据", "将删除当前所有向量制品与激活指针，关键词搜题和刷题不受影响；之后需要重新构建才能使用语义搜索。确定删除？", "确认删除");
+  if (!confirmed) return;
+  try {
+    await api("/admin/vectors", { method: "DELETE", body: { confirmed: true } });
+    showToast("向量数据已删除，语义搜索已暂时停用");
+    await refreshVectorOperation();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function searchAdminComments(form) {
+  const query = String(new FormData(form).get("query") || "").trim();
+  try {
+    state.adminData.comments = await api(`/admin/comments?limit=100&query=${encodeURIComponent(query)}`);
+    renderAdminContent();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function adminDeleteComment(commentId) {
+  const confirmed = await confirmModal("删除评论", "确认删除这条用户评论？此操作不可恢复。", "确认删除");
+  if (!confirmed) return;
+  try {
+    await api(`/study/comments/${encodeURIComponent(commentId)}`, { method: "DELETE", body: {} });
+    const payload = state.adminData.comments;
+    payload.items = (payload.items || []).filter((item) => item.comment_id !== commentId);
+    payload.total = Math.max(0, Number(payload.total || 0) - 1);
+    if (state.adminData.dashboard.activity) state.adminData.dashboard.activity.comments = Math.max(0, Number(state.adminData.dashboard.activity.comments || 0) - 1);
+    renderAdminContent();
+    showToast("评论已删除");
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function openPersonalSource(target) {
+  const collectionId = target.dataset.collection;
+  const position = Number(target.dataset.position);
+  if (!collectionId || !position) return;
+  state.accountReturnHash = location.hash || "#profile";
+  await startSession({ collectionId, position, path: collectionParentPath(target.dataset.path || ""), kind: "library", mode: "practice" });
 }
 
 function setButtonBusy(button, busy, label = "处理中") {
@@ -1969,6 +2458,137 @@ function setButtonBusy(button, busy, label = "处理中") {
     button.textContent = button.dataset.originalText || button.textContent;
     button.disabled = false;
   }
+}
+
+function openAvatarCrop(file) {
+  if (!file.type.startsWith("image/")) {
+    showToast("请选择 JPG、PNG 或 WebP 图片", "error");
+    return;
+  }
+  if (file.size > 20 * 1024 * 1024) {
+    showToast("原始图片不能超过 20 MB", "error");
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  const image = new Image();
+  image.onload = () => {
+    const baseScale = Math.max(512 / image.naturalWidth, 512 / image.naturalHeight);
+    state.avatarCrop = { image, url, baseScale, zoom: 1, offsetX: (512 - image.naturalWidth * baseScale) / 2, offsetY: (512 - image.naturalHeight * baseScale) / 2, dragging: false, pointerX: 0, pointerY: 0 };
+    const root = $("#modal-root");
+    root.innerHTML = `<div class="modal-backdrop avatar-crop-backdrop" role="presentation"><section class="modal avatar-crop-modal" role="dialog" aria-modal="true" aria-labelledby="avatar-crop-title"><div class="modal-heading"><div><h2 id="avatar-crop-title">调整头像</h2><p>拖动图片调整构图，使用滑杆缩放。</p></div><button class="icon-button" type="button" data-modal="cancel" aria-label="取消">×</button></div><div class="avatar-crop-canvas-wrap"><canvas id="avatar-crop-canvas" width="512" height="512"></canvas><span class="avatar-crop-guide" aria-hidden="true"></span></div><label class="avatar-zoom-control"><span>缩放</span><input id="avatar-crop-zoom" type="range" min="1" max="3" step="0.01" value="1"><output>100%</output></label><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="button" data-modal="confirm">使用此头像</button></div></section></div>`;
+    const canvas = $("#avatar-crop-canvas");
+    const zoom = $("#avatar-crop-zoom");
+    const output = $("output", zoom.parentElement);
+    const draw = () => drawAvatarCrop(canvas, output);
+    zoom.addEventListener("input", () => {
+      const previousScale = state.avatarCrop.baseScale * state.avatarCrop.zoom;
+      const centerImageX = (256 - state.avatarCrop.offsetX) / previousScale;
+      const centerImageY = (256 - state.avatarCrop.offsetY) / previousScale;
+      state.avatarCrop.zoom = Number(zoom.value);
+      const nextScale = state.avatarCrop.baseScale * state.avatarCrop.zoom;
+      state.avatarCrop.offsetX = 256 - centerImageX * nextScale;
+      state.avatarCrop.offsetY = 256 - centerImageY * nextScale;
+      clampAvatarCrop();
+      draw();
+    });
+    canvas.addEventListener("pointerdown", (event) => {
+      state.avatarCrop.dragging = true;
+      state.avatarCrop.pointerX = event.clientX;
+      state.avatarCrop.pointerY = event.clientY;
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!state.avatarCrop?.dragging) return;
+      const rect = canvas.getBoundingClientRect();
+      const scale = 512 / rect.width;
+      state.avatarCrop.offsetX += (event.clientX - state.avatarCrop.pointerX) * scale;
+      state.avatarCrop.offsetY += (event.clientY - state.avatarCrop.pointerY) * scale;
+      state.avatarCrop.pointerX = event.clientX;
+      state.avatarCrop.pointerY = event.clientY;
+      clampAvatarCrop();
+      draw();
+    });
+    canvas.addEventListener("pointerup", () => { if (state.avatarCrop) state.avatarCrop.dragging = false; });
+    canvas.addEventListener("pointercancel", () => { if (state.avatarCrop) state.avatarCrop.dragging = false; });
+    $$('[data-modal="cancel"]', root).forEach((button) => button.addEventListener("click", () => closeAvatarCrop()));
+    $('[data-modal="confirm"]', root).addEventListener("click", () => uploadCroppedAvatar(canvas));
+    $(".avatar-crop-backdrop", root).addEventListener("click", (event) => {
+      if (event.target.classList.contains("avatar-crop-backdrop")) closeAvatarCrop();
+    });
+    draw();
+  };
+  image.onerror = () => { URL.revokeObjectURL(url); showToast("图片读取失败", "error"); };
+  image.src = url;
+}
+
+function drawAvatarCrop(canvas, output) {
+  const crop = state.avatarCrop;
+  if (!crop) return;
+  const context = canvas.getContext("2d");
+  const scale = crop.baseScale * crop.zoom;
+  context.clearRect(0, 0, 512, 512);
+  context.fillStyle = "#f3f4f7";
+  context.fillRect(0, 0, 512, 512);
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(crop.image, crop.offsetX, crop.offsetY, crop.image.naturalWidth * scale, crop.image.naturalHeight * scale);
+  if (output) output.value = `${Math.round(crop.zoom * 100)}%`;
+}
+
+function clampAvatarCrop() {
+  const crop = state.avatarCrop;
+  if (!crop) return;
+  const scale = crop.baseScale * crop.zoom;
+  const width = crop.image.naturalWidth * scale;
+  const height = crop.image.naturalHeight * scale;
+  crop.offsetX = Math.min(0, Math.max(512 - width, crop.offsetX));
+  crop.offsetY = Math.min(0, Math.max(512 - height, crop.offsetY));
+}
+
+function closeAvatarCrop() {
+  if (state.avatarCrop?.url) URL.revokeObjectURL(state.avatarCrop.url);
+  state.avatarCrop = null;
+  $("#modal-root").innerHTML = "";
+}
+
+async function uploadCroppedAvatar(canvas) {
+  const button = $('[data-modal="confirm"]');
+  setButtonBusy(button, true, "上传中");
+  canvas.toBlob(async (blob) => {
+    if (!blob) {
+      setButtonBusy(button, false);
+      showToast("头像压缩失败", "error");
+      return;
+    }
+    try {
+      const form = new FormData();
+      form.append("avatar", blob, "avatar.webp");
+      const result = await api("/auth/avatar", { method: "POST", body: form });
+      state.user = result.user;
+      state.profileAvatarDraft = null;
+      state.comments = {};
+      state.myComments = null;
+      syncUserChrome(state.user);
+      closeAvatarCrop();
+      renderProfilePage();
+      showToast("头像已更新");
+    } catch (error) {
+      showToast(error.message, "error");
+      setButtonBusy(button, false);
+    }
+  }, "image/webp", 0.86);
+}
+
+function textEditorModal(title, value, maxLength, confirmLabel) {
+  return new Promise((resolve) => {
+    const root = $("#modal-root");
+    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="editor-modal-title"><div class="modal-heading"><h2 id="editor-modal-title">${escapeHtml(title)}</h2><button class="icon-button" type="button" data-modal="cancel" aria-label="取消">×</button></div><textarea id="editor-modal-input" maxlength="${maxLength}" rows="7">${escapeHtml(value || "")}</textarea><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="button" data-modal="confirm">${escapeHtml(confirmLabel)}</button></div></section></div>`;
+    const finish = (result) => { root.innerHTML = ""; resolve(result); };
+    $$('[data-modal="cancel"]', root).forEach((button) => button.addEventListener("click", () => finish(null)));
+    $('[data-modal="confirm"]', root).addEventListener("click", () => finish(String($("#editor-modal-input", root).value || "").trim()));
+    $(".modal-backdrop", root).addEventListener("click", (event) => { if (event.target.classList.contains("modal-backdrop")) finish(null); });
+    $("#editor-modal-input", root).focus();
+  });
 }
 
 function confirmModal(title, message, confirmLabel = "确认") {

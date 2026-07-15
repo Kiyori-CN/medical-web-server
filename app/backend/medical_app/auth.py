@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import re
 import secrets
 import sqlite3
@@ -11,7 +12,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from flask import Blueprint, Flask, g, jsonify, request
+from flask import Blueprint, Flask, g, jsonify, request, send_file
+from PIL import Image, ImageOps, UnidentifiedImageError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -19,9 +21,14 @@ SESSION_COOKIE = "medical_session"
 CSRF_COOKIE = "medical_csrf"
 SESSION_TTL_SECONDS = 14 * 24 * 60 * 60
 _USERNAME_RE = re.compile(r"^[\w.-]{3,32}$", re.UNICODE)
-_AVATAR_OPTIONS = {
+DEFAULT_AVATAR = "preset-01"
+PRESET_AVATARS = tuple(f"preset-{index:02d}" for index in range(1, 7))
+_LEGACY_AVATARS = {
     "", "医", "学", "知", "🩺", "🧬", "🧠", "🫀", "🫁", "📚", "⭐", "🌿",
 }
+_AVATAR_OPTIONS = {*PRESET_AVATARS, *_LEGACY_AVATARS, "custom"}
+AVATAR_MAX_BYTES = 2 * 1024 * 1024
+AVATAR_SIZE = 512
 
 
 class AuthenticationError(RuntimeError):
@@ -73,6 +80,42 @@ def validate_avatar(value: str) -> str:
     return avatar
 
 
+def public_avatar_url(user_id: str, avatar: str, updated_at: str = "") -> str:
+    if avatar in PRESET_AVATARS:
+        return f"/avatars/{avatar}.svg"
+    if avatar == "custom":
+        revision = hashlib.sha256(str(updated_at).encode("utf-8")).hexdigest()[:12]
+        return f"/api/auth/avatars/{user_id}?v={revision}"
+    return ""
+
+
+def _normalized_avatar_image(payload: bytes) -> bytes:
+    if not payload:
+        raise ValueError("请选择头像图片")
+    if len(payload) > AVATAR_MAX_BYTES:
+        raise ValueError("头像图片不能超过 2 MB")
+    try:
+        with Image.open(io.BytesIO(payload)) as source:
+            source.load()
+            image = ImageOps.exif_transpose(source).convert("RGB")
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as error:
+        raise ValueError("头像图片格式无效") from error
+    width, height = image.size
+    if min(width, height) < 128 or max(width, height) > 12000:
+        raise ValueError("头像图片尺寸须在 128–12000 像素之间")
+    edge = min(width, height)
+    left = (width - edge) // 2
+    top = (height - edge) // 2
+    image = image.crop((left, top, left + edge, top + edge))
+    image = image.resize((AVATAR_SIZE, AVATAR_SIZE), Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    image.save(output, format="WEBP", quality=84, method=6)
+    encoded = output.getvalue()
+    if len(encoded) > 512 * 1024:
+        raise ValueError("头像压缩后仍然过大，请更换图片")
+    return encoded
+
+
 class AuthStore:
     def __init__(self, database_path: str | Path):
         self.database_path = Path(database_path).resolve()
@@ -107,6 +150,14 @@ class AuthStore:
                     expires_at INTEGER NOT NULL,
                     user_agent TEXT NOT NULL DEFAULT '',
                     remote_hash TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS user_avatars (
+                    user_id TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                    mime_type TEXT NOT NULL,
+                    image_data BLOB NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
@@ -186,14 +237,15 @@ class AuthStore:
         connection.execute(
             """
             INSERT INTO users(
-                user_id, username, normalized_username, password_hash,
+                user_id, username, normalized_username, avatar, password_hash,
                 role, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
             """,
             (
                 user_id,
                 display_name,
                 _normalized_username(display_name),
+                DEFAULT_AVATAR,
                 generate_password_hash(password, method="scrypt"),
                 role,
                 now,
@@ -203,6 +255,8 @@ class AuthStore:
         return {
             "user_id": user_id,
             "username": display_name,
+            "avatar": DEFAULT_AVATAR,
+            "avatar_url": public_avatar_url(user_id, DEFAULT_AVATAR, now),
             "role": role,
             "status": "active",
             "created_at": now,
@@ -264,6 +318,11 @@ class AuthStore:
             ).fetchone() is None:
                 connection.rollback()
                 raise AuthenticationError("用户不存在")
+            if avatar == "custom" and connection.execute(
+                "SELECT 1 FROM user_avatars WHERE user_id = ?", (user_id,)
+            ).fetchone() is None:
+                connection.rollback()
+                raise ValueError("请先上传自定义头像")
             try:
                 connection.execute(
                     """
@@ -287,6 +346,51 @@ class AuthStore:
                 "SELECT * FROM users WHERE user_id = ?", (user_id,)
             ).fetchone()
         return self._public_user(updated)
+
+    def save_avatar_image(self, user_id: str, payload: bytes) -> dict[str, Any]:
+        encoded = _normalized_avatar_image(payload)
+        now = _utc_now()
+        digest = hashlib.sha256(encoded).hexdigest()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone() is None:
+                connection.rollback()
+                raise AuthenticationError("用户不存在")
+            connection.execute(
+                """
+                INSERT INTO user_avatars(
+                    user_id, mime_type, image_data, content_sha256, updated_at
+                ) VALUES (?, 'image/webp', ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    mime_type = excluded.mime_type,
+                    image_data = excluded.image_data,
+                    content_sha256 = excluded.content_sha256,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, encoded, digest, now),
+            )
+            connection.execute(
+                "UPDATE users SET avatar = 'custom', updated_at = ? WHERE user_id = ?",
+                (now, user_id),
+            )
+            connection.commit()
+            updated = connection.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return self._public_user(updated)
+
+    def avatar_image(self, user_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT mime_type, image_data, content_sha256, updated_at
+                FROM user_avatars WHERE user_id = ?
+                """,
+                (str(user_id or ""),),
+            ).fetchone()
+        return dict(row) if row else None
 
     def create_session(
         self, user_id: str, *, user_agent: str = "", remote_address: str = ""
@@ -359,7 +463,7 @@ class AuthStore:
                 """,
                 (max(1, min(int(limit), 500)), max(0, int(offset))),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._public_user(row) for row in rows]
 
     def update_user(self, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         with self.connect() as connection:
@@ -422,7 +526,7 @@ class AuthStore:
 
     @staticmethod
     def _public_user(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        payload = {
             "user_id": row["user_id"],
             "username": row["username"],
             "avatar": row["avatar"],
@@ -431,6 +535,10 @@ class AuthStore:
             "created_at": row["created_at"],
             "last_login_at": row["last_login_at"],
         }
+        payload["avatar_url"] = public_avatar_url(
+            row["user_id"], row["avatar"], row["updated_at"]
+        )
+        return payload
 
 
 def install_auth(app: Flask, store: AuthStore) -> None:
@@ -594,6 +702,33 @@ def create_auth_blueprint(
             data.get("avatar", g.current_user.get("avatar", "")),
         )
         return jsonify({"user": user})
+
+    @blueprint.post("/avatar")
+    @login_required
+    @csrf_required
+    def upload_avatar():
+        upload = request.files.get("avatar")
+        if upload is None:
+            raise ValueError("请选择头像图片")
+        payload = upload.stream.read(AVATAR_MAX_BYTES + 1)
+        user = store.save_avatar_image(g.current_user["user_id"], payload)
+        return jsonify({"user": user})
+
+    @blueprint.get("/avatars/<user_id>")
+    @login_required
+    def avatar_image(user_id: str):
+        item = store.avatar_image(user_id)
+        if item is None:
+            return jsonify({"error": "头像不存在"}), 404
+        response = send_file(
+            io.BytesIO(item["image_data"]),
+            mimetype=item["mime_type"],
+            max_age=31536000,
+        )
+        response.set_etag(item["content_sha256"])
+        response.make_conditional(request)
+        response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+        return response
 
     return blueprint
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import numpy as np
 import requests
@@ -9,6 +9,20 @@ import requests
 
 class ProviderError(RuntimeError):
     pass
+
+
+_EMBEDDING_MODEL_MARKERS = (
+    "embedding",
+    "embed-",
+    "bge-",
+    "/bge",
+    "gte-",
+    "/gte",
+    "e5-",
+    "/e5",
+    "text2vec",
+    "m3e-",
+)
 
 
 def validate_provider_url(value: str) -> None:
@@ -19,6 +33,78 @@ def validate_provider_url(value: str) -> None:
         raise ValueError(
             "api_url must not contain credentials, query parameters, or a fragment"
         )
+
+
+def provider_models_url(api_url: str) -> str:
+    validate_provider_url(api_url)
+    parsed = urlparse(api_url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if "v1" in parts:
+        parts = parts[: len(parts) - parts[::-1].index("v1")]
+    elif parts[-2:] == ["chat", "completions"]:
+        parts = parts[:-2]
+    elif parts and parts[-1] in {"embeddings", "completions", "responses"}:
+        parts = parts[:-1]
+    parts.append("models")
+    return urlunparse(parsed._replace(path="/" + "/".join(parts)))
+
+
+def list_provider_models(
+    *, api_url: str, api_key: str, provider: str, timeout: int = 30
+) -> list[dict[str, str]]:
+    provider = str(provider or "").strip().lower()
+    if provider not in {"embedding", "llm"}:
+        raise ValueError("provider must be embedding or llm")
+    if not isinstance(api_key, str) or len(api_key.strip()) < 8:
+        raise ProviderError("API key is not configured")
+    try:
+        response = requests.get(
+            provider_models_url(api_url),
+            headers={"Authorization": f"Bearer {api_key.strip()}"},
+            timeout=max(5, min(int(timeout), 120)),
+        )
+    except requests.RequestException as error:
+        raise ProviderError(
+            f"Provider model discovery failed: {type(error).__name__}"
+        ) from error
+    if response.status_code >= 400:
+        raise ProviderError(f"Provider model discovery returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+        rows = payload.get("data", payload.get("models", []))
+    except (TypeError, ValueError) as error:
+        raise ProviderError("Provider returned an invalid model list") from error
+    if not isinstance(rows, list):
+        raise ProviderError("Provider returned an invalid model list")
+    models: list[dict[str, str]] = []
+    for row in rows:
+        if isinstance(row, str):
+            model_id = row.strip()
+            metadata = ""
+            owner = ""
+        elif isinstance(row, dict):
+            model_id = str(row.get("id") or row.get("name") or "").strip()
+            metadata = " ".join(
+                str(row.get(key) or "")
+                for key in ("type", "task", "category", "capabilities")
+            ).lower()
+            owner = str(row.get("owned_by") or row.get("provider") or "").strip()
+        else:
+            continue
+        if not model_id or len(model_id) > 200:
+            continue
+        searchable = f"{model_id} {metadata}".lower()
+        is_embedding = any(marker in searchable for marker in _EMBEDDING_MODEL_MARKERS)
+        is_reranker = "rerank" in searchable
+        if provider == "embedding" and (not is_embedding or is_reranker):
+            continue
+        if provider == "llm" and (is_embedding or is_reranker):
+            continue
+        models.append({"id": model_id, "owned_by": owner})
+    deduplicated = {item["id"]: item for item in models}
+    return sorted(
+        deduplicated.values(), key=lambda item: (item["id"].casefold(), item["id"])
+    )[:500]
 
 
 class EmbeddingClient:

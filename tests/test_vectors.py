@@ -131,3 +131,64 @@ def test_vector_build_resume_contract_and_semantic_search(
             include_solution=False,
             filters={},
         )
+
+
+def test_incremental_vector_build_reuses_unchanged_question_rows(tmp_path, monkeypatch):
+    catalog = tmp_path / "catalog.sqlite3"
+    catalog.write_bytes(b"placeholder")
+    knowledge = tmp_path / "knowledge"
+    dataset = {
+        "metadata": {
+            "snapshot_id": "snapshot-a",
+            "catalog_schema_revision": 1,
+            "catalog_build_id": "catalog-a",
+        },
+        "items": [
+            {"question_id": "q1", "embedding_text": "题目一"},
+            {"question_id": "q2", "embedding_text": "题目二"},
+        ],
+    }
+    calls: list[list[str]] = []
+
+    def catalog_items(_):
+        return dataset["metadata"], dataset["items"]
+
+    def embed(self, texts):
+        calls.append(list(texts))
+        return _fake_embed(self, texts)
+
+    monkeypatch.setattr("medical_app.vector_builder._catalog_items", catalog_items)
+    monkeypatch.setattr(EmbeddingClient, "embed", embed)
+    first = build_vector_index(
+        catalog,
+        knowledge,
+        api_url="https://example.invalid/v1/embeddings",
+        api_key="sk-vector-test-secret",
+        model="Qwen/Qwen3-Embedding-0.6B",
+        dimensions=64,
+    )
+    assert first["incremental"]["reused_count"] == 0
+
+    dataset["metadata"] = {
+        "snapshot_id": "snapshot-b",
+        "catalog_schema_revision": 1,
+        "catalog_build_id": "catalog-b",
+    }
+    dataset["items"] = [
+        {"question_id": "q1", "embedding_text": "题目一"},
+        {"question_id": "q2", "embedding_text": "题目二"},
+        {"question_id": "q3", "embedding_text": "新增题目"},
+    ]
+    calls.clear()
+    second = build_vector_index(
+        catalog,
+        knowledge,
+        api_url="https://example.invalid/v1/embeddings",
+        api_key="sk-vector-test-secret",
+        model="Qwen/Qwen3-Embedding-0.6B",
+        dimensions=64,
+    )
+    assert second["incremental"]["source_build_id"] == first["build_id"]
+    assert second["incremental"]["reused_count"] == 2
+    assert second["incremental"]["embedded_count"] == 1
+    assert calls == [["新增题目"]]

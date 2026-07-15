@@ -7,12 +7,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .auth import public_avatar_url
 from .catalog import Catalog
 from .normalize import display_text, normalize_answer
 
 
-APP_SCHEMA_REVISION = 1
+APP_SCHEMA_REVISION = 2
 COMMENT_MAX_LENGTH = 2000
+NOTE_MAX_LENGTH = 10000
 
 
 class PracticeUnavailable(RuntimeError):
@@ -121,6 +123,16 @@ CREATE TABLE IF NOT EXISTS question_comments (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS question_notes (
+    profile_id TEXT NOT NULL,
+    occurrence_id INTEGER NOT NULL,
+    question_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, occurrence_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_session_questions_question
 ON practice_session_questions(question_id);
 
@@ -135,6 +147,12 @@ ON collection_question_progress(profile_id, collection_id, last_seen_at);
 
 CREATE INDEX IF NOT EXISTS idx_question_comments_occurrence
 ON question_comments(occurrence_id, created_at, comment_id);
+
+CREATE INDEX IF NOT EXISTS idx_question_comments_author
+ON question_comments(author_id, updated_at DESC, comment_id);
+
+CREATE INDEX IF NOT EXISTS idx_question_notes_profile
+ON question_notes(profile_id, updated_at DESC, occurrence_id);
 """
 
 
@@ -648,13 +666,7 @@ class PracticeStore:
             ).fetchall()
         finally:
             connection.close()
-        items = []
-        for row in rows:
-            item = dict(row)
-            item["can_delete"] = bool(
-                viewer_is_admin or row["author_id"] == self.profile_id
-            )
-            items.append(item)
+        items = self._decorate_comments(rows, viewer_is_admin=viewer_is_admin)
         return {
             "occurrence_id": int(occurrence_id),
             "question_id": question["question_id"],
@@ -729,6 +741,281 @@ class PracticeStore:
         finally:
             connection.close()
         return cursor.rowcount == 1
+
+    def update_comment(self, comment_id: str, body: object) -> dict[str, Any]:
+        comment_id = display_text(comment_id)
+        normalized_body = _comment_body(body)
+        if not comment_id:
+            raise PracticeNotFound("Comment not found")
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM question_comments WHERE comment_id = ?",
+                (comment_id,),
+            ).fetchone()
+            if row is None:
+                raise PracticeNotFound("Comment not found")
+            if row["author_id"] != self.profile_id:
+                raise PracticeForbidden("You cannot edit this comment")
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                "UPDATE question_comments SET body = ?, updated_at = ? WHERE comment_id = ?",
+                (normalized_body, now, comment_id),
+            )
+            connection.commit()
+            updated = connection.execute(
+                "SELECT * FROM question_comments WHERE comment_id = ?",
+                (comment_id,),
+            ).fetchone()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self._decorate_comments([updated], viewer_is_admin=False)[0]
+
+    def my_comments(
+        self, *, query: str = "", limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        return self._comment_feed(
+            author_id=self.profile_id,
+            query=query,
+            limit=limit,
+            offset=offset,
+            viewer_is_admin=False,
+        )
+
+    def all_comments(
+        self, *, query: str = "", limit: int = 100, offset: int = 0
+    ) -> dict[str, Any]:
+        return self._comment_feed(
+            author_id="",
+            query=query,
+            limit=limit,
+            offset=offset,
+            viewer_is_admin=True,
+        )
+
+    def _comment_feed(
+        self,
+        *,
+        author_id: str,
+        query: str,
+        limit: int,
+        offset: int,
+        viewer_is_admin: bool,
+    ) -> dict[str, Any]:
+        normalized_query = display_text(query)
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if author_id:
+            clauses.append("author_id = ?")
+            parameters.append(author_id)
+        if normalized_query:
+            clauses.append("(body LIKE ? OR author_name LIKE ?)")
+            like = f"%{normalized_query}%"
+            parameters.extend((like, like))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        connection = self.connect()
+        try:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM question_comments {where}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT comment_id, occurrence_id, question_id, author_id,
+                       author_name, body, created_at, updated_at
+                FROM question_comments {where}
+                ORDER BY updated_at DESC, comment_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, limit, offset),
+            ).fetchall()
+        finally:
+            connection.close()
+        return {
+            "count": len(rows),
+            "total": int(total),
+            "offset": offset,
+            "query": normalized_query,
+            "items": self._decorate_comments(
+                rows, viewer_is_admin=viewer_is_admin, include_question=True
+            ),
+        }
+
+    def _decorate_comments(
+        self,
+        rows: list[sqlite3.Row],
+        *,
+        viewer_is_admin: bool,
+        include_question: bool = False,
+    ) -> list[dict[str, Any]]:
+        author_ids = sorted({row["author_id"] for row in rows})
+        avatar_by_author: dict[str, dict[str, str]] = {}
+        if author_ids:
+            connection = self.connect()
+            try:
+                has_users = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+                ).fetchone()
+                if has_users:
+                    placeholders = ",".join("?" for _ in author_ids)
+                    for user in connection.execute(
+                        f"SELECT user_id, avatar, updated_at FROM users WHERE user_id IN ({placeholders})",
+                        author_ids,
+                    ):
+                        avatar_by_author[user["user_id"]] = {
+                            "avatar": user["avatar"],
+                            "avatar_url": public_avatar_url(
+                                user["user_id"], user["avatar"], user["updated_at"]
+                            ),
+                        }
+            finally:
+                connection.close()
+        questions: dict[int, dict[str, Any]] = {}
+        if include_question and rows:
+            occurrence_ids = sorted({int(row["occurrence_id"]) for row in rows})
+            questions = {
+                int(question["occurrence_id"]): question
+                for question in self.catalog.get_occurrence_questions(
+                    occurrence_ids, include_solution=False
+                )
+            }
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item.update(avatar_by_author.get(row["author_id"], {}))
+            item["can_edit"] = row["author_id"] == self.profile_id
+            item["can_delete"] = bool(
+                viewer_is_admin or row["author_id"] == self.profile_id
+            )
+            item["edited"] = row["updated_at"] != row["created_at"]
+            if include_question:
+                item["question"] = _question_reference(
+                    questions.get(int(row["occurrence_id"]))
+                )
+            items.append(item)
+        return items
+
+    def get_note(self, occurrence_id: int) -> dict[str, Any]:
+        question = self._resolve_occurrence_question(occurrence_id)
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT profile_id, occurrence_id, question_id, body, created_at, updated_at
+                FROM question_notes WHERE profile_id = ? AND occurrence_id = ?
+                """,
+                (self.profile_id, int(occurrence_id)),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return {
+                "occurrence_id": int(occurrence_id),
+                "question_id": question["question_id"],
+                "body": "",
+                "exists": False,
+            }
+        return {**dict(row), "exists": True}
+
+    def save_note(self, occurrence_id: int, body: object) -> dict[str, Any]:
+        question = self._resolve_occurrence_question(occurrence_id)
+        normalized_body = _note_body(body)
+        now = _utc_now()
+        connection = self.connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO question_notes(
+                        profile_id, occurrence_id, question_id, body, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(profile_id, occurrence_id) DO UPDATE SET
+                        question_id = excluded.question_id,
+                        body = excluded.body,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        self.profile_id,
+                        int(occurrence_id),
+                        question["question_id"],
+                        normalized_body,
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT profile_id, occurrence_id, question_id, body, created_at, updated_at
+                    FROM question_notes WHERE profile_id = ? AND occurrence_id = ?
+                    """,
+                    (self.profile_id, int(occurrence_id)),
+                ).fetchone()
+        finally:
+            connection.close()
+        return {**dict(row), "exists": True}
+
+    def delete_note(self, occurrence_id: int) -> bool:
+        self._resolve_occurrence_question(occurrence_id)
+        connection = self.connect()
+        try:
+            with connection:
+                cursor = connection.execute(
+                    "DELETE FROM question_notes WHERE profile_id = ? AND occurrence_id = ?",
+                    (self.profile_id, int(occurrence_id)),
+                )
+        finally:
+            connection.close()
+        return cursor.rowcount == 1
+
+    def my_notes(
+        self, *, query: str = "", limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        normalized_query = display_text(query)
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        where = "WHERE profile_id = ?"
+        parameters: list[Any] = [self.profile_id]
+        if normalized_query:
+            where += " AND body LIKE ?"
+            parameters.append(f"%{normalized_query}%")
+        connection = self.connect()
+        try:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM question_notes {where}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT occurrence_id, question_id, body, created_at, updated_at
+                FROM question_notes {where}
+                ORDER BY updated_at DESC, occurrence_id
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, limit, offset),
+            ).fetchall()
+        finally:
+            connection.close()
+        occurrence_ids = [int(row["occurrence_id"]) for row in rows]
+        questions = {
+            int(question["occurrence_id"]): question
+            for question in self.catalog.get_occurrence_questions(
+                occurrence_ids, include_solution=False
+            )
+        }
+        items = [
+            {
+                **dict(row),
+                "question": _question_reference(
+                    questions.get(int(row["occurrence_id"]))
+                ),
+            }
+            for row in rows
+        ]
+        return {"count": len(items), "total": int(total), "offset": offset, "items": items}
 
     def _resolve_occurrence_question(self, occurrence_id: int) -> dict[str, Any]:
         try:
@@ -1330,7 +1617,9 @@ class PracticeStore:
                     (SELECT COUNT(*) FROM practice_sessions WHERE status = 'active') AS active_practice,
                     (SELECT COUNT(*) FROM practice_session_questions WHERE answered_at IS NOT NULL) AS answers,
                     (SELECT COUNT(*) FROM study_items WHERE kind = 'favorite') AS favorites,
-                    (SELECT COUNT(*) FROM study_items WHERE kind = 'wrong') AS wrong_items
+                    (SELECT COUNT(*) FROM study_items WHERE kind = 'wrong') AS wrong_items,
+                    (SELECT COUNT(*) FROM question_comments) AS comments,
+                    (SELECT COUNT(*) FROM question_notes) AS notes
                 """
             ).fetchone()
         finally:
@@ -1388,3 +1677,30 @@ def _comment_body(value: object) -> str:
     if len(body) > COMMENT_MAX_LENGTH:
         raise ValueError(f"comment body must not exceed {COMMENT_MAX_LENGTH} characters")
     return body
+
+
+def _note_body(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("note body must be a string")
+    body = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not body:
+        raise ValueError("note body must not be empty")
+    if len(body) > NOTE_MAX_LENGTH:
+        raise ValueError(f"note body must not exceed {NOTE_MAX_LENGTH} characters")
+    return body
+
+
+def _question_reference(question: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not question:
+        return None
+    source = (question.get("sources") or [{}])[0]
+    return {
+        "question_id": question.get("question_id", ""),
+        "occurrence_id": question.get("occurrence_id"),
+        "type_label": question.get("type_label", ""),
+        "source_code": question.get("source_code", ""),
+        "stem": question.get("stem", ""),
+        "collection_id": source.get("collection_id", ""),
+        "collection_position": source.get("collection_position") or source.get("position"),
+        "relative_path": source.get("relative_path", ""),
+    }

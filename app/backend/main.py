@@ -22,6 +22,7 @@ from medical_app.practice_api import create_practice_blueprint
 from medical_app.semantic import SemanticSearchService
 from medical_app.settings import SettingsStore
 from medical_app.settings_api import create_settings_blueprint
+from medical_app.vector_admin import VectorOperationManager, create_vector_admin_blueprint
 
 
 def create_app() -> Flask:
@@ -48,6 +49,13 @@ def create_app() -> Flask:
         config.KNOWLEDGE_BASE_ROOT,
         provider_timeout=config.PROVIDER_TIMEOUT,
     )
+    vector_operations = VectorOperationManager(
+        catalog_database=catalog_path,
+        knowledge_base_root=config.KNOWLEDGE_BASE_ROOT,
+        settings_store=settings_store,
+        state_root=Path(config.APP_DB).resolve().parent,
+        vector_status=semantic_service.status,
+    )
 
     install_auth(application, auth_store)
     application.register_blueprint(
@@ -59,6 +67,7 @@ def create_app() -> Flask:
             secure_cookies=config.SECURE_COOKIES,
         )
     )
+    application.register_blueprint(create_vector_admin_blueprint(vector_operations))
     application.register_blueprint(create_user_admin_blueprint(auth_store))
     application.register_blueprint(create_catalog_blueprint(catalog_path, semantic_service))
     application.register_blueprint(

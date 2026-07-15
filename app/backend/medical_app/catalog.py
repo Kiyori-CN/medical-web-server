@@ -371,6 +371,7 @@ class Catalog:
                                 "sheet_name": row["sheet_name"],
                                 "row_number": row["row_number"],
                                 "position": row["source_position"],
+                                "collection_position": row["collection_position"],
                                 "collection_id": row["collection_id"],
                             }
                         ],

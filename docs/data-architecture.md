@@ -32,9 +32,10 @@ knowledge-base/
     build-state.json            可恢复构建进度
 
 state/
-  app.sqlite3                   账号、会话、文件刷题状态、收藏、错题、评论
+  app.sqlite3                   账号、头像、会话、文件刷题状态、收藏、错题、私有笔记、评论
   settings.sqlite3              网站与模型设置
   settings.key                  设置加密密钥
+  vector-operation.json         管理员向量构建/删除后台任务状态
 ```
 
 原始数据、派生制品和运行状态均不进入 Git。
@@ -159,6 +160,10 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 `collection_question_progress` 以 `(profile_id, collection_id, occurrence_id)` 唯一定位题号目录状态。提交答案时同步更新该投影；点击题库重置只删除当前账号在当前 collection 的投影行。`practice_sessions` 和 `practice_session_questions` 仍保留为历史试卷，`question_progress`、`study_items` 和 `question_comments` 均不随文件重置删除。同一道规范题出现在其他文件时也不会被连带重置。
 
 `question_comments` 绑定具体 `occurrence_id`，同时保存 `question_id`、作者账号 ID、作者名快照、正文和时间。评论不写入 catalog、不依赖用户外键；所有登录用户可查看和发表，只有作者本人或管理员可以删除，正文去除首尾空白且最长 2000 字。
+
+运行状态补充实体：`user_avatars` 以 `user_id` 保存服务端重编码后的 512×512 WebP；`question_notes` 以 `(profile_id, occurrence_id)` 唯一保存个人笔记；头像、笔记和评论均属于 state，不写入 catalog 或任何检索索引。笔记正文最长 10000 字，支持更新和删除，个人笔记列表通过 occurrence 反查原文件路径和题号。
+
+管理员构建通过 `medical_app.vector_task` 独立进程执行，`state/vector-operation.json` 记录 queued/running/complete/failed 与已完成数量。相同 API URL、模型、维度和文本版本的旧 manifest 可作为增量源；按 `question_id` 复制未变化行，只有新增或变化题目进入上游批次。删除向量只处理 `vector-current.json` 和 `vector-indexes/`，catalog、原始数据与用户 state 永不删除。
 
 ## 四种刷题模式
 

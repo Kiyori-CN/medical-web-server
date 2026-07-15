@@ -68,6 +68,8 @@ def test_main_auth_roles_health_assets_and_practice(
 
     assert client.get("/api/settings").status_code == 200
     assert client.get("/api/admin/dashboard").status_code == 200
+    assert client.get("/api/admin/comments").status_code == 200
+    assert client.get("/api/admin/vectors").get_json()["operation"]["status"] == "idle"
     stats = client.get("/api/stats").get_json()
     assert stats["questions"] == 5
     search = client.post(
@@ -93,6 +95,8 @@ def test_main_auth_roles_health_assets_and_practice(
     assert registered.status_code == 201
     assert registered.get_json()["user"]["role"] == "user"
     assert ordinary.get("/api/admin/dashboard").status_code == 403
+    assert ordinary.get("/api/admin/comments").status_code == 403
+    assert ordinary.get("/api/admin/vectors").status_code == 403
     assert ordinary.get("/api/settings").status_code == 200
     wrong_password = ordinary.post(
         "/api/auth/password",

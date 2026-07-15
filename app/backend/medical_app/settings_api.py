@@ -6,7 +6,13 @@ from typing import Any
 from flask import Blueprint, jsonify, request
 
 from .auth import admin_required, csrf_required, login_required
-from .providers import EmbeddingClient, ProviderError, test_chat_provider
+from .providers import (
+    EmbeddingClient,
+    ProviderError,
+    list_provider_models,
+    test_chat_provider,
+    validate_provider_url,
+)
 from .settings import SettingsStore, SettingsUnavailable
 
 
@@ -63,7 +69,7 @@ def create_settings_blueprint(
         if not isinstance(data, dict):
             raise ValueError("JSON body must be an object")
         provider = str(data.get("provider", "")).strip().lower()
-        config = store.provider_config(provider, include_secret=True)
+        config = _preview_provider_config(store, provider, data)
         if provider == "embedding":
             vectors = EmbeddingClient(
                 api_url=config["api_url"],
@@ -84,4 +90,46 @@ def create_settings_blueprint(
             return jsonify(test_chat_provider(config, timeout=provider_timeout))
         raise ValueError("provider must be embedding or llm")
 
+    @blueprint.post("/admin/settings/models")
+    @admin_required
+    @csrf_required
+    def discover_models():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        provider = str(data.get("provider", "")).strip().lower()
+        config = _preview_provider_config(store, provider, data)
+        models = list_provider_models(
+            api_url=config["api_url"],
+            api_key=config["api_key"],
+            provider=provider,
+            timeout=provider_timeout,
+        )
+        return jsonify({"provider": provider, "count": len(models), "models": models})
+
     return blueprint
+
+
+def _preview_provider_config(
+    store: SettingsStore, provider: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if provider not in {"embedding", "llm"}:
+        raise ValueError("provider must be embedding or llm")
+    config = store.provider_config(provider, include_secret=True)
+    api_url = str(payload.get("api_url") or config["api_url"]).strip()
+    model = str(payload.get("model") or config["model"]).strip()
+    api_key = payload.get("api_key")
+    if api_key in (None, ""):
+        api_key = config.get("api_key", "")
+    if not isinstance(api_key, str) or len(api_key.strip()) < 8:
+        raise ProviderError("API key is not configured")
+    validate_provider_url(api_url)
+    if not model or len(model) > 200:
+        raise ValueError("model must be between 1 and 200 characters")
+    config.update({"api_url": api_url, "model": model, "api_key": api_key.strip()})
+    if provider == "embedding" and payload.get("dimensions") not in (None, ""):
+        dimensions = int(payload["dimensions"])
+        if dimensions not in {64, 128, 256, 512, 768, 1024}:
+            raise ValueError("embedding dimensions are invalid")
+        config["dimensions"] = dimensions
+    return config

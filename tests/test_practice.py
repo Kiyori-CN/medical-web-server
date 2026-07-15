@@ -293,6 +293,31 @@ def test_question_comments_are_occurrence_bound_validated_and_permission_scoped(
     assert alice.list_comments(occurrence["occurrence_id"])["count"] == 0
 
 
+def test_private_notes_and_comment_feeds_are_account_scoped(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, alice = _services(sample_source_tree, tmp_path, "usr_alice")
+    bob = PracticeStore(alice.database_path, catalog, "usr_bob")
+    collection = _file_collection(catalog, "第一章.xlsx")
+    occurrence = catalog.collection_outline(collection["collection_id"])[0]
+
+    note = alice.save_note(occurrence["occurrence_id"], "记住这是易化扩散。")
+    assert note["exists"] is True
+    assert alice.get_note(occurrence["occurrence_id"])["body"] == "记住这是易化扩散。"
+    assert bob.get_note(occurrence["occurrence_id"])["exists"] is False
+    assert alice.my_notes()["items"][0]["question"]["collection_id"] == collection["collection_id"]
+
+    comment = alice.create_comment(
+        occurrence["occurrence_id"], author_name="Alice", body="先看题干中的方向。"
+    )
+    updated = alice.update_comment(comment["comment_id"], "先判断物质和浓度梯度。")
+    assert updated["edited"] is True
+    assert alice.my_comments()["items"][0]["body"] == "先判断物质和浓度梯度。"
+    with pytest.raises(PracticeForbidden):
+        bob.update_comment(comment["comment_id"], "越权修改")
+    assert alice.delete_note(occurrence["occurrence_id"]) is True
+
+
 def test_progress_reset_and_comment_routes_require_login_csrf_and_enforce_permissions(
     sample_source_tree: Path, tmp_path: Path
 ):

@@ -88,6 +88,73 @@ def _catalog_items(database_path: Path) -> tuple[dict[str, Any], list[dict[str, 
     }, questions
 
 
+def _find_incremental_source(
+    root: Path,
+    *,
+    exclude_build_id: str,
+    api_url: str,
+    model: str,
+    dimensions: int,
+) -> tuple[list[str], np.ndarray, dict[str, Any]] | None:
+    indexes_root = root / "vector-indexes"
+    if not indexes_root.is_dir():
+        return None
+    candidates: list[Path] = []
+    pointer_path = root / "vector-current.json"
+    if pointer_path.is_file():
+        try:
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            active = indexes_root / str(pointer.get("build_id", "")) / "manifest.json"
+            if active.is_file():
+                candidates.append(active)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    candidates.extend(
+        sorted(
+            indexes_root.glob("vec_*/manifest.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    )
+    seen: set[Path] = set()
+    for manifest_path in candidates:
+        manifest_path = manifest_path.resolve()
+        if manifest_path in seen:
+            continue
+        seen.add(manifest_path)
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("build_id") == exclude_build_id:
+                continue
+            if (
+                manifest.get("api_url") != api_url
+                or manifest.get("model") != model
+                or int(manifest.get("dimensions") or 0) != dimensions
+                or int(manifest.get("text_revision") or 0) != VECTOR_TEXT_REVISION
+                or manifest.get("dtype") != "float32"
+                or not manifest.get("normalized")
+            ):
+                continue
+            build_dir = manifest_path.parent
+            actual_validation = validate_vector_build(build_dir)
+            stored_validation = manifest.get("validation") or {}
+            for field in ("matrix_sha256", "question_ids_file_sha256"):
+                if stored_validation.get(field) and stored_validation[field] != actual_validation[field]:
+                    raise ValueError(f"Incremental source validation failed: {field}")
+            ids = json.loads((build_dir / "question_ids.json").read_text(encoding="utf-8"))
+            matrix = np.load(build_dir / "embeddings.npy", mmap_mode="r")
+            if (
+                not isinstance(ids, list)
+                or any(not isinstance(value, str) for value in ids)
+                or matrix.shape != (len(ids), dimensions)
+            ):
+                continue
+            return ids, matrix, manifest
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return None
+
+
 def build_vector_index(
     catalog_database: str | Path,
     knowledge_base_root: str | Path,
@@ -100,6 +167,7 @@ def build_vector_index(
     timeout: int = 60,
     max_retries: int = 5,
     force: bool = False,
+    incremental: bool = True,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     catalog_database = Path(catalog_database).resolve()
@@ -167,11 +235,21 @@ def build_vector_index(
         if stored_ids != question_ids:
             raise ValueError("Partial vector build question IDs do not match catalog")
         matrix = np.load(matrix_path, mmap_mode="r+")
-        next_index = int(state.get("next_index", 0))
+        legacy_next_index = int(state.get("next_index", 0))
         if matrix.shape != (len(items), dimensions) or matrix.dtype != np.float32:
             raise ValueError("Partial vector matrix does not match current input")
-        if next_index < 0 or next_index > len(items):
+        if legacy_next_index < 0 or legacy_next_index > len(items):
             raise ValueError("Partial vector build progress is invalid")
+        if "pending_indices" in state:
+            pending_indices = [int(value) for value in state["pending_indices"]]
+            next_pending_offset = int(state.get("next_pending_offset", 0))
+        else:
+            pending_indices = list(range(legacy_next_index, len(items)))
+            next_pending_offset = 0
+        if any(index < 0 or index >= len(items) for index in pending_indices):
+            raise ValueError("Partial vector build pending indexes are invalid")
+        if next_pending_offset < 0 or next_pending_offset > len(pending_indices):
+            raise ValueError("Partial vector build pending progress is invalid")
     else:
         _write_json_atomic(ids_path, question_ids)
         matrix = np.lib.format.open_memmap(
@@ -180,8 +258,47 @@ def build_vector_index(
             dtype=np.float32,
             shape=(len(items), dimensions),
         )
-        next_index = 0
-        state = {**expected_state, "next_index": 0, "started_at": _utc_now()}
+        incremental_source = None
+        reused_indexes: set[int] = set()
+        if incremental and not force:
+            incremental_source = _find_incremental_source(
+                root,
+                exclude_build_id=vector_id,
+                api_url=api_url,
+                model=model,
+                dimensions=dimensions,
+            )
+        if incremental_source:
+            source_ids, source_matrix, source_manifest = incremental_source
+            source_positions = {question_id: index for index, question_id in enumerate(source_ids)}
+            target_indexes: list[int] = []
+            source_indexes: list[int] = []
+            for target_index, question_id in enumerate(question_ids):
+                source_index = source_positions.get(question_id)
+                if source_index is not None:
+                    target_indexes.append(target_index)
+                    source_indexes.append(source_index)
+                    reused_indexes.add(target_index)
+            for start in range(0, len(target_indexes), 4096):
+                target_chunk = target_indexes[start : start + 4096]
+                source_chunk = source_indexes[start : start + 4096]
+                matrix[target_chunk] = np.asarray(source_matrix[source_chunk], dtype=np.float32)
+            matrix.flush()
+        pending_indices = [
+            index for index in range(len(items)) if index not in reused_indexes
+        ]
+        next_pending_offset = 0
+        state = {
+            **expected_state,
+            "next_index": len(reused_indexes),
+            "pending_indices": pending_indices,
+            "next_pending_offset": 0,
+            "incremental_source_build_id": (
+                source_manifest["build_id"] if incremental_source else ""
+            ),
+            "reused_count": len(reused_indexes),
+            "started_at": _utc_now(),
+        }
         _write_json_atomic(state_path, state)
 
     client = EmbeddingClient(
@@ -192,9 +309,11 @@ def build_vector_index(
         timeout=timeout,
     )
     started = time.monotonic()
-    for start in range(next_index, len(items), batch_size):
-        end = min(start + batch_size, len(items))
-        texts = [item["embedding_text"] for item in items[start:end]]
+    initially_completed = len(items) - len(pending_indices)
+    for pending_start in range(next_pending_offset, len(pending_indices), batch_size):
+        pending_end = min(pending_start + batch_size, len(pending_indices))
+        batch_indexes = pending_indices[pending_start:pending_end]
+        texts = [items[index]["embedding_text"] for index in batch_indexes]
         last_error: Exception | None = None
         for attempt in range(max(1, int(max_retries))):
             try:
@@ -211,11 +330,14 @@ def build_vector_index(
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         if np.any(norms <= 0) or not np.isfinite(norms).all():
             raise ValueError("Embedding batch contains invalid vector norms")
-        matrix[start:end] = vectors / norms
+        matrix[batch_indexes] = vectors / norms
         matrix.flush()
+        completed = initially_completed + pending_end
         state = {
-            **expected_state,
-            "next_index": end,
+            **state,
+            "next_index": completed,
+            "pending_indices": pending_indices,
+            "next_pending_offset": pending_end,
             "started_at": state.get("started_at", _utc_now()),
             "updated_at": _utc_now(),
         }
@@ -224,7 +346,7 @@ def build_vector_index(
             progress(
                 {
                     "build_id": vector_id,
-                    "completed": end,
+                    "completed": completed,
                     "total": len(items),
                     "elapsed_seconds": round(time.monotonic() - started, 1),
                 }
@@ -246,6 +368,11 @@ def build_vector_index(
         "matrix": "embeddings.npy",
         "question_ids": "question_ids.json",
         "validation": validation,
+        "incremental": {
+            "source_build_id": state.get("incremental_source_build_id", ""),
+            "reused_count": int(state.get("reused_count", 0)),
+            "embedded_count": len(items) - int(state.get("reused_count", 0)),
+        },
         "reused": False,
     }
     _write_json_atomic(manifest_path, manifest)
