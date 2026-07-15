@@ -82,6 +82,8 @@ const state = {
     activeId: "",
     messages: {},
     sending: false,
+    abortController: null,
+    draft: "",
     contextOccurrence: null,
     contextCollection: "",
   },
@@ -2125,10 +2127,12 @@ function aiMessageMarkup(message) {
     `<a href="#search" data-action="ai-citation" data-query="${escapeAttr(item.source || item.question_id || "")}">[${escapeHtml(item.index)}] ${escapeHtml(item.title || item.source || "题库来源")}</a>`
   ).join("");
   const content = escapeHtml(message.content || "").replace(/\n/g, "<br>");
+  const actions = message.role === "assistant" ? `<div class="ai-message-actions"><button class="text-button" type="button" data-action="ai-copy" data-message-id="${escapeAttr(message.message_id)}">复制</button><button class="text-button" type="button" data-action="ai-continue" data-message-id="${escapeAttr(message.message_id)}">继续追问</button></div>` : "";
   return `<article class="ai-message ${message.role === "user" ? "user" : "assistant"}">
     <div class="ai-message-role">${message.role === "user" ? "我" : "AI 学习助手"}</div>
     <div class="ai-message-body">${content}</div>
     ${citations ? `<div class="ai-citations"><span>题库引用</span>${citations}</div>` : ""}
+    ${actions}
   </article>`;
 }
 
@@ -2152,8 +2156,8 @@ function renderAIContent() {
       <div class="ai-messages" aria-live="polite">${messages.length ? messages.map(aiMessageMarkup).join("") : `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
       <form id="ai-chat-form" class="ai-composer" data-form="ai-chat">
         <label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog"${state.ai.contextOccurrence ? "" : " selected"}>全题库</option><option value="question"${state.ai.contextOccurrence ? " selected" : " disabled"}>当前题（从刷题页发起）</option><option value="collection"${state.ai.contextCollection ? "" : " disabled"}>当前文件（从刷题页发起）</option></select></label>
-        <textarea name="content" rows="3" maxlength="8000" placeholder="输入你的问题，按 Ctrl/⌘ + Enter 发送" required></textarea>
-        <div class="ai-composer-foot"><span>答案可能需要复核，请以原题和标准解析为准。</span><button class="button button-primary" type="submit"${state.ai.sending ? " disabled" : ""}>${state.ai.sending ? "生成中…" : "发送"}</button></div>
+        <textarea name="content" rows="3" maxlength="8000" placeholder="输入你的问题，按 Ctrl/⌘ + Enter 发送" required>${escapeHtml(state.ai.draft || "")}</textarea>
+        <div class="ai-composer-foot"><span>答案可能需要复核，请以原题和标准解析为准。</span>${state.ai.sending ? `<button class="button button-secondary" type="button" data-action="ai-stop">停止</button>` : `<button class="button button-primary" type="submit">发送</button>`}</div>
       </form>` : `<div class="ai-no-conversation">${emptyMarkup("创建一个 AI 会话", "会话按账号隔离，回答可引用全题库内容。", "✦")}<button class="button button-primary" type="button" data-action="ai-new">新建会话</button></div>`}
     </section>
   </div>`;
@@ -2233,15 +2237,56 @@ async function sendAIMessage(form) {
   if (!state.ai.activeId) return createAIConversation();
   const content = String(new FormData(form).get("content") || "").trim();
   if (!content || state.ai.sending) return;
+  const conversationId = state.ai.activeId;
+  state.ai.draft = "";
   state.ai.sending = true;
+  state.ai.abortController = new AbortController();
   renderAIContent();
   try {
     const scope = String(new FormData(form).get("scope") || "catalog");
-    const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`, { method: "POST", body: { content, context: { scope, occurrence_id: state.ai.contextOccurrence, collection_id: state.ai.contextCollection } } });
-    state.ai.messages[state.ai.activeId] = [...(state.ai.messages[state.ai.activeId] || []), payload.user, payload.assistant];
-    state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === state.ai.activeId ? { ...item, ...payload.conversation, preview: payload.assistant.content, message_count: (item.message_count || 0) + 2 } : item);
-  } catch (error) { showToast(error.message, "error"); }
-  finally { state.ai.sending = false; renderAIContent(); }
+    const payload = await api(`/ai/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "POST", signal: state.ai.abortController.signal, body: { content, context: { scope, occurrence_id: state.ai.contextOccurrence, collection_id: state.ai.contextCollection } } });
+    state.ai.messages[conversationId] = [...(state.ai.messages[conversationId] || []), payload.user, payload.assistant];
+    state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === conversationId ? { ...item, ...payload.conversation, preview: payload.assistant.content, message_count: (item.message_count || 0) + 2 } : item);
+  } catch (error) {
+    if (error?.name === "AbortError") showToast("已停止等待本次回答");
+    else showToast(error.message, "error");
+  }
+  finally {
+    state.ai.sending = false;
+    state.ai.abortController = null;
+    renderAIContent();
+  }
+}
+
+function stopAIMessage() {
+  state.ai.abortController?.abort();
+}
+
+async function copyAIMessage(messageId) {
+  const message = (state.ai.messages[state.ai.activeId] || []).find((item) => item.message_id === messageId && item.role === "assistant");
+  if (!message) return;
+  try {
+    await navigator.clipboard.writeText(message.content || "");
+  } catch (_) {
+    const fallback = document.createElement("textarea");
+    fallback.value = message.content || "";
+    fallback.setAttribute("readonly", "");
+    fallback.style.position = "fixed";
+    fallback.style.opacity = "0";
+    document.body.append(fallback);
+    fallback.select();
+    document.execCommand("copy");
+    fallback.remove();
+  }
+  showToast("回答已复制");
+}
+
+function continueAIMessage(messageId) {
+  const message = (state.ai.messages[state.ai.activeId] || []).find((item) => item.message_id === messageId && item.role === "assistant");
+  if (!message) return;
+  state.ai.draft = "请基于上一条回答继续解释：";
+  renderAIContent();
+  $("#ai-chat-form textarea")?.focus();
 }
 
 function forumRouteHash({ topic = "", section = "", query = "", returnHash = "" } = {}) {
@@ -3215,6 +3260,9 @@ async function handleClick(event) {
   if (action === "ai-rename") return renameAIConversation();
   if (action === "ai-delete") return deleteAIConversation();
   if (action === "ai-retry") return renderAIPage({ force: true });
+  if (action === "ai-stop") return stopAIMessage();
+  if (action === "ai-copy") return copyAIMessage(target.dataset.messageId || "");
+  if (action === "ai-continue") return continueAIMessage(target.dataset.messageId || "");
   if (action === "ai-citation") {
     event.preventDefault();
     const query = target.dataset.query || "";
