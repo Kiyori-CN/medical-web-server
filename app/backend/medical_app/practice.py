@@ -12,7 +12,7 @@ from .catalog import Catalog
 from .normalize import display_text, normalize_answer
 
 
-APP_SCHEMA_REVISION = 3
+APP_SCHEMA_REVISION = 4
 COMMENT_MAX_LENGTH = 2000
 NOTE_MAX_LENGTH = 10000
 
@@ -132,12 +132,11 @@ CREATE TABLE IF NOT EXISTS comment_reactions (
     PRIMARY KEY (comment_id, profile_id)
 );
 
-CREATE TABLE IF NOT EXISTS friendships (
-    profile_id TEXT NOT NULL,
-    friend_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'accepted' CHECK (status IN ('accepted', 'blocked')),
+CREATE TABLE IF NOT EXISTS user_follows (
+    follower_id TEXT NOT NULL,
+    following_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (profile_id, friend_id)
+    PRIMARY KEY (follower_id, following_id)
 );
 
 CREATE TABLE IF NOT EXISTS direct_messages (
@@ -191,8 +190,8 @@ ON question_comments(author_id, updated_at DESC, comment_id);
 CREATE INDEX IF NOT EXISTS idx_comment_reactions_comment
 ON comment_reactions(comment_id, reaction);
 
-CREATE INDEX IF NOT EXISTS idx_friendships_profile
-ON friendships(profile_id, status, friend_id);
+CREATE INDEX IF NOT EXISTS idx_user_follows_following
+ON user_follows(following_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_direct_messages_receiver
 ON direct_messages(receiver_id, created_at DESC);
@@ -811,36 +810,6 @@ class PracticeStore:
                                 now,
                             ),
                         )
-                has_users = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
-                ).fetchone()
-                if has_users:
-                    mentioned_ids: set[str] = set()
-                    for friend in connection.execute(
-                        """
-                        SELECT u.user_id, u.username FROM friendships f
-                        JOIN users u ON u.user_id = f.friend_id
-                        WHERE f.profile_id = ? AND f.status = 'accepted'
-                        """,
-                        (self.profile_id,),
-                    ):
-                        if f"@{friend['username']}" in normalized_body and friend["user_id"] not in mentioned_ids:
-                            mentioned_ids.add(friend["user_id"])
-                            connection.execute(
-                                """
-                                INSERT INTO notifications(
-                                    notification_id, profile_id, kind, actor_id, comment_id, body, created_at
-                                ) VALUES (?, ?, 'mention', ?, ?, ?, ?)
-                                """,
-                                (
-                                    f"ntf_{secrets.token_hex(10)}",
-                                    friend["user_id"],
-                                    self.profile_id,
-                                    item["comment_id"],
-                                    normalized_body[:200],
-                                    now,
-                                ),
-                            )
         finally:
             connection.close()
         return item
@@ -1335,64 +1304,137 @@ class PracticeStore:
             item["liked_at"] = row["liked_at"]
         return {"count": len(items), "total": int(total), "offset": offset, "items": items}
 
-    def list_friends(self) -> list[dict[str, Any]]:
+    def follow_user(self, target_id: str) -> dict[str, Any]:
+        target_id = display_text(target_id)
+        if not target_id or target_id == self.profile_id:
+            raise ValueError("不能关注自己")
+        connection = self.connect()
+        try:
+            with connection:
+                has_users = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+                ).fetchone()
+                if not has_users or connection.execute(
+                    "SELECT 1 FROM users WHERE user_id = ? AND status = 'active'", (target_id,)
+                ).fetchone() is None:
+                    raise PracticeNotFound("用户不存在")
+                connection.execute(
+                    "INSERT OR IGNORE INTO user_follows(follower_id, following_id, created_at) VALUES (?, ?, ?)",
+                    (self.profile_id, target_id, _utc_now()),
+                )
+        finally:
+            connection.close()
+        return self.profile_stats(target_id)
+
+    def unfollow_user(self, target_id: str) -> dict[str, Any]:
+        target_id = display_text(target_id)
+        connection = self.connect()
+        try:
+            with connection:
+                connection.execute(
+                    "DELETE FROM user_follows WHERE follower_id = ? AND following_id = ?",
+                    (self.profile_id, target_id),
+                )
+        finally:
+            connection.close()
+        return self.profile_stats(target_id)
+
+    def profile_stats(self, user_id: str) -> dict[str, Any]:
+        user_id = display_text(user_id)
+        connection = self.connect()
+        try:
+            followers = connection.execute(
+                "SELECT COUNT(*) FROM user_follows WHERE following_id = ?", (user_id,)
+            ).fetchone()[0]
+            following = connection.execute(
+                "SELECT COUNT(*) FROM user_follows WHERE follower_id = ?", (user_id,)
+            ).fetchone()[0]
+            likes = connection.execute(
+                """
+                SELECT COUNT(*) FROM comment_reactions r
+                JOIN question_comments c ON c.comment_id = r.comment_id
+                WHERE c.author_id = ? AND r.reaction = 'agree' AND r.profile_id != c.author_id
+                """,
+                (user_id,),
+            ).fetchone()[0]
+            dynamics = connection.execute(
+                "SELECT COUNT(*) FROM question_comments WHERE author_id = ?", (user_id,)
+            ).fetchone()[0]
+            is_following = bool(
+                connection.execute(
+                    "SELECT 1 FROM user_follows WHERE follower_id = ? AND following_id = ?",
+                    (self.profile_id, user_id),
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+        return {
+            "followers": int(followers),
+            "following": int(following),
+            "likes": int(likes),
+            "dynamics": int(dynamics),
+            "is_following": is_following,
+            "is_self": user_id == self.profile_id,
+        }
+
+    def public_profile(self, user_id: str) -> dict[str, Any]:
+        user_id = display_text(user_id)
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM users WHERE user_id = ? AND status = 'active'", (user_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise PracticeNotFound("用户不存在")
+        profile = {
+            "user_id": row["user_id"],
+            "username": row["username"],
+            "avatar": row["avatar"],
+            "avatar_url": public_avatar_url(row["user_id"], row["avatar"], row["updated_at"]),
+            "ip_location": row["ip_location"] if "ip_location" in row.keys() else "本地",
+            "birthday": row["birthday"] if "birthday" in row.keys() else "",
+            "gender": row["gender"] if "gender" in row.keys() else "",
+            "school": row["school"] if "school" in row.keys() else "",
+            "major": row["major"] if "major" in row.keys() else "",
+        }
+        try:
+            privacy = json.loads(row["privacy_json"] or "{}")
+        except (TypeError, ValueError, KeyError):
+            privacy = {}
+        if user_id != self.profile_id:
+            for key in ("birthday", "gender", "school", "major"):
+                if not privacy.get(key):
+                    profile[key] = ""
+        else:
+            profile.update(
+                {
+                    "birthday": row["birthday"] if "birthday" in row.keys() else "",
+                    "gender": row["gender"] if "gender" in row.keys() else "",
+                    "privacy": privacy,
+                }
+            )
+        profile["stats"] = self.profile_stats(user_id)
+        profile["is_self"] = profile["stats"]["is_self"]
+        profile["dynamics"] = self._public_dynamics(user_id)
+        return profile
+
+    def _public_dynamics(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         connection = self.connect()
         try:
             rows = connection.execute(
                 """
-                SELECT u.user_id, u.username, u.avatar, u.updated_at
-                FROM friendships f JOIN users u ON u.user_id = f.friend_id
-                WHERE f.profile_id = ? AND f.status = 'accepted' AND u.status = 'active'
-                ORDER BY u.username
+                SELECT comment_id, occurrence_id, question_id, author_id, author_name,
+                       body, parent_comment_id, created_at, updated_at
+                FROM question_comments WHERE author_id = ?
+                ORDER BY created_at DESC LIMIT ?
                 """,
-                (self.profile_id,),
+                (user_id, max(1, min(int(limit), 100))),
             ).fetchall()
         finally:
             connection.close()
-        return [
-            {"user_id": row["user_id"], "username": row["username"], "avatar": row["avatar"], "avatar_url": public_avatar_url(row["user_id"], row["avatar"], row["updated_at"])}
-            for row in rows
-        ]
-
-    def add_friend(self, username: str) -> dict[str, Any]:
-        normalized = display_text(username).casefold()
-        if not normalized:
-            raise ValueError("username is required")
-        connection = self.connect()
-        try:
-            with connection:
-                friend = connection.execute(
-                    "SELECT user_id, username, avatar, updated_at FROM users WHERE normalized_username = ? AND status = 'active'",
-                    (normalized,),
-                ).fetchone()
-                if friend is None:
-                    raise PracticeNotFound("用户不存在")
-                if friend["user_id"] == self.profile_id:
-                    raise ValueError("不能添加自己")
-                now = _utc_now()
-                connection.execute(
-                    "INSERT OR REPLACE INTO friendships(profile_id, friend_id, status, created_at) VALUES (?, ?, 'accepted', ?)",
-                    (self.profile_id, friend["user_id"], now),
-                )
-                connection.execute(
-                    "INSERT OR REPLACE INTO friendships(profile_id, friend_id, status, created_at) VALUES (?, ?, 'accepted', ?)",
-                    (friend["user_id"], self.profile_id, now),
-                )
-        finally:
-            connection.close()
-        return {"user_id": friend["user_id"], "username": friend["username"], "avatar": friend["avatar"], "avatar_url": public_avatar_url(friend["user_id"], friend["avatar"], friend["updated_at"])}
-
-    def remove_friend(self, friend_id: str) -> bool:
-        connection = self.connect()
-        try:
-            with connection:
-                cursor = connection.execute(
-                    "DELETE FROM friendships WHERE (profile_id = ? AND friend_id = ?) OR (profile_id = ? AND friend_id = ?)",
-                    (self.profile_id, friend_id, friend_id, self.profile_id),
-                )
-        finally:
-            connection.close()
-        return cursor.rowcount > 0
+        return self._decorate_comments(rows, viewer_is_admin=False, include_question=True)
 
     def list_messages(self, category: str = "all") -> dict[str, Any]:
         connection = self.connect()

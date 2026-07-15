@@ -32,7 +32,7 @@ knowledge-base/
     build-state.json            可恢复构建进度
 
 state/
-  app.sqlite3                   账号、资料隐私、头像、会话、文件刷题状态、收藏、错题、私有笔记、评论、好友、反应、通知、私信
+  app.sqlite3                   账号、资料隐私、头像、会话、文件刷题状态、收藏、错题、私有笔记、评论、关注、反应、通知、私信
   settings.sqlite3              网站与模型设置
   settings.key                  设置加密密钥
   vector-operation.json         管理员向量构建/删除后台任务状态
@@ -163,7 +163,7 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 
 运行状态补充实体：`user_avatars` 以 `user_id` 保存服务端重编码后的 512×512 WebP；`question_notes` 以 `(profile_id, occurrence_id)` 唯一保存个人笔记；头像、笔记和评论均属于 state，不写入 catalog 或任何检索索引。笔记正文最长 10000 字，支持更新和删除，个人笔记列表通过 occurrence 反查原文件路径和题号。
 
-社区状态补充实体：`comment_reactions` 以 `(comment_id, profile_id)` 保存赞同或反对；`question_comments.parent_comment_id` 保存回复关系；`friendships` 保存互为好友的本地账号；`direct_messages` 保存账号间私信；`notifications` 保存系统通知、回复/@ 和收到赞同。五类数据都只在本地 state 中按账号隔离，评论正文仍不进入 FTS 或向量文本。`users` 的 birthday/gender/school/major 与 privacy_json 用于个人中心资料和好友可见控制。
+社区状态补充实体：`comment_reactions` 以 `(comment_id, profile_id)` 保存赞同或反对；`question_comments.parent_comment_id` 保存回复关系；`user_follows` 保存单向关注与粉丝关系；`direct_messages` 保存账号间私信；`notifications` 保存系统通知、回复和收到赞同。五类数据都只在本地 state 中按账号隔离，评论正文仍不进入 FTS 或向量文本。`users` 的 birthday/gender/school/major/ip_location 与 privacy_json 用于公开个人资料和字段可见控制。
 
 题库根目录的今日统计通过 `/api/study/today-summary` 从当前账号的会话、答题、收藏、错题、笔记、评论和赞同记录实时聚合；管理员运行概览继续从 catalog 读取全库统计，普通题库页面不会展示 64,078 等全局数字。
 

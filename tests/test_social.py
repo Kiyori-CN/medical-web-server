@@ -20,7 +20,7 @@ def _social_services(sample_source_tree: Path, tmp_path: Path):
     return auth, catalog, alice, bob, alice_store, bob_store
 
 
-def test_profile_privacy_friends_messages_and_comment_interactions(
+def test_public_profile_follow_messages_and_comment_interactions(
     sample_source_tree: Path, tmp_path: Path
 ):
     auth, catalog, alice, bob, alice_store, bob_store = _social_services(
@@ -42,9 +42,13 @@ def test_profile_privacy_friends_messages_and_comment_interactions(
     assert profile["privacy"]["school"] is True
     assert profile["privacy"]["birthday"] is False
 
-    friend = alice_store.add_friend("BobUser")
-    assert friend["user_id"] == bob["user_id"]
-    assert bob_store.list_friends()[0]["user_id"] == alice["user_id"]
+    followed = alice_store.follow_user(bob["user_id"])
+    assert followed["followers"] == 1
+    assert followed["is_following"] is True
+    public = bob_store.public_profile(alice["user_id"])
+    assert public["school"] == "示例医学院"
+    assert public["birthday"] == ""
+    assert public["is_self"] is False
 
     collection = catalog.list_collections()[0]
     occurrence = catalog.collection_outline(collection["collection_id"])[0]
@@ -56,7 +60,7 @@ def test_profile_privacy_friends_messages_and_comment_interactions(
     bob_store.create_comment(
         occurrence["occurrence_id"],
         author_name="BobUser",
-        body="@Alice 我也这样认为。",
+        body="我也这样认为。",
         parent_comment_id=comment["comment_id"],
     )
     decorated = alice_store.list_comments(occurrence["occurrence_id"])["items"]
@@ -69,8 +73,7 @@ def test_profile_privacy_friends_messages_and_comment_interactions(
     assert message["receiver_id"] == alice["user_id"]
     inbox = alice_store.list_messages()
     assert inbox["messages"][0]["body"] == "一起复习这道题。"
-    assert {item["kind"] for item in inbox["notifications"]} >= {"agree", "reply", "mention"}
+    assert {item["kind"] for item in inbox["notifications"]} >= {"agree", "reply"}
 
-    assert alice_store.remove_friend(bob["user_id"]) is True
-    assert alice_store.list_friends() == []
-
+    unfollowed = alice_store.unfollow_user(bob["user_id"])
+    assert unfollowed["followers"] == 0

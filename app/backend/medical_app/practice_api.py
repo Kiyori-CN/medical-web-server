@@ -264,23 +264,22 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
     def my_likes():
         return jsonify(store().my_likes(limit=request.args.get("limit", 100), offset=request.args.get("offset", 0)))
 
-    @blueprint.get("/friends")
+    @blueprint.get("/profiles/<user_id>")
     @login_required
-    def friends():
-        return jsonify({"items": store().list_friends()})
+    def public_profile(user_id: str):
+        return jsonify(store().public_profile(user_id))
 
-    @blueprint.post("/friends")
+    @blueprint.post("/profiles/<user_id>/follow")
     @login_required
     @csrf_required
-    def add_friend():
-        data = _json_object()
-        return jsonify(store().add_friend(data.get("username", ""))), 201
+    def follow_profile(user_id: str):
+        return jsonify(store().follow_user(user_id))
 
-    @blueprint.delete("/friends/<friend_id>")
+    @blueprint.delete("/profiles/<user_id>/follow")
     @login_required
     @csrf_required
-    def remove_friend(friend_id: str):
-        return jsonify({"removed": store().remove_friend(friend_id)})
+    def unfollow_profile(user_id: str):
+        return jsonify(store().unfollow_user(user_id))
 
     @blueprint.get("/messages")
     @login_required

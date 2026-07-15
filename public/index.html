@@ -7,7 +7,7 @@
   <meta name="description" content="医考知库：按原始题库目录精确检索、刷题与复习。">
   <title>医考知库</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='17' fill='%235a5bd7'/%3E%3Cpath d='M18 19h20c5 0 8 3 8 8v19H26c-5 0-8-3-8-8V19zm8 8v5h12v-5H26zm0 10v4h8v-4h-8z' fill='white'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/style.css?rev=2ed50e3">
+  <link rel="stylesheet" href="/style.css?rev=af04a75">
 </head>
 <body>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
@@ -70,16 +70,10 @@
         </nav>
         <div class="topbar-actions">
           <button id="admin-entry" class="button button-quiet admin-only" type="button" data-action="open-admin" hidden>系统管理</button>
-          <button class="profile-button" type="button" data-action="toggle-profile" aria-haspopup="menu" aria-expanded="false">
+          <button class="profile-button" type="button" data-action="open-messages" aria-label="打开消息">
             <span id="profile-avatar" class="profile-avatar"><span id="profile-avatar-glyph">U</span></span>
             <span class="profile-copy"><strong id="profile-name">用户</strong><small id="profile-role">普通用户</small></span>
-            <span aria-hidden="true">⌄</span>
           </button>
-          <div id="profile-menu" class="profile-menu" role="menu" hidden>
-            <button type="button" role="menuitem" data-action="open-profile">个人中心</button>
-            <button type="button" role="menuitem" data-action="open-messages">我的消息</button>
-            <button type="button" role="menuitem" data-action="logout">退出登录</button>
-          </div>
         </div>
       </div>
     </header>
@@ -91,6 +85,8 @@
       <section id="page-wrong" class="page" hidden></section>
       <section id="page-practice" class="page page-practice" hidden></section>
       <section id="page-profile" class="page" hidden></section>
+      <section id="page-profile-detail" class="page" hidden></section>
+      <section id="page-settings" class="page" hidden></section>
       <section id="page-messages" class="page" hidden></section>
       <section id="page-my-comments" class="page" hidden></section>
       <section id="page-notes" class="page" hidden></section>
@@ -110,6 +106,6 @@
   </div>
 
   <div id="modal-root"></div>
-  <script src="/app.js?rev=2ed50e3" defer></script>
+  <script src="/app.js?rev=af04a75" defer></script>
 </body>
 </html>

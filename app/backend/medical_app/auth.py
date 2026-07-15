@@ -52,6 +52,13 @@ def _normalized_username(value: str) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
 
 
+def _ip_location(remote_address: str) -> str:
+    value = str(remote_address or "").strip()
+    if not value or value in {"127.0.0.1", "::1", "localhost"}:
+        return "本地"
+    return "未知"
+
+
 def validate_username(value: str) -> str:
     username = unicodedata.normalize("NFKC", str(value or "")).strip()
     if not _USERNAME_RE.fullmatch(username):
@@ -143,6 +150,7 @@ class AuthStore:
                     school TEXT NOT NULL DEFAULT '',
                     major TEXT NOT NULL DEFAULT '',
                     privacy_json TEXT NOT NULL DEFAULT '{}',
+                    ip_location TEXT NOT NULL DEFAULT '本地',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_login_at TEXT
@@ -185,6 +193,7 @@ class AuthStore:
                 ("school", "TEXT NOT NULL DEFAULT ''"),
                 ("major", "TEXT NOT NULL DEFAULT ''"),
                 ("privacy_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("ip_location", "TEXT NOT NULL DEFAULT '本地'"),
             ):
                 if name not in user_columns:
                     connection.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
@@ -279,7 +288,9 @@ class AuthStore:
             "last_login_at": None,
         }
 
-    def authenticate(self, username: str, password: str) -> dict[str, Any]:
+    def authenticate(
+        self, username: str, password: str, *, remote_address: str = ""
+    ) -> dict[str, Any]:
         normalized = _normalized_username(username)
         with self.connect() as connection:
             row = connection.execute(
@@ -290,13 +301,15 @@ class AuthStore:
             if row["status"] != "active":
                 raise AuthenticationError("账号已被停用，请联系管理员")
             now = _utc_now()
+            ip_location = _ip_location(remote_address)
             connection.execute(
-                "UPDATE users SET last_login_at = ?, updated_at = ? WHERE user_id = ?",
-                (now, now, row["user_id"]),
+                "UPDATE users SET last_login_at = ?, ip_location = ?, updated_at = ? WHERE user_id = ?",
+                (now, ip_location, now, row["user_id"]),
             )
             connection.commit()
             payload = self._public_user(row)
             payload["last_login_at"] = now
+            payload["ip_location"] = ip_location
             return payload
 
     def change_password(
@@ -573,6 +586,7 @@ class AuthStore:
             "gender": row["gender"] if "gender" in row.keys() else "",
             "school": row["school"] if "school" in row.keys() else "",
             "major": row["major"] if "major" in row.keys() else "",
+            "ip_location": row["ip_location"] if "ip_location" in row.keys() else "本地",
         }
         try:
             payload["privacy"] = json.loads(row["privacy_json"] or "{}") if "privacy_json" in row.keys() else {}
@@ -697,7 +711,11 @@ def create_auth_blueprint(
     @blueprint.post("/login")
     def login():
         data = _json_object()
-        user = store.authenticate(data.get("username", ""), data.get("password", ""))
+        user = store.authenticate(
+            data.get("username", ""),
+            data.get("password", ""),
+            remote_address=request.remote_addr or "",
+        )
         return authenticated_response(user)
 
     @blueprint.get("/me")

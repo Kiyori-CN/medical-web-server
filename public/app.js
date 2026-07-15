@@ -36,6 +36,8 @@ const state = {
   adminTab: "overview",
   adminData: null,
   profileAvatarDraft: null,
+  profileEditing: false,
+  publicProfile: null,
   comments: {},
   notes: {},
   myComments: null,
@@ -200,7 +202,7 @@ async function route() {
     return;
   }
   document.body.classList.remove("in-session", "outline-open");
-  const allowed = ["library", "search", "favorites", "wrong", "profile", "messages", "my-comments", "notes", "my-likes", "ai", "forum", "admin"];
+  const allowed = ["library", "search", "favorites", "wrong", "profile", "profile-detail", "settings", "messages", "my-comments", "notes", "my-likes", "ai", "forum", "admin"];
   if (!allowed.includes(target)) {
     await navigateHash("#library", { replace: true });
     return;
@@ -212,7 +214,7 @@ async function route() {
   }
   stopTimer();
   showPage(page);
-  setActiveNav(page);
+  setActiveNav(["profile-detail", "settings", "messages", "my-comments", "notes", "my-likes", "favorites", "wrong"].includes(page) ? "profile" : page);
   if (page === "library" || page === "favorites" || page === "wrong") {
     state.sessionReturnTarget = null;
     state.libraryPath[page] = descriptor.path;
@@ -233,7 +235,11 @@ async function route() {
     }
     renderSearchPage();
   } else if (page === "profile") {
-    renderProfilePage();
+    await renderMyHomePage();
+  } else if (page === "profile-detail") {
+    await renderPublicProfilePage(descriptor.userId || state.user.user_id);
+  } else if (page === "settings") {
+    renderSettingsPage();
   } else if (page === "messages") {
     await renderMessagesPage();
   } else if (page === "my-comments") {
@@ -284,6 +290,7 @@ function parseRouteHash() {
     target,
     path: params.get("path") || "",
     collectionId: params.get("collection") || "",
+    userId: params.get("user") || "",
   };
 }
 
@@ -342,11 +349,8 @@ async function renderLibrary(kind) {
 function renderLibraryShell(kind) {
   const container = $(`#page-${kind}`);
   const meta = libraryMeta(kind);
-  container.innerHTML = `
-    <div class="page-header page-header-compact">
-      <div class="page-title"><p class="eyebrow">${meta.eyebrow}</p></div>
-    </div>
-    <div id="${kind}-content">${loadingMarkup("正在读取题库目录")}</div>`;
+  const heading = kind === "library" ? "" : `<div class="page-header page-header-compact"><div class="page-title"><p class="eyebrow">${meta.eyebrow}</p></div></div>`;
+  container.innerHTML = `${heading}<div id="${kind}-content">${loadingMarkup("正在读取题库目录")}</div>`;
 }
 
 function libraryMeta(kind) {
@@ -570,9 +574,6 @@ function renderSearchPage() {
   const semanticReady = vector.status === "ready" && vector.semantic_enabled && state.searchFields.stem;
   const container = $("#page-search");
   container.innerHTML = `
-    <div class="page-header page-header-compact">
-      <div class="page-title"><p class="eyebrow">搜题</p></div>
-    </div>
     <div class="search-hero">
       <form id="search-form">
         <div class="search-box"><input id="search-input" name="query" type="search" maxlength="200" value="${escapeAttr(state.lastSearchQuery)}" placeholder="输入关键词或原题号" required><button class="button button-primary" type="submit">搜题</button></div>
@@ -1151,9 +1152,9 @@ function renderQuestionComments(occurrenceId) {
       : items.length
         ? `<div class="comment-list">${items.map((comment) => `
             <article class="comment-item">
-              <div class="comment-avatar" aria-hidden="true">${avatarVisual(comment, comment.author_name)}</div>
+              <button class="comment-avatar comment-avatar-button" type="button" data-action="open-profile" data-user-id="${escapeAttr(comment.author_id || "")}" aria-label="查看${escapeAttr(comment.author_name || "用户")}的个人资料">${avatarVisual(comment, comment.author_name)}</button>
               <div class="comment-main ${comment.parent_comment_id ? "comment-reply" : ""}">
-                <div class="comment-meta"><strong>${escapeHtml(comment.author_name || "用户")}</strong><time datetime="${escapeAttr(comment.created_at || "")}">${escapeHtml(formatDate(comment.created_at))}${comment.edited ? " · 已编辑" : ""}</time><span class="comment-actions">${comment.can_edit ? `<button class="text-button" type="button" data-action="edit-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">编辑</button>` : ""}${comment.can_delete ? `<button class="text-button comment-delete" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">删除</button>` : ""}</span></div>
+                <div class="comment-meta"><button class="comment-author" type="button" data-action="open-profile" data-user-id="${escapeAttr(comment.author_id || "")}">${escapeHtml(comment.author_name || "用户")}</button><time datetime="${escapeAttr(comment.created_at || "")}">${escapeHtml(formatDate(comment.created_at))}${comment.edited ? " · 已编辑" : ""}</time><span class="comment-actions">${comment.can_edit ? `<button class="text-button" type="button" data-action="edit-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">编辑</button>` : ""}${comment.can_delete ? `<button class="text-button comment-delete" type="button" data-action="delete-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">删除</button>` : ""}</span></div>
                 <p>${escapeHtml(comment.body)}</p>
                 <div class="comment-toolbar"><button class="comment-reaction ${comment.my_reaction === "agree" ? "active" : ""}" type="button" data-action="react-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-reaction="agree" data-occurrence="${occurrenceId}">赞同 <span>${comment.agree_count || 0}</span></button><button class="comment-reaction ${comment.my_reaction === "disagree" ? "active" : ""}" type="button" data-action="react-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-reaction="disagree" data-occurrence="${occurrenceId}">反对 <span>${comment.disagree_count || 0}</span></button><button class="comment-reaction" type="button" data-action="reply-comment" data-comment-id="${escapeAttr(comment.comment_id)}" data-occurrence="${occurrenceId}">回复 <span>${comment.reply_count || 0}</span></button></div>
               </div>
@@ -1164,7 +1165,7 @@ function renderQuestionComments(occurrenceId) {
     ${list}
     <form class="comment-form" data-form="question-comment" data-occurrence="${occurrenceId}">
       <textarea name="body" maxlength="2000" rows="3" required placeholder="分享解题思路，或提出与本题相关的疑问"></textarea>
-      <div class="comment-form-actions"><small>最多 2000 字</small><div><button class="button button-secondary button-small" type="button" data-action="mention-friend">@ 好友</button><button class="button button-primary button-small" type="submit">发表评论</button></div></div>
+      <div class="comment-form-actions"><small>最多 2000 字</small><button class="button button-primary button-small" type="submit">发表评论</button></div>
     </form>
   </section>`;
 }
@@ -1278,44 +1279,6 @@ async function replyToComment(commentId, occurrenceId) {
   } catch (error) { showToast(error.message, "error"); }
 }
 
-async function addFriend(form) {
-  const username = String(new FormData(form).get("username") || "").trim();
-  if (!username) return;
-  const button = $('button[type="submit"]', form);
-  setButtonBusy(button, true, "添加中");
-  try { await api("/friends", { method: "POST", body: { username } }); await renderMessagesPage(); showToast("好友已添加"); }
-  catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
-}
-
-async function removeFriend(friendId) {
-  const confirmed = await confirmModal("删除好友", "确认删除这位好友？", "确认删除");
-  if (!confirmed) return;
-  try { await api(`/friends/${encodeURIComponent(friendId)}`, { method: "DELETE", body: {} }); await renderMessagesPage(); showToast("好友已删除"); }
-  catch (error) { showToast(error.message, "error"); }
-}
-
-async function messageFriend(friendId, name) {
-  const body = await textEditorModal(`给 ${name || "好友"} 发消息`, "", 2000, "发送");
-  if (!body) return;
-  try { await api("/messages", { method: "POST", body: { receiver_id: friendId, body } }); await renderMessagesPage(); showToast("消息已发送"); }
-  catch (error) { showToast(error.message, "error"); }
-}
-
-async function mentionFriend(form) {
-  if (!form) return;
-  try {
-    const payload = await api("/friends");
-    const friends = payload.items || [];
-    if (!friends.length) { showToast("请先在个人中心添加好友"); return; }
-    const friend = await friendPickerModal(friends);
-    if (!friend) return;
-    const textarea = $('textarea[name="body"]', form);
-    const prefix = textarea.value && !textarea.value.endsWith(" ") ? " " : "";
-    textarea.value += `${prefix}@${friend.username} `;
-    textarea.focus();
-  } catch (error) { showToast(error.message, "error"); }
-}
-
 async function submitCurrentAnswer({ autoAdvance = false } = {}) {
   const session = state.session;
   const index = state.sessionIndex;
@@ -1419,60 +1382,94 @@ const PROFILE_AVATARS = [
   { id: "preset-06", label: "天蓝临床" },
 ];
 
-function renderProfilePage() {
+async function renderMyHomePage() {
   const user = state.user || {};
-  const selectedAvatar = (state.profileAvatarDraft ?? user.avatar) || "preset-01";
-  const preview = selectedAvatar === user.avatar
-    ? user
-    : { avatar: selectedAvatar, avatar_url: selectedAvatar.startsWith("preset-") ? `/avatars/${selectedAvatar}.svg` : "" };
-  $("#page-profile").innerHTML = `
-    <div class="page-header account-page-header">
-      <div class="page-title"><p class="eyebrow">个人中心</p><h1>${escapeHtml(user.username || "个人中心")}</h1><p class="section-copy">资料、学习内容与账号安全。</p></div>
-      <div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div>
-    </div>
-    <nav class="profile-shortcuts" aria-label="我的学习内容">
-      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="wrong"><span class="shortcut-icon shortcut-wrong" aria-hidden="true">!</span><span><strong>我的错题</strong><small>回到原文件继续练习</small></span><b aria-hidden="true">›</b></button>
-      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="favorites"><span class="shortcut-icon shortcut-favorites" aria-hidden="true">☆</span><span><strong>我的收藏</strong><small>沿原题库路径查看</small></span><b aria-hidden="true">›</b></button>
-      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="notes"><span class="shortcut-icon shortcut-notes" aria-hidden="true">□</span><span><strong>我的笔记</strong><small>按最近更新集中复习</small></span><b aria-hidden="true">›</b></button>
-      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="my-comments"><span class="shortcut-icon shortcut-comments" aria-hidden="true">◌</span><span><strong>我的评论</strong><small>查看和管理已发表内容</small></span><b aria-hidden="true">›</b></button>
-      <button class="card profile-shortcut" type="button" data-action="open-personal-page" data-page="my-likes"><span class="shortcut-icon shortcut-likes" aria-hidden="true">♡</span><span><strong>我的点赞</strong><small>查看赞同过的讨论</small></span><b aria-hidden="true">›</b></button>
-      <button class="card profile-shortcut" type="button" data-action="open-friends"><span class="shortcut-icon shortcut-friends" aria-hidden="true">◎</span><span><strong>我的好友</strong><small>好友、私信与评论提及</small></span><b aria-hidden="true">›</b></button>
-    </nav>
-    <div class="profile-layout">
-      <section class="card profile-card">
-        <div class="profile-card-head"><div><h2>个人资料</h2><p>头像和用户名会显示在评论区。</p></div><span class="badge badge-neutral">${user.role === "admin" ? "管理员" : "普通用户"}</span></div>
-        <form id="profile-form" class="profile-form">
-          <div class="profile-avatar-editor">
-            <span class="profile-avatar profile-avatar-large">${avatarVisual(preview, user.username)}</span>
-            <div class="avatar-editor-main"><div class="avatar-editor-copy"><strong>个人头像</strong><small>选择统一风格头像，或上传并裁剪自己的图片</small></div><div class="avatar-picker" role="radiogroup" aria-label="预设头像">
-              ${PROFILE_AVATARS.map((avatar) => `<button class="avatar-choice ${avatar.id === selectedAvatar ? "active" : ""}" type="button" role="radio" aria-label="${escapeAttr(avatar.label)}" aria-checked="${avatar.id === selectedAvatar}" data-action="select-avatar" data-avatar="${avatar.id}"><img src="/avatars/${avatar.id}.svg" alt=""></button>`).join("")}
-              ${user.avatar === "custom" ? `<button class="avatar-choice ${selectedAvatar === "custom" ? "active" : ""}" type="button" role="radio" aria-label="当前自定义头像" aria-checked="${selectedAvatar === "custom"}" data-action="select-avatar" data-avatar="custom">${avatarVisual(user, user.username)}</button>` : ""}
-              <button class="avatar-upload-button" type="button" data-action="choose-avatar-file"><span aria-hidden="true">＋</span>上传图片</button>
-              <input id="avatar-file-input" type="file" accept="image/jpeg,image/png,image/webp" hidden>
-            </div></div>
-          </div>
-          <label class="field"><span>用户名</span><input name="username" minlength="3" maxlength="32" value="${escapeAttr(user.username || "")}" required></label>
-          <div class="profile-fields-grid">
-            <label class="field"><span>生日</span><input name="birthday" type="date" value="${escapeAttr(user.birthday || "")}"></label>
-            <label class="field"><span>性别</span><select name="gender"><option value="">未设置</option><option value="男" ${user.gender === "男" ? "selected" : ""}>男</option><option value="女" ${user.gender === "女" ? "selected" : ""}>女</option><option value="保密" ${user.gender === "保密" ? "selected" : ""}>保密</option></select></label>
-            <label class="field"><span>学校</span><input name="school" maxlength="120" value="${escapeAttr(user.school || "")}" placeholder="填写学校"></label>
-            <label class="field"><span>专业</span><input name="major" maxlength="120" value="${escapeAttr(user.major || "")}" placeholder="填写专业"></label>
-          </div>
-          <fieldset class="privacy-settings"><legend>资料可见性</legend>${[['birthday','生日'],['gender','性别'],['school','学校'],['major','专业']].map(([key,label]) => `<label><input name="privacy_${key}" type="checkbox" ${user.privacy?.[key] ? "checked" : ""}><span>${label}对好友可见</span></label>`).join("")}</fieldset>
-          <div class="question-actions"><button class="button button-primary" type="submit">保存个人资料</button></div>
-        </form>
-      </section>
-      <section class="card profile-card">
-        <div class="profile-card-head"><div><h2>登录安全</h2><p>修改密码后，其他设备会立即退出登录。</p></div></div>
-        <form id="profile-password-form" class="stack-form">
-          <label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label>
-          <label class="field"><span>新密码</span><input name="new_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required placeholder="至少 10 位，包含三类字符"></label>
-          <label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label>
-          <p class="form-error" data-profile-password-error></p>
-          <div class="question-actions"><button class="button button-secondary" type="submit">修改密码</button></div>
-        </form>
-      </section>
+  const container = $("#page-profile");
+  container.innerHTML = loadingMarkup("正在读取个人空间");
+  try {
+    const profile = await api(`/profiles/${encodeURIComponent(user.user_id)}`);
+    state.publicProfile = profile;
+    const stats = profile.stats || {};
+    const summary = state.todaySummary || await api("/study/today-summary").catch(() => ({}));
+    state.todaySummary = summary;
+    container.innerHTML = `<div class="my-home">
+      <section class="my-home-hero" data-action="open-own-profile" role="button" tabindex="0"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div><h1>${escapeHtml(profile.username || "我的")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div><span class="my-home-chevron">›</span></section>
+      <nav class="my-home-stats card" aria-label="个人数据">${profileStatLink("dynamics", "动态", stats.dynamics || 0, "▤", "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "＋", "profile-detail")}${profileStatLink("followers", "粉丝", stats.followers || 0, "◎", "profile-detail")}</nav>
+      <section class="my-home-section"><h2>常用功能</h2><div class="my-home-actions">${homeAction("wrong", "错题", "!", summary.totals?.wrong || 0)}${homeAction("favorites", "收藏", "♡", summary.totals?.favorites || 0)}${homeAction("notes", "笔记", "▢", summary.totals?.notes || 0)}${homeAction("my-comments", "评论", "▱", summary.totals?.comments || 0)}${homeAction("my-likes", "点赞", "♧", summary.totals?.likes || 0)}</div></section>
+      <section class="my-home-section"><h2>其他功能</h2><div class="my-home-actions four">${homeUtility("帮助中心", "?", "help")}${homeUtility("联系客服", "◌", "contact")}${homeUtility("意见反馈", "✎", "feedback")}${homeUtility("设置", "⚙", "settings")}</div></section>
+      <button class="button button-danger logout-wide" type="button" data-action="logout">退出登录</button>
     </div>`;
+  } catch (error) {
+    container.innerHTML = emptyMarkup("个人空间读取失败", error.message, "!");
+  }
+}
+
+function profileStatLink(key, label, value, icon, page, userId = "") {
+  const targetId = userId || state.publicProfile?.user_id || state.user.user_id;
+  return `<a class="my-home-stat" href="#${page}?user=${encodeURIComponent(targetId)}&tab=${key}"><span class="my-home-stat-icon">${icon}</span><strong>${formatNumber(value)}</strong><small>${label}</small></a>`;
+}
+
+function homeAction(page, label, icon, count) {
+  return `<a class="my-home-action" href="#${page}"><span class="my-home-action-icon shortcut-${page === "my-comments" ? "comments" : page === "my-likes" ? "likes" : page}">${icon}</span><strong>${label}</strong><small>${formatNumber(count)}</small></a>`;
+}
+
+function homeUtility(label, icon, action) {
+  return `<button class="my-home-action" type="button" data-action="home-utility" data-utility="${action}"><span class="my-home-action-icon utility-icon">${icon}</span><strong>${label}</strong></button>`;
+}
+
+async function renderPublicProfilePage(userId) {
+  const container = $("#page-profile-detail");
+  container.innerHTML = loadingMarkup("正在读取个人资料");
+  try {
+    const profile = await api(`/profiles/${encodeURIComponent(userId)}`);
+    state.publicProfile = profile;
+    if (state.profileEditing && profile.is_self) return renderProfileEditorPage(profile);
+    const stats = profile.stats || {};
+    container.innerHTML = `<div class="public-profile"><button class="profile-back-button" type="button" data-action="back-to-my-home">‹ 我的</button><section class="public-profile-card card"><div class="public-profile-head"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div class="public-profile-identity"><h1>${escapeHtml(profile.username || "用户")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div>${profile.is_self ? `<button class="button button-secondary button-small" type="button" data-action="edit-profile">编辑</button>` : ""}</div><nav class="public-profile-stats">${profileStatLink("followers", "粉丝", stats.followers || 0, "◎", "profile-detail")}${profileStatLink("following", "关注", stats.following || 0, "＋", "profile-detail")}${profileStatLink("likes", "获赞", stats.likes || 0, "♧", "profile-detail")}</nav><div class="public-profile-actions">${profile.is_self ? "" : `<button class="button ${stats.is_following ? "button-secondary" : "button-primary"} button-small" type="button" data-action="toggle-follow" data-user-id="${escapeAttr(profile.user_id)}" data-following="${stats.is_following ? "true" : "false"}">${stats.is_following ? "已关注" : "关注"}</button><button class="button button-secondary button-small" type="button" data-action="message-profile" data-user-id="${escapeAttr(profile.user_id)}" data-name="${escapeAttr(profile.username)}">私信</button>`}</div></section><section class="public-profile-dynamics"><div class="section-heading"><div><h2>动态</h2><p>评论与学习讨论</p></div></div>${(profile.dynamics || []).length ? profile.dynamics.map(profileDynamicCard).join("") : emptyMarkup("暂无动态", "发表评论后会显示在这里。", "▤")}</section></div>`;
+  } catch (error) {
+    container.innerHTML = emptyMarkup("个人资料读取失败", error.message, "!");
+  }
+}
+
+function profileDynamicCard(item) {
+  const question = item.question || {};
+  return `<article class="card profile-dynamic-card"><div class="profile-dynamic-meta"><span>评论</span><time>${escapeHtml(formatDate(item.created_at))}</time></div><p>${escapeHtml(item.body || "")}</p>${question.stem ? `<small>${escapeHtml(question.stem)}</small>` : ""}<div class="profile-dynamic-actions"><span>赞同 ${item.agree_count || 0}</span><span>回复 ${item.reply_count || 0}</span></div></article>`;
+}
+
+function renderProfileEditorPage(user) {
+  const selectedAvatar = (state.profileAvatarDraft ?? user.avatar) || "preset-01";
+  const preview = selectedAvatar === user.avatar ? user : { avatar: selectedAvatar, avatar_url: selectedAvatar.startsWith("preset-") ? `/avatars/${selectedAvatar}.svg` : "" };
+  $("#page-profile-detail").innerHTML = `<div class="profile-editor-page"><button class="profile-back-button" type="button" data-action="cancel-profile-edit">‹ 个人资料</button><section class="card profile-card profile-editor-card"><div class="profile-card-head"><div><h1>编辑个人资料</h1><p>头像、昵称和公开资料。</p></div></div><form id="profile-form" class="profile-form"><div class="profile-avatar-editor"><span class="profile-avatar profile-avatar-large">${avatarVisual(preview, user.username)}</span><div class="avatar-editor-main"><div class="avatar-editor-copy"><strong>个人头像</strong><small>选择统一风格头像，或上传并裁剪自己的图片</small></div><div class="avatar-picker" role="radiogroup" aria-label="预设头像">${PROFILE_AVATARS.map((avatar) => `<button class="avatar-choice ${avatar.id === selectedAvatar ? "active" : ""}" type="button" role="radio" aria-label="${escapeAttr(avatar.label)}" aria-checked="${avatar.id === selectedAvatar}" data-action="select-avatar" data-avatar="${avatar.id}"><img src="/avatars/${avatar.id}.svg" alt=""></button>`).join("")}${user.avatar === "custom" ? `<button class="avatar-choice ${selectedAvatar === "custom" ? "active" : ""}" type="button" aria-label="当前自定义头像" data-action="select-avatar" data-avatar="custom">${avatarVisual(user, user.username)}</button>` : ""}<button class="avatar-upload-button" type="button" data-action="choose-avatar-file"><span aria-hidden="true">＋</span>上传图片</button><input id="avatar-file-input" type="file" accept="image/jpeg,image/png,image/webp" hidden></div></div></div><label class="field"><span>昵称</span><input name="username" minlength="3" maxlength="32" value="${escapeAttr(user.username || "")}" required></label><div class="profile-fields-grid"><label class="field"><span>生日</span><input name="birthday" type="date" value="${escapeAttr(user.birthday || "")}"></label><label class="field"><span>性别</span><select name="gender"><option value="">未设置</option><option value="男" ${user.gender === "男" ? "selected" : ""}>男</option><option value="女" ${user.gender === "女" ? "selected" : ""}>女</option><option value="保密" ${user.gender === "保密" ? "selected" : ""}>保密</option></select></label><label class="field"><span>学校</span><input name="school" maxlength="120" value="${escapeAttr(user.school || "")}"></label><label class="field"><span>专业</span><input name="major" maxlength="120" value="${escapeAttr(user.major || "")}"></label></div><fieldset class="privacy-settings"><legend>资料可见性</legend>${[["birthday","生日"],["gender","性别"],["school","学校"],["major","专业"]].map(([key,label]) => `<label><input name="privacy_${key}" type="checkbox" ${user.privacy?.[key] ? "checked" : ""}><span>${label}对其他人可见</span></label>`).join("")}</fieldset><div class="question-actions"><button class="button button-primary" type="submit">保存资料</button></div></form></section></div>`;
+}
+
+function renderSettingsPage() {
+  $("#page-settings").innerHTML = `<div class="settings-page"><button class="profile-back-button" type="button" data-action="back-to-my-home">‹ 我的</button><section class="card settings-card"><div class="section-heading"><div><h1>设置</h1><p>账号与安全、绑定和应用偏好。</p></div></div><div class="settings-list"><button type="button" class="settings-list-item" data-action="show-placeholder" data-title="第三方账号绑定"><span><strong>第三方账号绑定</strong><small>暂未开放第三方登录</small></span><b>›</b></button><button type="button" class="settings-list-item" data-action="show-placeholder" data-title="通知设置"><span><strong>通知设置</strong><small>管理消息提醒</small></span><b>›</b></button></div><form id="settings-password-form" class="stack-form settings-password-form"><h2>修改密码</h2><label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label><label class="field"><span>新密码</span><input name="new_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label><label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label><p class="form-error" data-profile-password-error></p><button class="button button-primary" type="submit">保存新密码</button></form></section></div>`;
+}
+
+async function toggleFollowProfile(button) {
+  const userId = button.dataset.userId;
+  const following = button.dataset.following === "true";
+  if (!userId) return;
+  try {
+    await api(`/profiles/${encodeURIComponent(userId)}/follow`, { method: following ? "DELETE" : "POST", body: {} });
+    await renderPublicProfilePage(userId);
+    showToast(following ? "已取消关注" : "已关注");
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function messageProfile(userId, name) {
+  const body = await textEditorModal(`给 ${name || "用户"} 发私信`, "", 2000, "发送");
+  if (!body) return;
+  try {
+    await api("/messages", { method: "POST", body: { receiver_id: userId, body } });
+    showToast("私信已发送");
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+function handleHomeUtility(utility) {
+  if (utility === "settings") return navigateHash("#settings");
+  const labels = { help: "帮助中心", contact: "联系客服", feedback: "意见反馈" };
+  return showToast(`${labels[utility] || "该功能"}即将开放`);
 }
 
 async function renderMessagesPage() {
@@ -1484,7 +1481,7 @@ async function renderMessagesPage() {
     </div>
     ${loadingMarkup("正在读取消息")}`;
   try {
-    const [payload, friends] = await Promise.all([api("/messages"), api("/friends")]);
+    const payload = await api("/messages");
     const notifications = payload.notifications || [];
     const direct = payload.messages || [];
     const groups = [
@@ -1496,23 +1493,15 @@ async function renderMessagesPage() {
     container.innerHTML = `
       <div class="page-header account-page-header"><div class="page-title"><p class="eyebrow">我的消息</p><h1>消息中心</h1><p class="section-copy">系统通知、私信和互动提醒。</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-account">‹ 返回</button></div></div>
       <div class="message-category-grid">${groups.map(([label, items]) => `<section class="card message-category"><div class="message-category-head"><h2>${label}</h2><span>${items.length}</span></div>${items.length ? `<div class="message-list">${items.slice(0, 20).map((item) => `<article><strong>${escapeHtml(item.sender_name || label)}</strong><p>${escapeHtml(item.body || (item.kind === "agree" ? "赞同了你的评论" : "你收到一条新消息"))}</p><time>${escapeHtml(formatDate(item.created_at))}</time></article>`).join("")}</div>` : `<p class="message-empty">暂无消息</p>`}</section>`).join("")}</div>
-      ${renderFriendsSection(friends.items || [])}`;
+      `;
   } catch (error) {
     container.innerHTML += emptyMarkup("消息读取失败", error.message, "!");
   }
 }
 
-function renderFriendsSection(items) {
-  return `<section class="card friends-card" id="friends-card">
-    <div class="section-heading"><div><h2>我的好友</h2><p>添加好友后，可以私信并在评论中 @ 对方。</p></div><span class="badge badge-neutral">${items.length} 人</span></div>
-    <form id="friend-add-form" class="friend-add-form"><label class="field"><span>添加好友</span><input name="username" maxlength="32" placeholder="输入完整用户名" required></label><button class="button button-primary" type="submit">添加</button></form>
-    ${items.length ? `<div class="friend-list">${items.map((friend) => `<article><span class="comment-avatar">${avatarVisual(friend, friend.username)}</span><strong>${escapeHtml(friend.username)}</strong><div><button class="button button-secondary button-small" type="button" data-action="message-friend" data-id="${escapeAttr(friend.user_id)}" data-name="${escapeAttr(friend.username)}">发私信</button><button class="button button-quiet button-small" type="button" data-action="remove-friend" data-id="${escapeAttr(friend.user_id)}">删除</button></div></article>`).join("")}</div>` : `<p class="message-empty">暂无好友，可通过完整用户名添加。</p>`}
-  </section>`;
-}
-
 function renderPlaceholderPage(page) {
   const meta = page === "ai" ? ["AI", "AI 助手", "对话与智能学习功能将在后续接入。", "✦"] : ["论坛", "学习论坛", "主题讨论功能将在后续开放。", "◌"];
-  $(`#page-${page}`).innerHTML = `<div class="page-header page-header-compact"><div class="page-title"><p class="eyebrow">${meta[0]}</p></div></div>${emptyMarkup(meta[1], meta[2], meta[3])}`;
+  $(`#page-${page}`).innerHTML = emptyMarkup(meta[1], meta[2], meta[3]);
 }
 
 async function renderMyCommentsPage({ force = false } = {}) {
@@ -1593,7 +1582,8 @@ async function saveProfile(form) {
     state.myComments = null;
     state.myLikes = null;
     syncUserChrome(state.user);
-    renderProfilePage();
+    state.profileEditing = false;
+    await renderPublicProfilePage(state.user.user_id);
     showToast("个人资料已保存");
   } catch (error) {
     showToast(error.message, "error");
@@ -1805,7 +1795,6 @@ function renderSiteSettings(settings) {
 
 async function handleClick(event) {
   if (Date.now() < state.suppressClickUntil) return;
-  if (!event.target.closest(".profile-button, .profile-menu")) closeProfileMenu();
   const target = event.target.closest("[data-action]");
   if (!target) return;
   const action = target.dataset.action;
@@ -1816,35 +1805,28 @@ async function handleClick(event) {
     return;
   }
   if (action === "auth-mode") return showAuth(target.dataset.mode);
-  if (action === "toggle-profile") {
-    const menu = $("#profile-menu");
-    menu.hidden = !menu.hidden;
-    target.setAttribute("aria-expanded", String(!menu.hidden));
-    return;
-  }
-  if (action === "open-profile") {
-    if (!location.hash.startsWith("#profile")) state.accountReturnHash = location.hash || "#library";
-    closeProfileMenu();
-    return navigateHash("#profile");
-  }
   if (action === "open-messages") {
     if (!location.hash.startsWith("#messages")) state.accountReturnHash = location.hash || "#library";
-    closeProfileMenu();
     return navigateHash("#messages");
   }
   if (action === "open-personal-page") {
     state.accountReturnHash = "#profile";
     return navigateHash(`#${target.dataset.page}`);
   }
-  if (action === "open-friends") {
-    state.accountReturnHash = "#profile";
-    return navigateHash("#messages");
-  }
+  if (action === "open-own-profile") { state.profileEditing = false; return navigateHash(`#profile-detail?user=${encodeURIComponent(state.user.user_id)}`); }
+  if (action === "back-to-my-home") { state.profileEditing = false; return navigateHash("#profile"); }
+  if (action === "edit-profile") { state.profileEditing = true; return renderPublicProfilePage(state.user.user_id); }
+  if (action === "cancel-profile-edit") { state.profileEditing = false; return renderPublicProfilePage(state.user.user_id); }
+  if (action === "toggle-follow") return toggleFollowProfile(target);
+  if (action === "message-profile") return messageProfile(target.dataset.userId, target.dataset.name);
+  if (action === "home-utility") return handleHomeUtility(target.dataset.utility);
+  if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
+  if (action === "open-profile") { state.profileEditing = false; return navigateHash(`#profile-detail?user=${encodeURIComponent(target.dataset.userId || state.user.user_id)}`); }
   if (action === "return-from-account") return navigateHash(state.accountReturnHash || "#library");
   if (action === "return-to-profile") return navigateHash("#profile");
   if (action === "select-avatar") {
     state.profileAvatarDraft = target.dataset.avatar || "";
-    renderProfilePage();
+    renderProfileEditorPage(state.user);
     return;
   }
   if (action === "choose-avatar-file") {
@@ -1854,8 +1836,6 @@ async function handleClick(event) {
   if (action === "logout") return logout();
   if (action === "open-admin") {
     if (!location.hash.startsWith("#admin")) state.adminReturnHash = location.hash || "#library";
-    $("#profile-menu").hidden = true;
-    $('[data-action="toggle-profile"]')?.setAttribute("aria-expanded", "false");
     return navigateHash("#admin");
   }
   if (action === "return-from-admin") return navigateHash(state.adminReturnHash || "#library");
@@ -1939,7 +1919,6 @@ async function handleClick(event) {
   if (action === "edit-comment") return editQuestionComment(target.dataset.commentId, Number(target.dataset.occurrence));
   if (action === "react-comment") return reactComment(target.dataset.commentId, target.dataset.reaction, Number(target.dataset.occurrence));
   if (action === "reply-comment") return replyToComment(target.dataset.commentId, Number(target.dataset.occurrence));
-  if (action === "mention-friend") return mentionFriend(target.closest("form"));
   if (action === "reload-note") return ensureQuestionNote(Number(target.dataset.occurrence), { force: true });
   if (action === "delete-note") return deleteQuestionNote(Number(target.dataset.occurrence), { fromList: target.dataset.fromList === "true" });
   if (action === "edit-personal-note") return editPersonalNote(Number(target.dataset.occurrence));
@@ -1959,15 +1938,6 @@ async function handleClick(event) {
   if (action === "update-user-role") return updateUserRole(target.dataset.id);
   if (action === "reset-user-password") return resetUserPassword(target.dataset.id, target.dataset.name);
   if (action === "test-provider") return testProvider(target.dataset.provider, target);
-  if (action === "remove-friend") return removeFriend(target.dataset.id);
-  if (action === "message-friend") return messageFriend(target.dataset.id, target.dataset.name);
-}
-
-function closeProfileMenu() {
-  const menu = $("#profile-menu");
-  if (!menu || menu.hidden) return;
-  menu.hidden = true;
-  $('[data-action="toggle-profile"]')?.setAttribute("aria-expanded", "false");
 }
 
 async function handleSubmit(event) {
@@ -1975,12 +1945,11 @@ async function handleSubmit(event) {
   if (event.target.id === "auth-form") return submitAuth(event.target);
   if (event.target.id === "search-form") return submitSearch(event.target);
   if (event.target.id === "profile-form") return saveProfile(event.target);
-  if (event.target.id === "profile-password-form") return saveProfilePassword(event.target);
+  if (event.target.id === "settings-password-form") return saveProfilePassword(event.target);
   if (event.target.id === "semantic-settings-form") return saveSemanticSettings(event.target);
   if (event.target.id === "site-settings-form") return saveSiteSettings(event.target);
   if (event.target.id === "create-user-form") return createUser(event.target);
   if (event.target.id === "admin-comment-search") return searchAdminComments(event.target);
-  if (event.target.id === "friend-add-form") return addFriend(event.target);
   if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);
   if (event.target.dataset.form === "question-note") return submitQuestionNote(event.target);
@@ -2033,28 +2002,8 @@ async function logout() {
   state.notes = {};
   state.myComments = null;
   state.myNotes = null;
-  $("#profile-menu").hidden = true;
   location.hash = "";
   showAuth("login");
-}
-
-async function changeOwnPassword() {
-  $("#profile-menu").hidden = true;
-  const values = await ownPasswordModal();
-  if (!values) return;
-  try {
-    await api("/auth/password", { method: "POST", body: values });
-    state.user = null;
-    state.session = null;
-    state.comments = {};
-    state.notes = {};
-    state.myComments = null;
-    state.myNotes = null;
-    showAuth("login");
-    showToast("密码已修改，请重新登录");
-  } catch (error) {
-    showToast(error.message, "error");
-  }
 }
 
 async function submitSearch(form) {
@@ -2730,7 +2679,8 @@ async function uploadCroppedAvatar(canvas) {
       state.myComments = null;
       syncUserChrome(state.user);
       closeAvatarCrop();
-      renderProfilePage();
+      state.profileEditing = false;
+      await renderPublicProfilePage(state.user.user_id);
       showToast("头像已更新");
     } catch (error) {
       showToast(error.message, "error");
@@ -2748,17 +2698,6 @@ function textEditorModal(title, value, maxLength, confirmLabel) {
     $('[data-modal="confirm"]', root).addEventListener("click", () => finish(String($("#editor-modal-input", root).value || "").trim()));
     $(".modal-backdrop", root).addEventListener("click", (event) => { if (event.target.classList.contains("modal-backdrop")) finish(null); });
     $("#editor-modal-input", root).focus();
-  });
-}
-
-function friendPickerModal(friends) {
-  return new Promise((resolve) => {
-    const root = $("#modal-root");
-    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal friend-picker-modal" role="dialog" aria-modal="true" aria-labelledby="friend-picker-title"><div class="modal-heading"><h2 id="friend-picker-title">提及好友</h2><button class="icon-button" type="button" data-modal="cancel" aria-label="取消">×</button></div><div class="friend-picker-list">${friends.map((friend) => `<button type="button" data-friend-id="${escapeAttr(friend.user_id)}"><span class="comment-avatar">${avatarVisual(friend, friend.username)}</span><strong>${escapeHtml(friend.username)}</strong></button>`).join("")}</div></section></div>`;
-    const finish = (value) => { root.innerHTML = ""; resolve(value); };
-    $('[data-modal="cancel"]', root).addEventListener("click", () => finish(null));
-    $$('[data-friend-id]', root).forEach((button) => button.addEventListener("click", () => finish(friends.find((friend) => friend.user_id === button.dataset.friendId) || null)));
-    $(".modal-backdrop", root).addEventListener("click", (event) => { if (event.target.classList.contains("modal-backdrop")) finish(null); });
   });
 }
 
@@ -2784,31 +2723,6 @@ function passwordModal(username) {
     $("#password-reset-form", root).addEventListener("submit", (event) => {
       event.preventDefault();
       finish(event.target.elements.password.value);
-    });
-    $(".modal-backdrop", root).addEventListener("click", (event) => {
-      if (event.target.classList.contains("modal-backdrop")) finish(null);
-    });
-    $("input", root).focus();
-  });
-}
-
-function ownPasswordModal() {
-  return new Promise((resolve) => {
-    const root = $("#modal-root");
-    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="own-password-modal-title"><h2 id="own-password-modal-title">修改密码</h2><p>验证当前密码后设置新密码。修改成功后需要重新登录。</p><form id="own-password-form" class="stack-form"><label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label><label class="field"><span>新密码</span><input name="new_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required placeholder="至少 10 位，包含三类字符"></label><label class="field"><span>确认新密码</span><input name="confirm_password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required></label><p class="form-error" data-password-error></p><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="submit">保存新密码</button></div></form></section></div>`;
-    const finish = (value) => { root.innerHTML = ""; resolve(value); };
-    $('[data-modal="cancel"]', root).addEventListener("click", () => finish(null));
-    $("#own-password-form", root).addEventListener("submit", (event) => {
-      event.preventDefault();
-      const form = event.target;
-      if (form.elements.new_password.value !== form.elements.confirm_password.value) {
-        $('[data-password-error]', form).textContent = "两次输入的新密码不一致";
-        return;
-      }
-      finish({
-        current_password: form.elements.current_password.value,
-        new_password: form.elements.new_password.value,
-      });
     });
     $(".modal-backdrop", root).addEventListener("click", (event) => {
       if (event.target.classList.contains("modal-backdrop")) finish(null);
