@@ -1,0 +1,79 @@
+from pathlib import Path
+
+import pytest
+
+from medical_app.auth import AuthStore
+from medical_app.forum import ForumForbidden, ForumNotFound, ForumStore
+
+
+def _forum_services(tmp_path: Path):
+    database = tmp_path / "state" / "app.sqlite3"
+    auth = AuthStore(database)
+    auth.initialize()
+    alice = auth.setup_admin("Alice", "StrongPass1!")
+    bob = auth.register("BobUser", "StrongPass2!")
+    alice_store = ForumStore(database, alice["user_id"])
+    alice_store.initialize()
+    bob_store = ForumStore(database, bob["user_id"])
+    return alice, bob, alice_store, bob_store
+
+
+def test_forum_topic_reply_search_and_permissions(tmp_path: Path):
+    alice, bob, alice_store, bob_store = _forum_services(tmp_path)
+    sections = alice_store.sections()
+    assert [item["section_id"] for item in sections] == ["study", "questions"]
+
+    topic = alice_store.create_topic(
+        section_id="questions",
+        title="细胞膜运输方式怎么区分",
+        body="易化扩散和主动转运的关键区别是什么？",
+        author_name="Alice",
+    )
+    assert {item["section_id"]: item["topic_count"] for item in alice_store.sections()} == {
+        "study": 0,
+        "questions": 1,
+    }
+    listing = bob_store.list_topics(section_id="questions", query="主动转运")
+    assert listing["total"] == 1
+    assert listing["items"][0]["topic_id"] == topic["topic_id"]
+    assert listing["items"][0]["can_manage"] is False
+
+    reply = bob_store.create_reply(
+        topic["topic_id"], body="关键是是否消耗能量以及转运方向。", author_name="BobUser"
+    )
+    detail = alice_store.get_topic(topic["topic_id"], viewer_is_admin=True)
+    assert detail["topic"]["reply_count"] == 1
+    assert detail["replies"][0]["reply_id"] == reply["reply_id"]
+    assert detail["replies"][0]["can_manage"] is True
+
+    with pytest.raises(ForumForbidden):
+        bob_store.delete_topic(topic["topic_id"])
+    assert alice_store.delete_reply(reply["reply_id"], viewer_is_admin=True) is True
+    assert alice_store.delete_topic(topic["topic_id"], viewer_is_admin=True) is True
+    assert {item["section_id"]: item["topic_count"] for item in alice_store.sections()} == {
+        "study": 0,
+        "questions": 0,
+    }
+    with pytest.raises(ForumNotFound):
+        bob_store.get_topic(topic["topic_id"])
+
+
+def test_forum_validates_lengths_and_parent_topic(tmp_path: Path):
+    _, _, alice_store, _ = _forum_services(tmp_path)
+    with pytest.raises(ValueError, match="标题长度"):
+        alice_store.create_topic(
+            section_id="study", title="短", body="正文足够长", author_name="Alice"
+        )
+    topic = alice_store.create_topic(
+        section_id="study",
+        title="制定每日复习计划",
+        body="如何把题库练习拆分为稳定的每日目标？",
+        author_name="Alice",
+    )
+    with pytest.raises(ForumNotFound, match="回复目标"):
+        alice_store.create_reply(
+            topic["topic_id"],
+            body="尝试按章节拆分。",
+            author_name="Alice",
+            parent_reply_id="missing",
+        )

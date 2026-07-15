@@ -18,6 +18,7 @@ from medical_app.auth import (
     install_auth,
 )
 from medical_app.catalog import Catalog, CatalogUnavailable, resolve_catalog_path
+from medical_app.forum_api import create_forum_blueprint
 from medical_app.practice import PracticeStore
 from medical_app.practice_api import create_practice_blueprint
 from medical_app.semantic import SemanticSearchService
@@ -71,6 +72,7 @@ def create_app() -> Flask:
     application.register_blueprint(create_vector_admin_blueprint(vector_operations))
     application.register_blueprint(create_user_admin_blueprint(auth_store))
     application.register_blueprint(create_catalog_blueprint(catalog_path, semantic_service))
+    application.register_blueprint(create_forum_blueprint(config.APP_DB))
     application.register_blueprint(
         create_ai_blueprint(
             config.APP_DB,

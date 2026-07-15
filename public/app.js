@@ -84,6 +84,12 @@ const state = {
     contextOccurrence: null,
     contextCollection: "",
   },
+  forum: {
+    sections: null,
+    topics: null,
+    topic: null,
+    composerOpen: false,
+  },
 };
 
 document.addEventListener("DOMContentLoaded", boot);
@@ -307,7 +313,7 @@ async function route() {
     await renderMyLikesPage();
   } else if (page === "ai" || page === "forum") {
     if (page === "ai") await renderAIPage();
-    else renderPlaceholderPage(page);
+    else await renderForumPage(descriptor);
   } else if (page === "admin") {
     await renderAdminPage();
   }
@@ -368,6 +374,8 @@ function parseRouteHash() {
     userId: params.get("user") || "",
     tab: params.get("tab") || "",
     query: params.get("query") || "",
+    topicId: params.get("topic") || "",
+    sectionId: params.get("section") || "",
     returnHash: normalizeStudyReturnHash(params.get("return") || ""),
   };
 }
@@ -2229,6 +2237,135 @@ async function sendAIMessage(form) {
   finally { state.ai.sending = false; renderAIContent(); }
 }
 
+function forumRouteHash({ topic = "", section = "", query = "" } = {}) {
+  const params = new URLSearchParams();
+  if (topic) params.set("topic", topic);
+  if (section) params.set("section", section);
+  if (query) params.set("query", query);
+  return `#forum${params.size ? `?${params}` : ""}`;
+}
+
+function forumSectionChips(sections, selected) {
+  return `<div class="forum-section-chips"><button class="forum-section-chip ${selected ? "" : "active"}" type="button" data-action="forum-section" data-section="">全部</button>${sections.map((item) => `<button class="forum-section-chip ${selected === item.section_id ? "active" : ""}" type="button" data-action="forum-section" data-section="${escapeAttr(item.section_id)}">${escapeHtml(item.name)}<small>${formatNumber(item.topic_count)}</small></button>`).join("")}</div>`;
+}
+
+function forumTopicCard(item) {
+  return `<button class="card forum-topic-card" type="button" data-action="forum-open-topic" data-topic="${escapeAttr(item.topic_id)}">
+    <div class="forum-topic-meta"><span>${escapeHtml(item.section_name)}</span><time datetime="${escapeAttr(item.last_activity)}">${escapeHtml(formatDate(item.last_activity))}</time></div>
+    <h2>${escapeHtml(item.title)}</h2>
+    <p>${escapeHtml(item.preview || "")}</p>
+    <div class="forum-topic-foot"><span>${escapeHtml(item.author_name)}</span><strong>${formatNumber(item.reply_count)} 回复</strong></div>
+  </button>`;
+}
+
+function forumComposerMarkup(sections) {
+  if (!state.forum.composerOpen) return "";
+  return `<form id="forum-topic-form" class="card forum-composer" data-form="forum-topic">
+    <div class="forum-composer-head"><div><strong>发布主题</strong><span>围绕学习与题目展开具体讨论</span></div><button class="text-button" type="button" data-action="forum-toggle-composer">取消</button></div>
+    <label><span>分区</span><select name="section_id" required>${sections.map((item) => `<option value="${escapeAttr(item.section_id)}">${escapeHtml(item.name)}</option>`).join("")}</select></label>
+    <label><span>标题</span><input name="title" type="text" minlength="4" maxlength="120" required placeholder="用一句话说明讨论主题"></label>
+    <label><span>正文</span><textarea name="body" rows="6" minlength="4" maxlength="20000" required placeholder="补充背景、你的思路或具体问题"></textarea></label>
+    <div class="forum-composer-actions"><span>内容仅保存在本地社区数据库</span><button class="button button-primary" type="submit">发布主题</button></div>
+  </form>`;
+}
+
+async function renderForumPage(descriptor = parseRouteHash(), { force = false } = {}) {
+  const container = $("#page-forum");
+  container.innerHTML = loadingMarkup("正在读取论坛");
+  try {
+    if (!state.forum.sections || force) {
+      const payload = await api("/forum/sections");
+      state.forum.sections = payload.sections || [];
+    }
+    if (descriptor.topicId) {
+      const payload = await api(`/forum/topics/${encodeURIComponent(descriptor.topicId)}`);
+      state.forum.topic = payload;
+      renderForumTopic(payload);
+      return;
+    }
+    const params = new URLSearchParams({ limit: "20", offset: "0", sort: "latest" });
+    if (descriptor.sectionId) params.set("section", descriptor.sectionId);
+    if (descriptor.query) params.set("query", descriptor.query);
+    state.forum.topics = await api(`/forum/topics?${params}`);
+    renderForumListing(descriptor);
+  } catch (error) {
+    container.innerHTML = emptyMarkup("论坛读取失败", error.message, "!");
+  }
+}
+
+function renderForumListing(descriptor = parseRouteHash()) {
+  const container = $("#page-forum");
+  const sections = state.forum.sections || [];
+  const payload = state.forum.topics || { items: [], total: 0 };
+  container.innerHTML = `<section class="page-header page-header-compact forum-page-header"><div class="page-title"><h1>学习论坛</h1><p class="section-copy">围绕题目、知识点和复习方法持续讨论。</p></div><button class="button button-primary" type="button" data-action="forum-toggle-composer">${state.forum.composerOpen ? "收起发布" : "发布主题"}</button></section>
+    ${forumComposerMarkup(sections)}
+    <div class="card forum-toolbar">${forumSectionChips(sections, descriptor.sectionId)}<form id="forum-search-form" data-form="forum-search"><input name="query" type="search" maxlength="80" value="${escapeAttr(descriptor.query)}" placeholder="搜索主题、正文或作者"><button class="button button-secondary button-small" type="submit">搜索</button></form></div>
+    <div class="forum-list">${payload.items?.length ? payload.items.map(forumTopicCard).join("") : emptyMarkup("暂无主题", descriptor.query ? "换一个关键词，或发布新的讨论。" : "成为第一个发起讨论的人。", "◌")}</div>
+    ${(payload.items || []).length < Number(payload.total || 0) ? `<div class="forum-load-more"><span>已显示 ${formatNumber(payload.items.length)} / ${formatNumber(payload.total)}</span><button class="button button-secondary button-small" type="button" data-action="forum-load-more">加载更多</button></div>` : ""}`;
+}
+
+function renderForumTopic(payload) {
+  const container = $("#page-forum");
+  const topic = payload.topic;
+  const replies = payload.replies || [];
+  container.innerHTML = `<div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back">‹ 返回论坛</button>${topic.can_manage ? `<button class="text-button danger" type="button" data-action="forum-delete-topic" data-topic="${escapeAttr(topic.topic_id)}">删除主题</button>` : ""}</div>
+    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span><time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><div class="forum-author">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主</small></span></div><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div></article>
+    <section class="forum-replies"><div class="forum-replies-head"><h2>全部回复</h2><span>${formatNumber(topic.reply_count || replies.length)}</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><div class="forum-author">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${index + 1} 楼 · ${escapeHtml(formatDate(reply.created_at))}</small></span></div>${reply.can_manage && reply.status === "visible" ? `<button class="text-button danger" type="button" data-action="forum-delete-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topic.topic_id)}">删除</button>` : ""}</div><p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p></article>`).join("") : `<div class="forum-reply-empty">还没有回复，来说说你的看法。</div>`}</section>
+    <form id="forum-reply-form" class="card forum-reply-form" data-form="forum-reply" data-topic="${escapeAttr(topic.topic_id)}"><label><span>参与讨论</span><textarea name="body" rows="4" minlength="2" maxlength="5000" required placeholder="写下你的观点、解题思路或补充"></textarea></label><div><small>回复对所有登录用户可见</small><button class="button button-primary" type="submit">发表回复</button></div></form>`;
+}
+
+async function submitForumTopic(form) {
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "发布中");
+  try {
+    const values = Object.fromEntries(new FormData(form));
+    const topic = await api("/forum/topics", { method: "POST", body: values });
+    state.forum.composerOpen = false;
+    state.forum.sections = null;
+    return navigateHash(forumRouteHash({ topic: topic.topic_id }));
+  } catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
+}
+
+async function submitForumReply(form) {
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "发表中");
+  try {
+    const body = String(new FormData(form).get("body") || "").trim();
+    await api(`/forum/topics/${encodeURIComponent(form.dataset.topic)}/replies`, { method: "POST", body: { body } });
+    await renderForumPage({ ...parseRouteHash(), topicId: form.dataset.topic });
+  } catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
+}
+
+async function loadMoreForumTopics(button) {
+  const descriptor = parseRouteHash();
+  const current = state.forum.topics || { items: [] };
+  setButtonBusy(button, true, "加载中");
+  try {
+    const params = new URLSearchParams({ limit: "20", offset: String(current.items.length), sort: "latest" });
+    if (descriptor.sectionId) params.set("section", descriptor.sectionId);
+    if (descriptor.query) params.set("query", descriptor.query);
+    const next = await api(`/forum/topics?${params}`);
+    state.forum.topics = { ...next, items: [...current.items, ...(next.items || [])] };
+    renderForumListing(descriptor);
+  } catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
+}
+
+async function deleteForumTopic(id) {
+  if (!window.confirm("删除这个论坛主题及其全部回复？")) return;
+  try {
+    await api(`/forum/topics/${encodeURIComponent(id)}`, { method: "DELETE", body: {} });
+    state.forum.sections = null;
+    await navigateHash("#forum");
+  }
+  catch (error) { showToast(error.message, "error"); }
+}
+
+async function deleteForumReply(id, topicId) {
+  if (!window.confirm("删除这条回复？")) return;
+  try { await api(`/forum/replies/${encodeURIComponent(id)}`, { method: "DELETE", body: {} }); await renderForumPage({ ...parseRouteHash(), topicId }); }
+  catch (error) { showToast(error.message, "error"); }
+}
+
 async function renderMyCommentsPage({ force = false } = {}) {
   const container = $("#page-my-comments");
   if (!state.myComments || force) container.innerHTML = `${personalPageHeader("评论", "正在读取评论")}${loadingMarkup("正在读取评论")}`;
@@ -2841,6 +2978,13 @@ async function handleClick(event) {
     state.ai.activeId = state.ai.activeId || state.ai.conversations?.[0]?.conversation_id || "";
     return navigateHash("#ai");
   }
+  if (action === "forum-toggle-composer") { state.forum.composerOpen = !state.forum.composerOpen; renderForumListing(parseRouteHash()); return; }
+  if (action === "forum-section") return navigateHash(forumRouteHash({ section: target.dataset.section || "" }));
+  if (action === "forum-open-topic") return navigateHash(forumRouteHash({ topic: target.dataset.topic || "" }));
+  if (action === "forum-back") return navigateHash("#forum");
+  if (action === "forum-load-more") return loadMoreForumTopics(target);
+  if (action === "forum-delete-topic") return deleteForumTopic(target.dataset.topic);
+  if (action === "forum-delete-reply") return deleteForumReply(target.dataset.reply, target.dataset.topic);
 }
 
 async function handleSubmit(event) {
@@ -2858,6 +3002,12 @@ async function handleSubmit(event) {
   if (event.target.dataset.form === "question-comment") return submitQuestionComment(event.target);
   if (event.target.dataset.form === "question-note") return submitQuestionNote(event.target);
   if (event.target.dataset.form === "ai-chat") return sendAIMessage(event.target);
+  if (event.target.dataset.form === "forum-topic") return submitForumTopic(event.target);
+  if (event.target.dataset.form === "forum-reply") return submitForumReply(event.target);
+  if (event.target.dataset.form === "forum-search") {
+    const query = String(new FormData(event.target).get("query") || "").trim();
+    return navigateHash(forumRouteHash({ section: parseRouteHash().sectionId, query }));
+  }
 }
 
 document.addEventListener("keydown", (event) => {
