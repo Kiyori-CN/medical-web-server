@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS ai_conversations (
     conversation_id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT '新对话',
+    context_occurrence_id INTEGER,
+    context_collection_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -97,6 +99,17 @@ class AIStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript(AI_SCHEMA_SQL)
+            conversation_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(ai_conversations)")
+            }
+            if "context_occurrence_id" not in conversation_columns:
+                connection.execute(
+                    "ALTER TABLE ai_conversations ADD COLUMN context_occurrence_id INTEGER"
+                )
+            if "context_collection_id" not in conversation_columns:
+                connection.execute(
+                    "ALTER TABLE ai_conversations ADD COLUMN context_collection_id TEXT NOT NULL DEFAULT ''"
+                )
             message_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(ai_messages)")
             }
@@ -117,7 +130,8 @@ class AIStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT c.conversation_id, c.title, c.created_at, c.updated_at,
+                SELECT c.conversation_id, c.title, c.context_occurrence_id,
+                       c.context_collection_id, c.created_at, c.updated_at,
                        (SELECT content FROM ai_messages m
                         WHERE m.conversation_id = c.conversation_id
                         ORDER BY m.created_at DESC, m.message_id DESC LIMIT 1) AS preview,
@@ -132,19 +146,37 @@ class AIStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def create_conversation(self, title: object = "") -> dict[str, Any]:
+    def create_conversation(
+        self, title: object = "", *, context: object = None
+    ) -> dict[str, Any]:
         clean_title = _clean_text(title, limit=80) or "新对话"
+        context_occurrence_id, context_collection_id = self._conversation_context(context)
         now = _utc_now()
         conversation_id = secrets.token_urlsafe(18)
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO ai_conversations(conversation_id, profile_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, self.profile_id, clean_title, now, now),
+                """
+                INSERT INTO ai_conversations(
+                    conversation_id, profile_id, title, context_occurrence_id,
+                    context_collection_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    self.profile_id,
+                    clean_title,
+                    context_occurrence_id,
+                    context_collection_id,
+                    now,
+                    now,
+                ),
             )
             connection.commit()
         return {
             "conversation_id": conversation_id,
             "title": clean_title,
+            "context_occurrence_id": context_occurrence_id,
+            "context_collection_id": context_collection_id,
             "created_at": now,
             "updated_at": now,
             "preview": "",
@@ -403,7 +435,11 @@ class AIStore:
         if not conversation_id:
             raise AINotFound("会话不存在")
         row = connection.execute(
-            "SELECT conversation_id, profile_id, title, created_at, updated_at FROM ai_conversations WHERE conversation_id = ?",
+            """
+            SELECT conversation_id, profile_id, title, context_occurrence_id,
+                   context_collection_id, created_at, updated_at
+            FROM ai_conversations WHERE conversation_id = ?
+            """,
             (conversation_id,),
         ).fetchone()
         if row is None:
@@ -411,6 +447,26 @@ class AIStore:
         if row["profile_id"] != self.profile_id:
             raise AIAccessDenied("无权访问该会话")
         return row
+
+    @staticmethod
+    def _conversation_context(context: object) -> tuple[int | None, str]:
+        if context in (None, ""):
+            return None, ""
+        if not isinstance(context, dict):
+            raise ValueError("context must be an object")
+        occurrence = context.get("occurrence_id")
+        occurrence_id = None
+        if occurrence not in (None, ""):
+            try:
+                occurrence_id = int(occurrence)
+            except (TypeError, ValueError) as error:
+                raise ValueError("occurrence_id is invalid") from error
+            if occurrence_id <= 0:
+                raise ValueError("occurrence_id is invalid")
+        collection_id = display_text(context.get("collection_id"))
+        if len(collection_id) > 200:
+            raise ValueError("collection_id is invalid")
+        return occurrence_id, collection_id
 
     def _build_context(self, prompt: str, context: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         scope = display_text(context.get("scope") or "catalog").lower()

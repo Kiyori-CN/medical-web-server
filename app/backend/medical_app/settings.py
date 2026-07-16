@@ -10,7 +10,11 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 
 from .normalize import display_text
-from .providers import validate_provider_url
+from .providers import (
+    normalize_provider_base_url,
+    provider_api_url,
+    provider_models_url,
+)
 
 
 SETTINGS_SCHEMA_REVISION = 1
@@ -146,9 +150,13 @@ class SettingsStore:
         if row is None:
             raise SettingsUnavailable(f"Provider is not configured: {provider}")
         encrypted = row["api_key_encrypted"]
+        base_url = normalize_provider_base_url(row["api_url"])
+        api_url = provider_api_url(base_url, provider)
         result = {
             "provider": provider,
-            "api_url": row["api_url"],
+            "base_url": base_url,
+            "api_url": api_url,
+            "models_url": provider_models_url(base_url),
             "model": row["model"],
             "dimensions": row["dimensions"],
             "api_key_configured": bool(encrypted),
@@ -210,9 +218,12 @@ class SettingsStore:
         ).fetchone()
         if current is None:
             raise SettingsUnavailable(f"Provider is not initialized: {provider}")
-        api_url = display_text(payload.get("api_url", current["api_url"]))
+        configured_url = payload.get(
+            "base_url", payload.get("api_url", current["api_url"])
+        )
+        base_url = normalize_provider_base_url(display_text(configured_url))
+        api_url = provider_api_url(base_url, provider)
         model = display_text(payload.get("model", current["model"]))
-        validate_provider_url(api_url)
         if not model or len(model) > 200:
             raise ValueError("model must be between 1 and 200 characters")
         dimensions = current["dimensions"]

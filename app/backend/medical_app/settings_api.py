@@ -10,8 +10,10 @@ from .providers import (
     EmbeddingClient,
     ProviderError,
     list_provider_models,
+    normalize_provider_base_url,
+    provider_api_url,
+    provider_models_url,
     test_chat_provider,
-    validate_provider_url,
 )
 from .settings import SettingsStore, SettingsUnavailable
 
@@ -116,17 +118,26 @@ def _preview_provider_config(
     if provider not in {"embedding", "llm"}:
         raise ValueError("provider must be embedding or llm")
     config = store.provider_config(provider, include_secret=True)
-    api_url = str(payload.get("api_url") or config["api_url"]).strip()
+    configured_url = payload.get("base_url") or payload.get("api_url") or config["base_url"]
+    base_url = normalize_provider_base_url(str(configured_url).strip())
+    api_url = provider_api_url(base_url, provider)
     model = str(payload.get("model") or config["model"]).strip()
     api_key = payload.get("api_key")
     if api_key in (None, ""):
         api_key = config.get("api_key", "")
     if not isinstance(api_key, str) or len(api_key.strip()) < 8:
         raise ProviderError("API key is not configured")
-    validate_provider_url(api_url)
     if not model or len(model) > 200:
         raise ValueError("model must be between 1 and 200 characters")
-    config.update({"api_url": api_url, "model": model, "api_key": api_key.strip()})
+    config.update(
+        {
+            "base_url": base_url,
+            "api_url": api_url,
+            "models_url": provider_models_url(base_url),
+            "model": model,
+            "api_key": api_key.strip(),
+        }
+    )
     if provider == "embedding" and payload.get("dimensions") not in (None, ""):
         dimensions = int(payload["dimensions"])
         if dimensions not in {64, 128, 256, 512, 768, 1024}:

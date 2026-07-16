@@ -55,7 +55,11 @@ def create_ai_blueprint(
     @csrf_required
     def create_conversation():
         data = _json_object()
-        return jsonify(store().create_conversation(data.get("title", ""))), 201
+        return jsonify(
+            store().create_conversation(
+                data.get("title", ""), context=data.get("context")
+            )
+        ), 201
 
     @blueprint.patch("/conversations/<conversation_id>")
     @login_required

@@ -35,18 +35,31 @@ def validate_provider_url(value: str) -> None:
         )
 
 
-def provider_models_url(api_url: str) -> str:
-    validate_provider_url(api_url)
-    parsed = urlparse(api_url)
+def normalize_provider_base_url(value: str) -> str:
+    value = str(value or "").strip().rstrip("/")
+    validate_provider_url(value)
+    parsed = urlparse(value)
     parts = [part for part in parsed.path.split("/") if part]
-    if "v1" in parts:
-        parts = parts[: len(parts) - parts[::-1].index("v1")]
-    elif parts[-2:] == ["chat", "completions"]:
+    if parts[-2:] == ["chat", "completions"]:
         parts = parts[:-2]
-    elif parts and parts[-1] in {"embeddings", "completions", "responses"}:
+    elif parts and parts[-1] in {"embeddings", "models", "completions", "responses"}:
         parts = parts[:-1]
-    parts.append("models")
+    if not parts:
+        parts = ["v1"]
     return urlunparse(parsed._replace(path="/" + "/".join(parts)))
+
+
+def provider_api_url(base_url: str, provider: str) -> str:
+    provider_value = str(provider or "").strip().lower()
+    if provider_value not in {"embedding", "llm"}:
+        raise ValueError("provider must be embedding or llm")
+    base = normalize_provider_base_url(base_url)
+    suffix = "embeddings" if provider_value == "embedding" else "chat/completions"
+    return f"{base}/{suffix}"
+
+
+def provider_models_url(base_url: str) -> str:
+    return f"{normalize_provider_base_url(base_url)}/models"
 
 
 def list_provider_models(

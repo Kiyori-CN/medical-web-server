@@ -814,6 +814,88 @@ class PracticeStore:
             "archived_at": archived_at,
         }
 
+    def delete_archived_session(self, session_id: object) -> dict[str, Any]:
+        session_id_value = display_text(session_id)
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT archived_at FROM practice_sessions
+                WHERE session_id = ? AND profile_id = ?
+                """,
+                (session_id_value, self.profile_id),
+            ).fetchone()
+            if row is None:
+                raise PracticeNotFound("Practice session not found")
+            if not row["archived_at"]:
+                raise PracticeConflict("仅可永久删除已归档的练习记录")
+            answer_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM practice_session_questions
+                    WHERE session_id = ?
+                    """,
+                    (session_id_value,),
+                ).fetchone()[0]
+            )
+            cursor = connection.execute(
+                """
+                DELETE FROM practice_sessions
+                WHERE session_id = ? AND profile_id = ? AND archived_at IS NOT NULL
+                """,
+                (session_id_value, self.profile_id),
+            )
+            if cursor.rowcount != 1:
+                raise PracticeConflict("练习记录已变化，请刷新后重试")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {
+            "removed": True,
+            "session_id": session_id_value,
+            "sessions_deleted": 1,
+            "answers_deleted": answer_count,
+        }
+
+    def delete_all_archived_sessions(self, confirmation: object) -> dict[str, Any]:
+        if confirmation != "DELETE_ARCHIVED":
+            raise ValueError("清空已归档记录需要有效确认")
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            counts = connection.execute(
+                """
+                SELECT COUNT(DISTINCT s.session_id) AS sessions,
+                       COUNT(q.session_id) AS answers
+                FROM practice_sessions s
+                LEFT JOIN practice_session_questions q ON q.session_id = s.session_id
+                WHERE s.profile_id = ? AND s.archived_at IS NOT NULL
+                """,
+                (self.profile_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                DELETE FROM practice_sessions
+                WHERE profile_id = ? AND archived_at IS NOT NULL
+                """,
+                (self.profile_id,),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {
+            "removed": True,
+            "sessions_deleted": int(counts["sessions"] or 0),
+            "answers_deleted": int(counts["answers"] or 0),
+        }
+
     @staticmethod
     def _session_history_title(
         session: sqlite3.Row,

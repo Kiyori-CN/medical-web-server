@@ -4,6 +4,11 @@ import pytest
 import requests
 from flask import Flask, g
 
+from medical_app.providers import (
+    normalize_provider_base_url,
+    provider_api_url,
+    provider_models_url,
+)
 from medical_app.settings import SettingsStore
 from medical_app.settings_api import create_settings_blueprint
 
@@ -108,6 +113,34 @@ def test_provider_url_rejects_embedded_credentials(tmp_path):
         )
 
 
+def test_provider_base_url_normalizes_complete_endpoints_and_derives_urls(tmp_path):
+    assert normalize_provider_base_url("https://example.invalid") == "https://example.invalid/v1"
+    assert normalize_provider_base_url("https://example.invalid/v1/models") == "https://example.invalid/v1"
+    assert normalize_provider_base_url("https://example.invalid/openai/v1/chat/completions/") == "https://example.invalid/openai/v1"
+    assert provider_models_url("https://example.invalid/v1/embeddings") == "https://example.invalid/v1/models"
+    assert provider_api_url("https://example.invalid/v1/models", "embedding") == "https://example.invalid/v1/embeddings"
+    assert provider_api_url("https://example.invalid/v1/chat/completions", "llm") == "https://example.invalid/v1/chat/completions"
+
+    store = SettingsStore(
+        tmp_path / "state" / "settings.sqlite3",
+        tmp_path / "state" / "settings.key",
+    )
+    store.initialize()
+    updated = store.update(
+        {
+            "providers": {
+                "embedding": {"base_url": "https://example.invalid"},
+                "llm": {"api_url": "https://gateway.invalid/openai/v1/chat/completions"},
+            }
+        }
+    )
+    assert updated["embedding"]["base_url"] == "https://example.invalid/v1"
+    assert updated["embedding"]["api_url"] == "https://example.invalid/v1/embeddings"
+    assert updated["embedding"]["models_url"] == "https://example.invalid/v1/models"
+    assert updated["llm"]["base_url"] == "https://gateway.invalid/openai/v1"
+    assert updated["llm"]["api_url"] == "https://gateway.invalid/openai/v1/chat/completions"
+
+
 def test_model_discovery_accepts_unsaved_key_and_separates_provider_models(tmp_path, monkeypatch):
     store = SettingsStore(
         tmp_path / "state" / "settings.sqlite3",
@@ -122,7 +155,13 @@ def test_model_discovery_accepts_unsaved_key_and_separates_provider_models(tmp_p
         def json():
             return {"data": [{"id": "Qwen/Qwen3-Embedding-0.6B"}, {"id": "Qwen/Qwen2.5-7B-Instruct"}, {"id": "BAAI/bge-reranker-v2-m3"}]}
 
-    monkeypatch.setattr("medical_app.providers.requests.get", lambda *args, **kwargs: Response())
+    requested_urls = []
+
+    def fake_get(url, *args, **kwargs):
+        requested_urls.append(url)
+        return Response()
+
+    monkeypatch.setattr("medical_app.providers.requests.get", fake_get)
     app = _app(store)
     app.config["ROLE"] = "admin"
     client = app.test_client()
@@ -134,7 +173,7 @@ def test_model_discovery_accepts_unsaved_key_and_separates_provider_models(tmp_p
         headers=headers,
         json={
             "provider": "embedding",
-            "api_url": "https://example.invalid/v1/embeddings",
+            "base_url": "https://example.invalid",
             "api_key": "sk-unsaved-preview",
             "model": "Qwen/Qwen3-Embedding-0.6B",
             "dimensions": 1024,
@@ -144,6 +183,7 @@ def test_model_discovery_accepts_unsaved_key_and_separates_provider_models(tmp_p
         "Qwen/Qwen3-Embedding-0.6B"
     ]
     assert store.provider_config("embedding", include_secret=True)["api_key"] == ""
+    assert requested_urls[-1] == "https://example.invalid/v1/models"
 
     llm = client.post(
         "/api/admin/settings/models",
@@ -158,3 +198,4 @@ def test_model_discovery_accepts_unsaved_key_and_separates_provider_models(tmp_p
     assert [item["id"] for item in llm.get_json()["models"]] == [
         "Qwen/Qwen2.5-7B-Instruct"
     ]
+    assert requested_urls[-1] == "https://example.invalid/v1/models"

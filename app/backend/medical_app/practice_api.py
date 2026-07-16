@@ -287,6 +287,21 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
         data = _json_object()
         return jsonify(store().set_session_archived(session_id, data.get("archived")))
 
+    @blueprint.delete("/study/sessions/<session_id>")
+    @login_required
+    @csrf_required
+    def delete_archived_session(session_id: str):
+        return jsonify(store().delete_archived_session(session_id))
+
+    @blueprint.delete("/study/sessions")
+    @login_required
+    @csrf_required
+    def delete_all_archived_sessions():
+        if request.args.get("status", "") != "archived":
+            raise ValueError("仅支持清空已归档练习记录")
+        data = _json_object()
+        return jsonify(store().delete_all_archived_sessions(data.get("confirmation")))
+
     @blueprint.post("/study/comments/<comment_id>/reaction")
     @login_required
     @csrf_required

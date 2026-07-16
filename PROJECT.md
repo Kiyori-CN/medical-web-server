@@ -60,7 +60,7 @@
 - 收藏是可取消的账号状态，错题可以在原路径目录或错题会话中删除。
 - 个人学习数据导出只读取当前账号的每日学习目标、收藏、错题、私有笔记、规范题/文件题进度、练习会话和逐题作答记录；JSONL/CSV 均流式输出，禁止跨账号读取或写入 catalog。
 - 题号目录重置只删除当前账号、当前 collection 的 `collection_question_progress` 投影，不删除历史会话、收藏、错题或评论；同一规范题在其他文件中的状态不受影响；
-- 练习记录直接读取 `practice_sessions` 与 `practice_session_questions`，不创建重复历史表；`archived_at` 是可逆归档标记，不改变会话状态、答案或进度。列表严格按 `profile_id` 隔离，默认排除归档，支持全部/进行中/已完成/已归档与 `limit + offset` 分页。进行中的测试模式在归档前后都隐藏成绩，归档会话不能提交或交卷；恢复后可继续答题，已完成记录复用整卷复盘，个人历史不提供删除入口。
+- 练习记录直接读取 `practice_sessions` 与 `practice_session_questions`，不创建重复历史表；`archived_at` 是可逆归档标记，不改变会话状态、答案或进度。列表严格按 `profile_id` 隔离，默认排除归档，支持全部/进行中/已完成/已归档与 `limit + offset` 分页。进行中的测试模式在归档前后都隐藏成绩，归档会话不能提交或交卷；恢复后可继续答题，已完成记录复用整卷复盘。只有已归档会话可由所属账号永久删除，单删与批量清空均要求 CSRF，批量还要求固定确认字段；外键级联只删除会话和逐题明细，不删除收藏、错题、笔记或进度投影。
 - 评论绑定具体 `occurrence_id` 并保存 `question_id` 和作者名快照；评论仅在答案解析解锁后显示于标准解析下方，所有登录用户可读写，作者可删除自己的评论，管理员可删除任意评论；
 - 私有笔记以 `(profile_id, occurrence_id)` 唯一保存，位于标准解析与评论之间；只允许当前账号读写，不进入 catalog、FTS、向量或搜题结果；
 - 练习模式底栏顺序为上一题、题号、提交答案、收藏、可选的删除错题、下一题；其他模式按实际可用操作自动填满宽度。
@@ -77,7 +77,7 @@
 - 系统管理的“题库管理”只读导出当前激活 catalog：JSONL/CSV 均按 occurrence 保留来源文件和原题版本，流式读取避免在 4G 服务器上整库载入内存；导出不包含任何 `state/` 用户数据，CSV 单元格执行公式注入防护。
 - 通用导入先进入 `state/import-staging/` 预检，不直接写 catalog。XLSX/CSV/JSONL/JSON 文件受 16 MB、50,000 行、128 字段、30 份和 256 MB 总暂存预算约束；XLSX 额外限制 2,000 个压缩成员和 256 MB 解压体积，以标准库流式遍历多工作表、读取缓存值并保留精确行定位，不加载外链或 DTD/实体。自动映射后可由管理员手动调整核心字段，错误行与标准化样例保存于 manifest。预检阶段禁止构建、激活或替换当前 catalog。
 - 手机刷题顶栏将返回、题库标题、计时和交卷分配到固定列，题目切换动画只作用于题卡，不能带动右侧控件水平位移。
-- 模型管理将嵌入模型与大语言模型独立保存和测试；未保存密钥可通过单次管理员请求查询上游 `/models`，不写入数据库或日志。
+- 模型管理将嵌入模型与大语言模型独立保存和测试；管理员输入基础网址，服务端拒绝凭据/query/fragment，兼容规范化已有完整端点，并分别派生 `/models`、`/embeddings`、`/chat/completions`。数据库与向量 manifest 继续使用最终实际请求 URL；未保存密钥可通过单次管理员请求查询上游 `/models`，不写入数据库或日志。
 - 语义索引按 64,078 道规范题构建 1024 维 float32 单位向量，使用 `vector-current.json` 原子指针激活；管理员可手动构建/续建、增量更新和删除。catalog 变化时按稳定 `question_id` 复用同配置旧矩阵行，仅请求新增或变化题目；构建前后校验 catalog、模型、API URL、维度、题目 ID 哈希和矩阵范数。
 
 ## 资源策略
@@ -113,7 +113,7 @@
 - 题库页面支持目录浏览与分类导航切换；两种浏览方式互相切换时保留当前内容，目标数据完成后再原子替换，禁止闪现“正在整理分类导航”等中间加载卡。分类导航固定使用“考试多行标签 → 题库类型多行标签 → 学科纵向折叠 → 章节/最终文件”，前两组标签宽度固定、自动换行并可分别展开或收起，学科展开时按需请求子树，不预载全部文件；目录、分类、收藏和错题中的最终题库名称直接左对齐，不显示“卷”等装饰图标；切换标签或展开目录时必须保留当前滚动位置。
 - 收藏、错题、笔记、评论和点赞的增删操作必须使今日统计失效并在下一次进入题库时刷新；个人评论、笔记和点赞列表使用 offset 分批加载，点赞列表允许取消赞同。更新时间紧邻今日统计标题右侧，分类导航不显示解释性说明。
 
-AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conversations/<id>`、`GET/POST /api/ai/conversations/<id>/messages` 和 `POST /api/ai/conversations/<id>/regenerate`。上下文最多纳入 6 条题库材料；刷题答案解析解锁后可以把当前 occurrence/collection 传入 AI；LLM 密钥只在服务端从加密设置库读取，响应不返回密钥或供应商原始错误。所有 AI 写操作要求登录会话和 CSRF。AI 回答支持复制、继续追问草稿和最后一条回答原位重新生成；非流式等待可由浏览器 AbortController 停止，取消后前端不渲染未完成响应。
+AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conversations/<id>`、`GET/POST /api/ai/conversations/<id>/messages` 和 `POST /api/ai/conversations/<id>/regenerate`。新建会话可绑定 `context_occurrence_id/context_collection_id`；上下文最多纳入 6 条题库材料。刷题答案解析解锁后，桌面右侧/手机底部抽屉优先恢复同一 occurrence 最近会话，不改变 hash、不重绘原题、不自动请求模型，并提供解析、易错点、知识点拓展和同类题快捷问题；关闭、遮罩、Escape 和手机下拉都必须精确恢复原题号、作答草稿和滚动位置。LLM 密钥只在服务端从加密设置库读取，响应不返回密钥或供应商原始错误。所有 AI 写操作要求登录会话和 CSRF。AI 回答支持复制、继续追问草稿和最后一条回答原位重新生成；非流式等待可由浏览器 AbortController 停止，取消后前端不渲染未完成响应。
 
 论坛 API 为 `GET /api/forum/sections`、`GET/POST /api/forum/topics`、`GET/PATCH/DELETE /api/forum/topics/<id>`、`POST /api/forum/topics/<id>/replies` 和 `PATCH/DELETE /api/forum/replies/<id>`。主题与回复保存在本地 state，列表支持分区、关键词、排序和 offset 分页；写操作要求 CSRF，编辑/删除权限由服务端按作者或管理员执行。回复可携带同主题可见回复的 `parent_reply_id`，详情返回 `parent_author_name`；正文最多解析 20 个有效 `@用户名`，提及通知会排除自己并与楼主/父作者回复通知去重。
 
@@ -125,7 +125,7 @@ AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conve
 
 学习目标 API 为 `GET/PUT /api/study/goals`，仅允许当前登录账号读取或更新自己的每日题数（1–1000）和学习时长（1–1440 分钟）目标，写入要求 CSRF。`GET /api/study/today-summary` 同时返回目标进度、连续学习天数和近 7 日趋势。
 
-练习历史 API 为 `GET /api/study/sessions?status=active|complete|archived&limit=20&offset=0`，仅登录用户可读并按当前 `profile_id` 返回会话摘要、状态统计与 `has_more`；未传 `status` 表示全部未归档记录。`PUT /api/study/sessions/<session_id>/archive` 以布尔 `archived` 幂等归档或恢复，要求 CSRF 与账号所有权；非法状态、布尔值或分页参数返回 400。归档不解锁进行中测试成绩，且归档活动会话拒绝作答和交卷。
+练习历史 API 为 `GET /api/study/sessions?status=active|complete|archived&limit=20&offset=0`，仅登录用户可读并按当前 `profile_id` 返回会话摘要、状态统计与 `has_more`；未传 `status` 表示全部未归档记录。`PUT /api/study/sessions/<session_id>/archive` 以布尔 `archived` 幂等归档或恢复，要求 CSRF 与账号所有权；`DELETE /api/study/sessions/<session_id>` 仅永久删除所属账号的已归档会话，`DELETE /api/study/sessions?status=archived` 还要求 `confirmation=DELETE_ARCHIVED` 的 JSON 字段。非法状态、布尔值、确认或分页参数返回 400，未归档删除返回 409。归档不解锁进行中测试成绩，且归档活动会话拒绝作答和交卷。
 
 个人学习数据 API 为 `GET /api/study/export?format=jsonl|csv`，仅登录用户可读，按 `profile_id` 导出学习目标、收藏、错题、笔记、进度、会话和作答记录，响应禁止缓存和代理缓冲，CSV 公式前缀会被中和。
 

@@ -37,6 +37,7 @@ def test_ai_conversations_are_account_scoped_and_messages_are_persisted(
         lambda config, messages, **kwargs: "答案见 [1]，因为题干描述了膜转运。",
     )
     conversation = store.create_conversation()
+    assert conversation["context_occurrence_id"] is None
     result = store.send_message(conversation["conversation_id"], "膜转运方式是什么？")
     assert result["assistant"]["role"] == "assistant"
     assert result["assistant"]["citations"]
@@ -63,6 +64,27 @@ def test_ai_collection_context_is_bounded(sample_source_tree: Path, tmp_path: Pa
     )
     assert len(result["assistant"]["citations"]) <= 6
     assert result["conversation"]["title"] == "文件复习"
+
+
+def test_ai_conversation_can_bind_to_one_practice_occurrence(
+    sample_source_tree: Path, tmp_path: Path
+):
+    store, catalog = _store(sample_source_tree, tmp_path)
+    collection = catalog.list_collections()[0]
+    occurrence = catalog.collection_outline(collection["collection_id"])[0]
+    conversation = store.create_conversation(
+        "本题解析",
+        context={
+            "occurrence_id": occurrence["occurrence_id"],
+            "collection_id": collection["collection_id"],
+        },
+    )
+    listed = store.list_conversations()
+    assert listed[0]["conversation_id"] == conversation["conversation_id"]
+    assert listed[0]["context_occurrence_id"] == occurrence["occurrence_id"]
+    assert listed[0]["context_collection_id"] == collection["collection_id"]
+    with pytest.raises(ValueError):
+        store.create_conversation(context={"occurrence_id": 0})
 
 
 def test_ai_regenerate_replaces_last_answer_and_preserves_account_scope(
@@ -137,5 +159,8 @@ def test_ai_initialize_migrates_existing_messages_context_column(
         )
     AIStore(database, catalog, FakeSettings(), "alice").initialize()
     with sqlite3.connect(database) as connection:
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(ai_messages)")}
-    assert "context_json" in columns
+        message_columns = {row[1] for row in connection.execute("PRAGMA table_info(ai_messages)")}
+        conversation_columns = {row[1] for row in connection.execute("PRAGMA table_info(ai_conversations)")}
+    assert "context_json" in message_columns
+    assert "context_occurrence_id" in conversation_columns
+    assert "context_collection_id" in conversation_columns

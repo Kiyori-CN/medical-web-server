@@ -85,10 +85,18 @@ const state = {
     activeId: "",
     messages: {},
     sending: false,
+    pending: null,
     abortController: null,
     draft: "",
+    drafts: {},
     contextOccurrence: null,
     contextCollection: "",
+    drawerOpen: false,
+    drawerContext: null,
+    drawerLoading: false,
+    drawerError: "",
+    drawerScrollY: 0,
+    drawerReturnFocus: null,
   },
   forum: {
     sections: null,
@@ -172,6 +180,7 @@ function getCookie(name) {
 }
 
 function showAuth(mode) {
+  closePracticeAIDrawer({ restoreFocus: false });
   stopTimer();
   stopNotificationPolling();
   resetPreferenceSaveRuntime();
@@ -211,6 +220,17 @@ function setAuthError(message) {
 
 async function enterApp(user) {
   resetPreferenceSaveRuntime();
+  state.ai.abortController?.abort();
+  state.ai.conversations = null;
+  state.ai.activeId = "";
+  state.ai.messages = {};
+  state.ai.sending = false;
+  state.ai.pending = null;
+  state.ai.abortController = null;
+  state.ai.draft = "";
+  state.ai.drafts = {};
+  state.ai.contextOccurrence = null;
+  state.ai.contextCollection = "";
   state.user = user;
   state.comments = {};
   state.notes = {};
@@ -256,6 +276,7 @@ async function route() {
     }
     return;
   }
+  closePracticeAIDrawer({ restoreFocus: false });
   document.body.classList.remove("in-session", "outline-open");
   const allowed = ["library", "search", "favorites", "wrong", "profile", "profile-detail", "connections", "history", "settings", "messages", "my-comments", "notes", "my-likes", "ai", "forum", "admin"];
   if (!allowed.includes(target)) {
@@ -1295,7 +1316,7 @@ function renderPractice() {
           is_correct: submitted.is_correct,
           point: submitted.point,
           explanation: submitted.explanation,
-        } : question)}<div class="practice-ai-action"><button class="button button-quiet button-small" type="button" data-action="ai-current-question" data-occurrence="${occurrenceId || ""}" data-collection="${escapeAttr(source.collection_id || session.collection_id || "")}">✦ AI 解析这道题</button></div></div>` : ""}
+        } : question)}<div class="practice-ai-action"><button class="button button-quiet button-small" type="button" data-action="ai-current-question" data-occurrence="${occurrenceId || ""}" data-collection="${escapeAttr(source.collection_id || session.collection_id || "")}">✦ 打开 AI 解题助手</button></div></div>` : ""}
         ${reveal ? `<div class="question-note-slot" data-note-occurrence="${occurrenceId || ""}">${renderQuestionNote(occurrenceId)}</div>` : ""}
         ${reveal ? `<div class="question-comments-slot" data-comments-occurrence="${occurrenceId || ""}">${renderQuestionComments(occurrenceId)}</div>` : ""}
         <div class="practice-footer" data-action-count="${4 + Number(showSubmit) + Number(session.saved_kind === "wrong")}">
@@ -1791,6 +1812,7 @@ function renderPracticeHistoryContent() {
   ];
   $("#page-history").innerHTML = `${practiceHistoryHeader()}
     <nav class="history-tabs card" aria-label="练习记录状态">${tabs.map(([value, label, count]) => `<button class="${state.practiceHistoryStatus === value ? "active" : ""}" type="button" data-action="history-status" data-status="${value}" aria-pressed="${state.practiceHistoryStatus === value}"><span>${label}</span><small>${formatNumber(count)}</small></button>`).join("")}</nav>
+    ${state.practiceHistoryStatus === "archived" && Number(stats.archived || 0) > 0 ? `<div class="history-archive-tools"><p><strong>已归档记录</strong><span>删除后无法恢复，但不会影响收藏、错题、笔记和学习进度。</span></p><button class="button button-danger button-small" type="button" data-action="clear-archived-history">清空已归档</button></div>` : ""}
     <section class="history-list" aria-live="polite">${items.length ? items.map(practiceHistoryCard).join("") : emptyMarkup("暂无练习记录", state.practiceHistoryStatus === "active" ? "当前没有未完成练习。" : state.practiceHistoryStatus === "complete" ? "完成练习后会显示在这里。" : state.practiceHistoryStatus === "archived" ? "归档的练习会保留在这里并可随时恢复。" : "开始一次刷题后会保留记录。", "◷")}</section>
     ${payload.has_more ? `<button class="button button-secondary history-load-more" type="button" data-action="history-load-more">加载更多</button>` : ""}`;
 }
@@ -1816,7 +1838,8 @@ function practiceHistoryCard(item) {
     : practiceModeLabel(item.mode);
   const openAction = archived ? "" : `<button class="button ${completed ? "button-secondary" : "button-primary"} button-small" type="button" data-action="open-history-session" data-session-id="${escapeAttr(item.session_id)}">${completed ? "查看复盘" : "继续答题"}</button>`;
   const archiveAction = `<button class="button ${archived ? "button-primary" : "button-quiet"} button-small" type="button" data-action="toggle-history-archive" data-session-id="${escapeAttr(item.session_id)}" data-archived="${archived}">${archived ? "恢复" : "归档"}</button>`;
-  return `<article class="card history-card"><div class="history-card-head"><div><span class="status-pill ${statusClass}">${statusLabel}</span><span class="history-mode">${escapeHtml(modeLabel)}</span></div><time>${escapeHtml(formatDate(item.last_activity_at))}</time></div><div class="history-card-title"><h2>${escapeHtml(item.title || "练习")}</h2>${source}</div><div class="history-progress"><span><strong>${formatNumber(summary.answered || 0)} / ${formatNumber(summary.total || 0)}</strong><small>已答题</small></span><progress max="100" value="${Math.max(0, Math.min(100, Number(summary.progress || 0)))}" aria-label="练习完成进度"></progress></div><div class="history-card-foot"><div class="history-results">${resultCopy}<small>创建于 ${escapeHtml(formatDate(item.created_at))}${duration}</small></div><div class="history-card-actions">${openAction}${archiveAction}</div></div></article>`;
+  const deleteAction = archived ? `<button class="button button-danger button-small" type="button" data-action="delete-history-session" data-session-id="${escapeAttr(item.session_id)}" data-title="${escapeAttr(item.title || "练习")}">删除</button>` : "";
+  return `<article class="card history-card"><div class="history-card-head"><div><span class="status-pill ${statusClass}">${statusLabel}</span><span class="history-mode">${escapeHtml(modeLabel)}</span></div><time>${escapeHtml(formatDate(item.last_activity_at))}</time></div><div class="history-card-title"><h2>${escapeHtml(item.title || "练习")}</h2>${source}</div><div class="history-progress"><span><strong>${formatNumber(summary.answered || 0)} / ${formatNumber(summary.total || 0)}</strong><small>已答题</small></span><progress max="100" value="${Math.max(0, Math.min(100, Number(summary.progress || 0)))}" aria-label="练习完成进度"></progress></div><div class="history-card-foot"><div class="history-results">${resultCopy}<small>创建于 ${escapeHtml(formatDate(item.created_at))}${duration}</small></div><div class="history-card-actions">${openAction}${archiveAction}${deleteAction}</div></div></article>`;
 }
 
 function formatHistoryDuration(value) {
@@ -1861,6 +1884,56 @@ async function togglePracticeHistoryArchive(button) {
     }
     showToast(archived ? "练习已恢复" : "练习已归档");
     await renderPracticeHistoryPage(state.practiceHistoryStatus);
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function deletePracticeHistorySession(button) {
+  const sessionId = button.dataset.sessionId || "";
+  if (!sessionId) return;
+  const title = button.dataset.title || "这份练习";
+  const confirmed = await confirmModal(
+    "永久删除练习记录",
+    `确认永久删除“${title}”？本次练习及逐题作答明细将被删除，且无法恢复。`,
+    "永久删除",
+    true
+  );
+  if (!confirmed) return;
+  setButtonBusy(button, true, "删除中");
+  try {
+    await api(`/study/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+      body: {},
+    });
+    if (state.session?.session_id === sessionId) state.session = null;
+    showToast("练习记录已永久删除");
+    await renderPracticeHistoryPage("archived");
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function clearArchivedPracticeHistory(button) {
+  const count = Number(state.practiceHistory?.stats?.archived || 0);
+  if (!count) return;
+  const confirmed = await confirmModal(
+    "清空已归档记录",
+    `确认永久删除全部 ${count} 份已归档练习？所有相关逐题作答明细都会一并删除，且无法恢复。`,
+    "全部永久删除",
+    true
+  );
+  if (!confirmed) return;
+  setButtonBusy(button, true, "清空中");
+  try {
+    const result = await api("/study/sessions?status=archived", {
+      method: "DELETE",
+      body: { confirmation: "DELETE_ARCHIVED" },
+    });
+    showToast(`已永久删除 ${formatNumber(result.sessions_deleted || 0)} 份练习记录`);
+    await renderPracticeHistoryPage("archived");
   } catch (error) {
     showToast(error.message, "error");
     setButtonBusy(button, false);
@@ -2327,6 +2400,13 @@ function renderPlaceholderPage(page) {
   $(`#page-${page}`).innerHTML = emptyMarkup(meta[1], meta[2], meta[3]);
 }
 
+function activateAIConversation(id) {
+  const nextId = String(id || "");
+  if (state.ai.activeId) state.ai.drafts[state.ai.activeId] = state.ai.draft || "";
+  state.ai.activeId = nextId;
+  state.ai.draft = nextId ? state.ai.drafts[nextId] || "" : "";
+}
+
 function aiConversationMarkup(item, activeId) {
   const active = item.conversation_id === activeId ? " active" : "";
   return `<button class="ai-conversation${active}" type="button" data-action="ai-select" data-id="${escapeAttr(item.conversation_id)}">
@@ -2336,26 +2416,54 @@ function aiConversationMarkup(item, activeId) {
   </button>`;
 }
 
-function aiMessageMarkup(message, { canRegenerate = false } = {}) {
-  const citations = (message.citations || []).map((item) =>
-    `<a href="#search" data-action="ai-citation" data-query="${escapeAttr(item.source || item.question_id || "")}">[${escapeHtml(item.index)}] ${escapeHtml(item.title || item.source || "题库来源")}</a>`
-  ).join("");
+function aiMessageMarkup(message, { canRegenerate = false, surface = "page" } = {}) {
+  const citations = (message.citations || []).map((item) => {
+    const label = `[${escapeHtml(item.index)}] ${escapeHtml(item.title || item.source || "题库来源")}`;
+    return surface === "drawer"
+      ? `<span class="ai-citation-static">${label}</span>`
+      : `<a href="#search" data-action="ai-citation" data-query="${escapeAttr(item.source || item.question_id || "")}">${label}</a>`;
+  }).join("");
   const content = escapeHtml(message.content || "").replace(/\n/g, "<br>");
   const actions = message.role === "assistant" ? `<div class="ai-message-actions"><button class="text-button" type="button" data-action="ai-copy" data-message-id="${escapeAttr(message.message_id)}">复制</button><button class="text-button" type="button" data-action="ai-continue" data-message-id="${escapeAttr(message.message_id)}">继续追问</button>${canRegenerate ? `<button class="text-button" type="button" data-action="ai-regenerate" data-message-id="${escapeAttr(message.message_id)}">重新生成</button>` : ""}</div>` : "";
-  return `<article class="ai-message ${message.role === "user" ? "user" : "assistant"}">
-    <div class="ai-message-role">${message.role === "user" ? "我" : "AI 学习助手"}</div>
+  return `<article class="ai-message ${message.role === "user" ? "user" : "assistant"}${message.pending ? " pending" : ""}">
+    <div class="ai-message-role">${message.role === "user" ? `我${message.pending ? " · 等待回答" : ""}` : "AI 学习助手"}</div>
     <div class="ai-message-body">${content}</div>
     ${citations ? `<div class="ai-citations"><span>题库引用</span>${citations}</div>` : ""}
     ${actions}
   </article>`;
 }
 
+function aiConversationMessages(activeId, surface = "page") {
+  const stored = state.ai.messages[activeId] || [];
+  const pending = state.ai.pending?.conversationId === activeId
+    ? [...stored, { role: "user", content: state.ai.pending.content, citations: [], pending: true }]
+    : stored;
+  return pending.length
+    ? pending.map((message, index) => aiMessageMarkup(message, {
+      surface,
+      canRegenerate: !message.pending && message.role === "assistant" && index === pending.length - 1,
+    })).join("")
+    : "";
+}
+
+function aiComposerMarkup({ surface = "page" } = {}) {
+  const drawer = surface === "drawer";
+  return `<form id="${drawer ? "practice-ai-chat-form" : "ai-chat-form"}" class="ai-composer" data-form="ai-chat" data-ai-surface="${surface}">
+    ${drawer
+      ? `<input type="hidden" name="scope" value="question"><div class="ai-drawer-scope"><span>仅围绕当前题对话</span><small>关闭后答题位置和草稿保持不变</small></div>`
+      : `<label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog"${state.ai.contextOccurrence ? "" : " selected"}>全题库</option><option value="question"${state.ai.contextOccurrence ? " selected" : " disabled"}>当前题（从刷题页发起）</option><option value="collection"${state.ai.contextCollection ? "" : " disabled"}>当前文件（从刷题页发起）</option></select></label>`}
+    <textarea name="content" rows="3" maxlength="8000" placeholder="${drawer ? "继续追问本题，按 Ctrl/⌘ + Enter 发送" : "输入你的问题，按 Ctrl/⌘ + Enter 发送"}" required>${escapeHtml(state.ai.draft || "")}</textarea>
+    <div class="ai-composer-foot"><span>AI 回答可能有误，请以原题与标准解析为准。</span>${state.ai.sending ? `<button class="button button-secondary" type="button" data-action="ai-stop">停止</button>` : `<button class="button button-primary" type="submit">发送</button>`}</div>
+  </form>`;
+}
+
 function renderAIContent() {
   const container = $("#page-ai");
   const conversations = state.ai.conversations || [];
   const active = conversations.find((item) => item.conversation_id === state.ai.activeId) || conversations[0];
-  if (active && active.conversation_id !== state.ai.activeId) state.ai.activeId = active.conversation_id;
+  if (active && active.conversation_id !== state.ai.activeId) activateAIConversation(active.conversation_id);
   const messages = state.ai.messages[state.ai.activeId] || [];
+  const messagesMarkup = aiConversationMessages(state.ai.activeId, "page");
   container.innerHTML = `<section class="ai-page-header page-header page-header-compact">
     <div class="page-title"><p class="eyebrow">AI 学习</p><h1>把题库变成可追问的学习助手</h1><p class="section-copy">回答会绑定当前账号，会话和题库引用只保存在本地状态库。</p></div>
     <button class="button button-primary" type="button" data-action="ai-new">新建会话</button>
@@ -2367,15 +2475,162 @@ function renderAIContent() {
     </aside>
     <section class="card ai-chat-panel">
       ${active ? `<div class="ai-chat-head"><div><strong>${escapeHtml(active.title || "新对话")}</strong><small>非流式回答 · 最多保留最近 12 条上下文</small></div><div class="ai-chat-actions"><button class="text-button" type="button" data-action="ai-rename">重命名</button><button class="text-button danger" type="button" data-action="ai-delete">删除</button></div></div>
-      <div class="ai-messages" aria-live="polite">${messages.length ? messages.map((message, index) => aiMessageMarkup(message, { canRegenerate: message.role === "assistant" && index === messages.length - 1 })).join("") : `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
-      <form id="ai-chat-form" class="ai-composer" data-form="ai-chat">
-        <label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog"${state.ai.contextOccurrence ? "" : " selected"}>全题库</option><option value="question"${state.ai.contextOccurrence ? " selected" : " disabled"}>当前题（从刷题页发起）</option><option value="collection"${state.ai.contextCollection ? "" : " disabled"}>当前文件（从刷题页发起）</option></select></label>
-        <textarea name="content" rows="3" maxlength="8000" placeholder="输入你的问题，按 Ctrl/⌘ + Enter 发送" required>${escapeHtml(state.ai.draft || "")}</textarea>
-        <div class="ai-composer-foot"><span>答案可能需要复核，请以原题和标准解析为准。</span>${state.ai.sending ? `<button class="button button-secondary" type="button" data-action="ai-stop">停止</button>` : `<button class="button button-primary" type="submit">发送</button>`}</div>
-      </form>` : `<div class="ai-no-conversation">${emptyMarkup("创建一个 AI 会话", "会话按账号隔离，回答可引用全题库内容。", "✦")}<button class="button button-primary" type="button" data-action="ai-new">新建会话</button></div>`}
+      <div class="ai-messages" aria-live="polite">${messagesMarkup || `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
+      ${aiComposerMarkup({ surface: "page" })}` : `<div class="ai-no-conversation">${emptyMarkup("创建一个 AI 会话", "会话按账号隔离，回答可引用全题库内容。", "✦")}<button class="button button-primary" type="button" data-action="ai-new">新建会话</button></div>`}
     </section>
   </div>`;
-  if (messages.length) window.requestAnimationFrame(() => { const box = $(".ai-messages"); if (box) box.scrollTop = box.scrollHeight; });
+  if (messages.length || state.ai.pending) window.requestAnimationFrame(() => { const box = $("#page-ai .ai-messages"); if (box) box.scrollTop = box.scrollHeight; });
+}
+
+const PRACTICE_AI_PROMPTS = [
+  ["解析本题", "请逐步解析本题，说明正确答案为什么成立，并解释其他选项为什么不成立。"],
+  ["易错点", "请总结本题最容易混淆和答错的地方，并给出简洁的辨析方法。"],
+  ["知识点拓展", "请基于本题梳理相关核心知识点，并补充临床或考试中常见的关联考法。"],
+  ["生成同类题", "请根据本题考点生成一道同类型练习题，先给题目和选项，暂时不要公布答案。"],
+];
+
+function renderPracticeAIDrawer() {
+  const root = $("#practice-ai-drawer-root");
+  if (!root) return;
+  if (!state.ai.drawerOpen) {
+    root.innerHTML = "";
+    return;
+  }
+  const context = state.ai.drawerContext || {};
+  const active = (state.ai.conversations || []).find((item) => item.conversation_id === state.ai.activeId);
+  const messagesMarkup = active ? aiConversationMessages(active.conversation_id, "drawer") : "";
+  const content = state.ai.drawerLoading
+    ? `<div class="practice-ai-drawer-state">${loadingMarkup("正在恢复本题 AI 对话")}</div>`
+    : state.ai.drawerError
+      ? `<div class="practice-ai-drawer-state">${emptyMarkup("AI 对话暂时无法打开", state.ai.drawerError, "!")}<button class="button button-secondary" type="button" data-action="retry-practice-ai">重试</button></div>`
+      : `<div class="practice-ai-quick-prompts" aria-label="快捷提问">${PRACTICE_AI_PROMPTS.map(([label, prompt]) => `<button type="button" data-action="ai-quick-prompt" data-prompt="${escapeAttr(prompt)}">${escapeHtml(label)}</button>`).join("")}</div>
+        <div class="ai-messages practice-ai-messages" aria-live="polite">${messagesMarkup || `<div class="ai-welcome practice-ai-welcome"><span aria-hidden="true">✦</span><h2>这道题想问什么？</h2><p>选择一个快捷问题，或在下方输入。打开抽屉不会自动调用模型。</p></div>`}</div>
+        ${aiComposerMarkup({ surface: "drawer" })}`;
+  root.innerHTML = `<button class="practice-ai-drawer-backdrop" type="button" data-action="close-practice-ai" aria-label="关闭 AI 解题助手"></button>
+    <aside class="practice-ai-drawer" role="dialog" aria-modal="true" aria-labelledby="practice-ai-drawer-title">
+      <div class="practice-ai-drawer-grabber" aria-hidden="true"></div>
+      <header class="practice-ai-drawer-head">
+        <div><span>AI 解题助手</span><h2 id="practice-ai-drawer-title">第 ${formatNumber(context.position || 1)} / ${formatNumber(context.total || 1)} 题</h2></div>
+        <button class="icon-button" type="button" data-action="close-practice-ai" aria-label="关闭 AI 解题助手">×</button>
+      </header>
+      <div class="practice-ai-context"><strong>${escapeHtml(context.title || "当前题目")}</strong><span>${escapeHtml(context.typeLabel || "题目")}${context.sourceCode ? ` · ${escapeHtml(context.sourceCode)}` : ""}</span><p>${escapeHtml(context.stem || "")}</p></div>
+      <div class="practice-ai-drawer-body">${content}</div>
+    </aside>`;
+  if (!state.ai.drawerLoading && !state.ai.drawerError && (messagesMarkup || state.ai.pending)) {
+    window.requestAnimationFrame(() => {
+      const box = $(".practice-ai-messages", root);
+      if (box) box.scrollTop = box.scrollHeight;
+    });
+  }
+}
+
+function renderAIViews() {
+  renderAIContent();
+  renderPracticeAIDrawer();
+}
+
+function lockPracticeAIDrawerScroll() {
+  state.ai.drawerScrollY = window.scrollY;
+  document.documentElement.classList.add("practice-ai-drawer-open");
+  document.body.classList.add("practice-ai-drawer-open");
+}
+
+function closePracticeAIDrawer({ restoreFocus = true } = {}) {
+  if (!state.ai.drawerOpen) return;
+  const scrollY = state.ai.drawerScrollY;
+  const focusTarget = state.ai.drawerReturnFocus;
+  state.ai.drawerOpen = false;
+  state.ai.drawerLoading = false;
+  state.ai.drawerError = "";
+  state.ai.drawerContext = null;
+  state.ai.drawerReturnFocus = null;
+  renderPracticeAIDrawer();
+  document.documentElement.classList.remove("practice-ai-drawer-open");
+  document.body.classList.remove("practice-ai-drawer-open");
+  window.scrollTo({ top: scrollY, behavior: "instant" });
+  if (restoreFocus && focusTarget?.isConnected) focusTarget.focus({ preventScroll: true });
+}
+
+async function loadPracticeAIDrawerConversation() {
+  const context = state.ai.drawerContext;
+  if (!context || !state.ai.drawerOpen) return;
+  state.ai.drawerLoading = true;
+  state.ai.drawerError = "";
+  renderPracticeAIDrawer();
+  try {
+    if (!state.ai.conversations) {
+      const payload = await api("/ai/conversations");
+      state.ai.conversations = payload.conversations || [];
+    }
+    let active = (state.ai.conversations || []).find(
+      (item) => Number(item.context_occurrence_id) === Number(context.occurrenceId)
+    );
+    if (!active) {
+      active = await api("/ai/conversations", {
+        method: "POST",
+        body: {
+          title: `第 ${context.position} 题 · ${context.title}`.slice(0, 80),
+          context: {
+            occurrence_id: context.occurrenceId,
+            collection_id: context.collectionId,
+          },
+        },
+      });
+      state.ai.conversations = [active, ...(state.ai.conversations || [])];
+      state.ai.messages[active.conversation_id] = [];
+    }
+    activateAIConversation(active.conversation_id);
+    if (!state.ai.messages[active.conversation_id]) {
+      const payload = await api(`/ai/conversations/${encodeURIComponent(active.conversation_id)}/messages`);
+      state.ai.messages[active.conversation_id] = payload.messages || [];
+    }
+  } catch (error) {
+    state.ai.drawerError = error.message || "AI 对话加载失败";
+  } finally {
+    state.ai.drawerLoading = false;
+    renderPracticeAIDrawer();
+  }
+}
+
+async function openPracticeAIDrawer(button) {
+  const session = state.session;
+  const item = session?.items?.[state.sessionIndex];
+  if (!session || !item) return;
+  const source = item.question?.sources?.[0] || {};
+  const occurrenceId = Number(button?.dataset.occurrence || item.occurrence_id || item.question?.occurrence_id || source.occurrence_id) || null;
+  const reveal = session.solution_visible || (Boolean(item.submission) && session.mode !== "test");
+  if (!occurrenceId || !reveal) {
+    showToast("答案解析解锁后才能使用本题 AI", "error");
+    return;
+  }
+  if (!state.ai.drawerOpen) {
+    state.ai.drawerReturnFocus = button || document.activeElement;
+    lockPracticeAIDrawerScroll();
+  }
+  state.ai.contextOccurrence = occurrenceId;
+  state.ai.contextCollection = button?.dataset.collection || source.collection_id || session.collection_id || "";
+  state.ai.drawerContext = {
+    occurrenceId,
+    collectionId: state.ai.contextCollection,
+    position: item.position,
+    total: session.items.length,
+    title: fileTitle(source.relative_path || session.collection_id || "当前练习"),
+    typeLabel: item.question?.type_label || item.question?.raw_type || item.question?.question_type || "题目",
+    sourceCode: item.question?.source_code || "",
+    stem: String(item.question?.stem || "").slice(0, 160),
+  };
+  state.ai.drawerOpen = true;
+  await loadPracticeAIDrawerConversation();
+  window.requestAnimationFrame(() => {
+    $(".practice-ai-drawer [data-action=\"close-practice-ai\"]")?.focus({ preventScroll: true });
+  });
+}
+
+function usePracticeAIQuickPrompt(button) {
+  if (state.ai.sending || state.ai.drawerLoading || state.ai.drawerError) return;
+  state.ai.draft = button.dataset.prompt || "";
+  renderPracticeAIDrawer();
+  window.requestAnimationFrame(() => $("#practice-ai-chat-form")?.requestSubmit());
 }
 
 async function renderAIPage({ force = false } = {}) {
@@ -2385,7 +2640,7 @@ async function renderAIPage({ force = false } = {}) {
     if (!state.ai.conversations || force) {
       const payload = await api("/ai/conversations");
       state.ai.conversations = payload.conversations || [];
-      if (!state.ai.activeId && state.ai.conversations[0]) state.ai.activeId = state.ai.conversations[0].conversation_id;
+      if (!state.ai.activeId && state.ai.conversations[0]) activateAIConversation(state.ai.conversations[0].conversation_id);
     }
     if (state.ai.activeId && !state.ai.messages[state.ai.activeId]) {
       const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`);
@@ -2401,22 +2656,22 @@ async function createAIConversation() {
   try {
     const item = await api("/ai/conversations", { method: "POST", body: {} });
     state.ai.conversations = [item, ...(state.ai.conversations || [])];
-    state.ai.activeId = item.conversation_id;
+    activateAIConversation(item.conversation_id);
     state.ai.messages[item.conversation_id] = [];
-    renderAIContent();
+    renderAIViews();
     $("#ai-chat-form textarea")?.focus();
   } catch (error) { showToast(error.message, "error"); }
 }
 
 async function selectAIConversation(id) {
-  state.ai.activeId = id;
+  activateAIConversation(id);
   if (!state.ai.messages[id]) {
     try {
       const payload = await api(`/ai/conversations/${encodeURIComponent(id)}/messages`);
       state.ai.messages[id] = payload.messages || [];
     } catch (error) { showToast(error.message, "error"); }
   }
-  renderAIContent();
+  renderAIViews();
 }
 
 async function renameAIConversation() {
@@ -2427,7 +2682,7 @@ async function renameAIConversation() {
   try {
     const updated = await api(`/ai/conversations/${encodeURIComponent(active.conversation_id)}`, { method: "PATCH", body: { title } });
     state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === updated.conversation_id ? { ...item, ...updated } : item);
-    renderAIContent();
+    renderAIViews();
   } catch (error) { showToast(error.message, "error"); }
 }
 
@@ -2438,37 +2693,46 @@ async function deleteAIConversation() {
     await api(`/ai/conversations/${encodeURIComponent(id)}`, { method: "DELETE", body: {} });
     state.ai.conversations = (state.ai.conversations || []).filter((item) => item.conversation_id !== id);
     delete state.ai.messages[id];
-    state.ai.activeId = state.ai.conversations[0]?.conversation_id || "";
+    activateAIConversation(state.ai.conversations[0]?.conversation_id || "");
     if (state.ai.activeId && !state.ai.messages[state.ai.activeId]) {
       const payload = await api(`/ai/conversations/${encodeURIComponent(state.ai.activeId)}/messages`);
       state.ai.messages[state.ai.activeId] = payload.messages || [];
     }
-    renderAIContent();
+    renderAIViews();
   } catch (error) { showToast(error.message, "error"); }
 }
 
 async function sendAIMessage(form) {
   if (!state.ai.activeId) return createAIConversation();
-  const content = String(new FormData(form).get("content") || "").trim();
+  const formData = new FormData(form);
+  const content = String(formData.get("content") || "").trim();
   if (!content || state.ai.sending) return;
   const conversationId = state.ai.activeId;
+  const surface = form.dataset.aiSurface === "drawer" ? "drawer" : "page";
+  const scope = String(formData.get("scope") || "catalog");
+  const occurrenceId = surface === "drawer" ? state.ai.drawerContext?.occurrenceId : state.ai.contextOccurrence;
+  const collectionId = surface === "drawer" ? state.ai.drawerContext?.collectionId : state.ai.contextCollection;
   state.ai.draft = "";
+  state.ai.drafts[conversationId] = "";
   state.ai.sending = true;
+  state.ai.pending = { conversationId, content };
   state.ai.abortController = new AbortController();
-  renderAIContent();
+  renderAIViews();
   try {
-    const scope = String(new FormData(form).get("scope") || "catalog");
-    const payload = await api(`/ai/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "POST", signal: state.ai.abortController.signal, body: { content, context: { scope, occurrence_id: state.ai.contextOccurrence, collection_id: state.ai.contextCollection } } });
+    const payload = await api(`/ai/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "POST", signal: state.ai.abortController.signal, body: { content, context: { scope, occurrence_id: occurrenceId, collection_id: collectionId } } });
     state.ai.messages[conversationId] = [...(state.ai.messages[conversationId] || []), payload.user, payload.assistant];
     state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === conversationId ? { ...item, ...payload.conversation, preview: payload.assistant.content, message_count: (item.message_count || 0) + 2 } : item);
   } catch (error) {
+    state.ai.draft = content;
+    state.ai.drafts[conversationId] = content;
     if (error?.name === "AbortError") showToast("已停止等待本次回答");
     else showToast(error.message, "error");
   }
   finally {
     state.ai.sending = false;
+    state.ai.pending = null;
     state.ai.abortController = null;
-    renderAIContent();
+    renderAIViews();
   }
 }
 
@@ -2499,8 +2763,9 @@ function continueAIMessage(messageId) {
   const message = (state.ai.messages[state.ai.activeId] || []).find((item) => item.message_id === messageId && item.role === "assistant");
   if (!message) return;
   state.ai.draft = "请基于上一条回答继续解释：";
-  renderAIContent();
-  $("#ai-chat-form textarea")?.focus();
+  state.ai.drafts[state.ai.activeId] = state.ai.draft;
+  renderAIViews();
+  $(`${state.ai.drawerOpen ? "#practice-ai-chat-form" : "#ai-chat-form"} textarea`)?.focus();
 }
 
 async function regenerateAIMessage(messageId) {
@@ -2511,7 +2776,7 @@ async function regenerateAIMessage(messageId) {
   if (!message || messages[messages.length - 1]?.message_id !== messageId) return;
   state.ai.sending = true;
   state.ai.abortController = new AbortController();
-  renderAIContent();
+  renderAIViews();
   try {
     const payload = await api(`/ai/conversations/${encodeURIComponent(conversationId)}/regenerate`, {
       method: "POST",
@@ -2527,7 +2792,7 @@ async function regenerateAIMessage(messageId) {
   finally {
     state.ai.sending = false;
     state.ai.abortController = null;
-    renderAIContent();
+    renderAIViews();
   }
 }
 
@@ -3282,12 +3547,52 @@ function providerPanel(prefix, title, provider, dimensions) {
   const modelState = state.providerModels[prefix] || { status: "idle", items: [], open: false, error: "" };
   return `<form class="settings-group provider-settings-card" data-provider-form="${prefix}">
     <div class="provider-card-heading"><div><h3>${title}</h3><span>${provider.api_key_configured ? `已保存 ${escapeHtml(provider.api_key_masked || "")}` : "尚未保存密钥"}</span></div><span class="status-dot ${provider.api_key_configured ? "ready" : ""}"></span></div>
-    <label class="field"><span>API 地址</span><input name="api_url" type="url" value="${escapeAttr(provider.api_url || "")}" required></label>
+    <label class="field"><span>基础网址</span><input name="base_url" data-provider-base="${prefix}" type="url" value="${escapeAttr(provider.base_url || provider.api_url || "")}" placeholder="https://api.example.com/v1" required><small class="field-help">可直接粘贴已有完整端点，保存时会自动规范化为基础网址。</small></label>
+    <div id="${prefix}-endpoint-preview" class="provider-endpoint-preview">${providerEndpointPreviewMarkup(prefix, {
+      modelsUrl: provider.models_url,
+      apiUrl: provider.api_url,
+    })}</div>
     <div class="field model-select-field"><span>模型</span><div class="model-combobox"><input name="model" data-provider-model="${prefix}" value="${escapeAttr(provider.model || "")}" required autocomplete="off"><button type="button" data-action="toggle-model-list" data-provider="${prefix}" aria-label="展开上游模型" aria-expanded="${modelState.open ? "true" : "false"}">⌄</button></div>${renderProviderModelDropdown(prefix, modelState)}</div>
     ${dimensions ? `<label class="field"><span>向量维度</span><input name="dimensions" type="number" min="64" max="1024" step="64" value="${provider.dimensions || 1024}" required></label>` : ""}
     <label class="field"><span>API 密钥</span><input name="api_key" data-provider-key="${prefix}" type="password" autocomplete="new-password" placeholder="${provider.api_key_configured ? `留空则继续使用 ${escapeAttr(provider.api_key_masked || "")}` : "输入后自动读取上游模型"}"></label>
     <div class="provider-card-actions"><button class="button button-secondary" type="button" data-action="test-provider" data-provider="${prefix}">测试连接</button><button class="button button-primary" type="submit">保存配置</button></div>
   </form>`;
+}
+
+function deriveProviderUrls(value, provider) {
+  try {
+    const url = new URL(String(value || "").trim());
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null;
+    const parts = url.pathname.split('/').filter(Boolean);
+    if (parts.slice(-2).join('/') === 'chat/completions') parts.splice(-2);
+    else if (["embeddings", "models", "completions", "responses"].includes(parts.at(-1))) parts.pop();
+    if (!parts.length) parts.push('v1');
+    url.pathname = `/${parts.join('/')}`;
+    const baseUrl = url.toString().replace(/\/$/, '');
+    return {
+      baseUrl,
+      modelsUrl: `${baseUrl}/models`,
+      apiUrl: `${baseUrl}/${provider === "embedding" ? "embeddings" : "chat/completions"}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function providerEndpointPreviewMarkup(provider, urls) {
+  const modelsUrl = urls?.modelsUrl || "等待输入有效的基础网址";
+  const apiUrl = urls?.apiUrl || "等待输入有效的基础网址";
+  return `<div><span>模型列表</span><code>${escapeHtml(modelsUrl)}</code></div><div><span>${provider === "embedding" ? "嵌入请求" : "聊天请求"}</span><code>${escapeHtml(apiUrl)}</code></div>`;
+}
+
+function updateProviderEndpointPreview(provider) {
+  const form = providerForm(provider);
+  const slot = $(`#${provider}-endpoint-preview`);
+  if (!form || !slot) return;
+  slot.innerHTML = providerEndpointPreviewMarkup(
+    provider,
+    deriveProviderUrls(form.elements.base_url?.value, provider)
+  );
 }
 
 function renderProviderModelDropdown(provider, modelState) {
@@ -3383,6 +3688,8 @@ async function handleClick(event) {
   if (action === "history-load-more") return loadMorePracticeHistory(target);
   if (action === "open-history-session") return openHistorySession(target.dataset.sessionId);
   if (action === "toggle-history-archive") return togglePracticeHistoryArchive(target);
+  if (action === "delete-history-session") return deletePracticeHistorySession(target);
+  if (action === "clear-archived-history") return clearArchivedPracticeHistory(target);
   if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
   if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(publicProfileRouteHash(target.dataset.userId || state.user.user_id, state.profileReturnHash)); }
   if (action === "open-forum-dynamic") return navigateHash(forumRouteHash({ topic: target.dataset.topic, returnHash: location.hash || "#profile" }));
@@ -3552,16 +3859,16 @@ async function handleClick(event) {
   if (action === "ai-copy") return copyAIMessage(target.dataset.messageId || "");
   if (action === "ai-continue") return continueAIMessage(target.dataset.messageId || "");
   if (action === "ai-regenerate") return regenerateAIMessage(target.dataset.messageId || "");
+  if (action === "close-practice-ai") return closePracticeAIDrawer();
+  if (action === "retry-practice-ai") return loadPracticeAIDrawerConversation();
+  if (action === "ai-quick-prompt") return usePracticeAIQuickPrompt(target);
   if (action === "ai-citation") {
     event.preventDefault();
     const query = target.dataset.query || "";
     if (query) { state.lastSearchQuery = query; return navigateHash("#search"); }
   }
   if (action === "ai-current-question") {
-    state.ai.contextOccurrence = Number(target.dataset.occurrence) || null;
-    state.ai.contextCollection = target.dataset.collection || "";
-    state.ai.activeId = state.ai.activeId || state.ai.conversations?.[0]?.conversation_id || "";
-    return navigateHash("#ai");
+    return openPracticeAIDrawer(target);
   }
   if (action === "forum-toggle-composer") { state.forum.composerOpen = !state.forum.composerOpen; renderForumListing(parseRouteHash()); return; }
   if (action === "forum-section") return navigateHash(forumRouteHash({ section: target.dataset.section || "" }));
@@ -3629,6 +3936,15 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("input", (event) => {
   if (event.target.dataset.providerKey) {
     scheduleProviderDiscovery(event.target.dataset.providerKey);
+    return;
+  }
+  if (event.target.dataset.providerBase) {
+    updateProviderEndpointPreview(event.target.dataset.providerBase);
+    return;
+  }
+  if (event.target.closest?.('[data-form="ai-chat"]') && event.target.name === "content") {
+    state.ai.draft = event.target.value;
+    if (state.ai.activeId) state.ai.drafts[state.ai.activeId] = event.target.value;
     return;
   }
   if (event.target.dataset.action !== "subjective-draft" || !state.session) return;
@@ -3755,6 +4071,7 @@ function selectAnswerOption(label) {
 }
 
 function moveSession(delta) {
+  if (state.ai.drawerOpen) return;
   const next = state.sessionIndex + delta;
   if (next < 0) {
     showToast("已经是第一题");
@@ -3778,6 +4095,12 @@ function clearSelectionTimer() {
 
 function handlePracticePointerDown(event) {
   if (!event.isPrimary || !document.body.classList.contains("in-session")) return;
+  const aiDrawerHandle = event.target.closest(".practice-ai-drawer-grabber, .practice-ai-drawer-head");
+  if (aiDrawerHandle && state.ai.drawerOpen) {
+    state.gestureStart = { kind: "ai-drawer", x: event.clientX, y: event.clientY, time: Date.now(), pointerId: event.pointerId };
+    return;
+  }
+  if (state.ai.drawerOpen) return;
   const outlineHandle = event.target.closest(".practice-outline-grabber, .practice-outline-head");
   if (outlineHandle && $("#practice-outline")?.classList.contains("open")) {
     state.gestureStart = { kind: "outline", x: event.clientX, y: event.clientY, time: Date.now(), pointerId: event.pointerId };
@@ -3794,6 +4117,13 @@ function handlePracticePointerUp(event) {
   const dx = event.clientX - start.x;
   const dy = event.clientY - start.y;
   if (Date.now() - start.time > 750) return;
+  if (start.kind === "ai-drawer") {
+    if (dy > 64 && Math.abs(dy) > Math.abs(dx) * 1.2) {
+      state.suppressClickUntil = Date.now() + 250;
+      closePracticeAIDrawer();
+    }
+    return;
+  }
   if (start.kind === "outline") {
     if (dy > 56 && Math.abs(dy) > Math.abs(dx) * 1.2) {
       state.suppressClickUntil = Date.now() + 250;
@@ -3812,12 +4142,16 @@ function clearPracticeGesture() {
 
 function handlePracticeKeydown(event) {
   if (event.key === "Escape") {
-    closeProfileMenu();
+    if (state.ai.drawerOpen) {
+      closePracticeAIDrawer();
+      return;
+    }
     if (!document.body.classList.contains("in-session")) return;
     setPracticeOutline(false);
     return;
   }
   if (!document.body.classList.contains("in-session")) return;
+  if (state.ai.drawerOpen) return;
   if (event.target.matches("input, textarea, select")) return;
   if (event.key === "ArrowLeft") moveSession(-1);
   if (event.key === "ArrowRight") moveSession(1);
@@ -4012,7 +4346,7 @@ async function saveProviderSettings(form) {
   const button = $('button[type="submit"]', form);
   setButtonBusy(button, true, "保存中");
   try {
-    const config = { api_url: values.api_url, model: values.model };
+    const config = { base_url: values.base_url, model: values.model };
     if (provider === "embedding") config.dimensions = Number(values.dimensions);
     if (values.api_key) config.api_key = values.api_key;
     state.adminData.settings = await api("/admin/settings", { method: "PUT", body: { providers: { [provider]: config } } });
@@ -4055,7 +4389,7 @@ function providerPreview(provider) {
   const values = Object.fromEntries(new FormData(form));
   return {
     provider,
-    api_url: values.api_url,
+    base_url: values.base_url,
     model: values.model,
     api_key: values.api_key || undefined,
     dimensions: provider === "embedding" ? Number(values.dimensions) : undefined,
@@ -4522,10 +4856,10 @@ function textEditorModal(title, value, maxLength, confirmLabel) {
   });
 }
 
-function confirmModal(title, message, confirmLabel = "确认") {
+function confirmModal(title, message, confirmLabel = "确认", danger = false) {
   return new Promise((resolve) => {
     const root = $("#modal-root");
-    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><h2 id="modal-title">${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="button" data-modal="confirm">${escapeHtml(confirmLabel)}</button></div></section></div>`;
+    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><h2 id="modal-title">${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button ${danger ? "button-danger" : "button-primary"}" type="button" data-modal="confirm">${escapeHtml(confirmLabel)}</button></div></section></div>`;
     const finish = (value) => { root.innerHTML = ""; resolve(value); };
     $('[data-modal="cancel"]', root).addEventListener("click", () => finish(false));
     $('[data-modal="confirm"]', root).addEventListener("click", () => finish(true));

@@ -17,7 +17,7 @@
 - 个人中心：预设头像使用 `public/avatars/preset-*.svg` 统一风格资源；本地图片在浏览器中拖动/缩放裁剪为正方形 WebP 后上传，服务端再次校验并转码为 512×512 WebP，存入 `state/app.sqlite3.user_avatars`。错题、收藏、笔记、评论和点赞入口只保留在题库顶部。
 - 本地 state 不上传生产，生产独立创建数据库和 key。
 
-AI 学习助手使用同一个 `state/app.sqlite3` 保存账号隔离的 `ai_conversations` 与 `ai_messages`。发送消息时服务端从加密设置库读取已保存的 LLM 配置，检索最多 6 条题库材料后执行一次非流式请求；未配置或上游失败返回安全的 `ai_unavailable`，不会返回密钥或供应商原始响应。会话列表、新建、重命名、删除和消息读写分别受登录会话与 CSRF 保护。
+AI 学习助手使用同一个 `state/app.sqlite3` 保存账号隔离的 `ai_conversations` 与 `ai_messages`。会话可用 `context_occurrence_id/context_collection_id` 绑定一条原题；答案解析解锁后，刷题页在原题上方打开桌面右侧/手机底部抽屉，同一 occurrence 优先恢复最近绑定会话，不改变 hash、题号、作答草稿或背景滚动，且打开本身不发起模型请求。发送消息时服务端从加密设置库读取已保存的 LLM 配置，检索最多 6 条题库材料后执行一次非流式请求；未配置或上游失败返回安全的 `ai_unavailable`，不会返回密钥或供应商原始响应。会话列表、新建、重命名、删除和消息读写分别受登录会话与 CSRF 保护。
 
 API URL 不允许包含用户名、密码、query 密钥或 fragment。供应商错误正文不得原样透传。聊天、截图或日志中出现过的密钥必须先在供应商后台轮换，再通过 HTTPS 设置页录入。
 
@@ -30,8 +30,8 @@ API URL 不允许包含用户名、密码、query 密钥或 fragment。供应商
 - 默认搜索结果数；
 - 是否启用语义搜索；
 - 默认 keyword / semantic / hybrid；
-- 嵌入 API URL、模型、维度和密钥；
-- 大模型 API URL、模型和密钥；
+- 嵌入基础网址、模型、维度和密钥；
+- 大模型基础网址、模型和密钥；
 - 用户创建、启停和角色状态；
 - 用户角色调整、密码重置和既有会话撤销；
 - 全站评论管理（筛选、查看来源和管理员删除）；
@@ -40,7 +40,8 @@ API URL 不允许包含用户名、密码、query 密钥或 fragment。供应商
 ## 默认嵌入配置
 
 ```text
-API URL: https://api.siliconflow.cn/v1/embeddings
+基础网址: https://api.siliconflow.cn/v1
+实际嵌入端点: https://api.siliconflow.cn/v1/embeddings
 模型: Qwen/Qwen3-Embedding-0.6B
 维度: 1024
 单位: 一道规范题
@@ -95,7 +96,7 @@ knowledge-base/
 
 搜索标签只更新筛选偏好和已有查询结果，不主动调用搜索框 `focus()`；手机端只有用户直接点击输入框时才打开输入法。
 
-模型管理中的嵌入模型和大语言模型使用两个独立表单，各自拥有模型下拉、测试连接和保存配置按钮。API 密钥输入框在停顿约 700ms 后调用管理员临时模型发现接口；临时请求可以使用尚未保存的密钥，服务端不将该密钥写入设置数据库、响应、日志或 manifest。模型列表通过上游 `/v1/models` 获取，并按 embedding/rerank 能力标记分别过滤。
+模型管理中的嵌入模型和大语言模型使用两个独立表单，各自拥有基础网址、派生端点预览、模型下拉、测试连接和保存配置按钮。基础网址拒绝内嵌用户名/密码、query 和 fragment；只输入域名时补 `/v1`，输入已有 `/models`、`/embeddings` 或 `/chat/completions` 完整端点时先规范化回基础网址，再派生模型列表、嵌入和聊天实际地址。数据库和向量 manifest 继续保存最终实际请求 URL，确保既有向量兼容校验不含糊。API 密钥输入框在停顿约 700ms 后调用管理员临时模型发现接口；临时请求可以使用尚未保存的密钥，服务端不将该密钥写入设置数据库、响应、日志或 manifest。模型列表通过派生的 `<base>/models` 获取，并按 embedding/rerank 能力标记分别过滤。
 
 语义索引必须匹配当前 catalog ID、题目 ID 哈希、API URL、模型和维度。任一不匹配都返回明确的 unavailable 状态，不自动使用错误索引。
 

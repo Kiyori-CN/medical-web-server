@@ -160,6 +160,36 @@ def test_practice_blueprint_requires_login_and_csrf(
     restored = client.put(archive_url, headers=headers, json={"archived": False})
     assert restored.status_code == 200
     assert restored.get_json()["archived_at"] is None
+    delete_url = f"/api/study/sessions/{session['session_id']}"
+    assert client.delete(delete_url, headers=headers).status_code == 409
+    client.put(archive_url, headers=headers, json={"archived": True})
+    assert client.delete(delete_url).status_code == 403
+    deleted = client.delete(delete_url, headers=headers)
+    assert deleted.status_code == 200
+    assert deleted.get_json()["answers_deleted"] == 1
+    assert client.get("/api/study/sessions?status=archived").get_json()["total"] == 0
+    second = client.post(
+        "/api/practice/sessions",
+        headers=headers,
+        json={"count": 1, "filters": {"question_type": "单选题"}},
+    ).get_json()
+    client.put(
+        f"/api/study/sessions/{second['session_id']}/archive",
+        headers=headers,
+        json={"archived": True},
+    )
+    clear_url = "/api/study/sessions?status=archived"
+    assert client.delete(
+        clear_url, json={"confirmation": "DELETE_ARCHIVED"}
+    ).status_code == 403
+    assert client.delete(
+        clear_url, headers=headers, json={"confirmation": "delete"}
+    ).status_code == 400
+    cleared = client.delete(
+        clear_url, headers=headers, json={"confirmation": "DELETE_ARCHIVED"}
+    )
+    assert cleared.status_code == 200
+    assert cleared.get_json()["sessions_deleted"] == 1
 
 
 def test_study_goals_use_shanghai_day_boundary_and_track_streak(
@@ -287,6 +317,40 @@ def test_session_history_is_paginated_account_scoped_and_test_safe(
     assert store.session_history(status="active")["total"] == 1
     with pytest.raises(ValueError):
         store.session_history(status="deleted")
+
+
+def test_archived_session_deletion_is_explicit_and_account_scoped(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, store = _services(sample_source_tree, tmp_path)
+    first = store.create_session(count=1, filters={"question_type": "单选题"})
+    second = store.create_session(count=1, filters={"question_type": "单选题"})
+    other = PracticeStore(store.database_path, catalog, "other-user")
+    other.initialize()
+    other_session = other.create_session(count=1, filters={"question_type": "单选题"})
+
+    with pytest.raises(PracticeConflict):
+        store.delete_archived_session(first["session_id"])
+    store.set_session_archived(first["session_id"], True)
+    store.set_session_archived(second["session_id"], True)
+    other.set_session_archived(other_session["session_id"], True)
+    with pytest.raises(PracticeNotFound):
+        other.delete_archived_session(first["session_id"])
+    with pytest.raises(ValueError):
+        store.delete_all_archived_sessions("delete")
+
+    deleted = store.delete_archived_session(first["session_id"])
+    assert deleted == {
+        "removed": True,
+        "session_id": first["session_id"],
+        "sessions_deleted": 1,
+        "answers_deleted": 1,
+    }
+    cleared = store.delete_all_archived_sessions("DELETE_ARCHIVED")
+    assert cleared["sessions_deleted"] == 1
+    assert cleared["answers_deleted"] == 1
+    assert store.session_history(status="archived")["total"] == 0
+    assert other.session_history(status="archived")["total"] == 1
 
 
 def test_session_archive_migrates_legacy_state_without_losing_history(
