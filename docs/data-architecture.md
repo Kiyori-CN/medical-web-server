@@ -165,7 +165,7 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 
 `collection_question_progress` 以 `(profile_id, collection_id, occurrence_id)` 唯一定位题号目录状态。提交答案时同步更新该投影；点击题库重置只删除当前账号在当前 collection 的投影行。`practice_sessions` 和 `practice_session_questions` 仍保留为历史试卷，`question_progress`、`study_items` 和 `question_comments` 均不随文件重置删除。同一道规范题出现在其他文件时也不会被连带重置。
 
-练习记录不新增重复表。`PracticeStore.session_history()` 直接聚合当前 `profile_id` 的 `practice_sessions` 与 `practice_session_questions`，按最近答题或交卷时间倒序，以 `status + limit + offset` 返回摘要、状态统计和 `has_more`。进行中的 `test` 会话只暴露总题数、已答数和进度，正确数、错误数、未判数与正确率均返回空值；会话完成后复用既有详情接口解锁完整复盘。前端历史 hash 保存当前筛选，恢复会话后仍能返回同一历史列表；不提供删除历史的写接口。
+练习记录不新增重复表。`practice_sessions.archived_at` 通过兼容迁移新增，空值表示正常展示，时间值表示当前账号已归档；归档不改变 `status`、`completed_at`、答案或任何进度投影，可通过幂等 API 恢复。`PracticeStore.session_history()` 直接聚合当前 `profile_id` 的 `practice_sessions` 与 `practice_session_questions`，默认排除归档，以 `active/complete/archived + limit + offset` 返回摘要、四类状态统计和 `has_more`；同秒活动使用插入顺序稳定排序。进行中的 `test` 会话在归档前后都只暴露总题数、已答数和进度，成绩字段为空；归档活动会话拒绝提交和交卷，collection 续答入口忽略归档记录。前端历史 hash 保存当前筛选，恢复会话后仍能返回同一历史列表；不提供删除历史的写接口。
 
 `question_comments` 绑定具体 `occurrence_id`，同时保存 `question_id`、作者账号 ID、作者名快照、正文和时间。评论不写入 catalog、不依赖用户外键；所有登录用户可查看和发表，只有作者本人或管理员可以删除，正文去除首尾空白且最长 2000 字。
 
@@ -179,7 +179,7 @@ AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` �
 
 题库导出不创建新的事实源或状态表。`medical_app.catalog_export` 通过 SQLite `mode=ro` 与 `query_only` 读取当前激活 catalog，按 `collection_questions → question_occurrences → question_versions` 输出原题版本，并携带 collection 路径及位置。JSONL 使用结构化 `options`，CSV 使用 A–H 平铺列并中和电子表格公式前缀；生成器逐行读取，响应不缓存、不经 Nginx 缓冲，也不读取 `state/`。
 
-个人学习数据导出不创建新表。`medical_app.study_export` 通过 SQLite `mode=ro` 与 `query_only` 读取 `study_goals`、`study_items`、`question_notes`、`question_progress`、`collection_question_progress`、`practice_sessions` 和 `practice_session_questions`，每条查询都绑定当前会话的 `profile_id`。JSONL 以 `record_type` 区分学习目标、收藏/错题、笔记、进度、文件进度、会话和逐题作答；CSV 使用固定列并中和公式前缀。生成器逐行输出并返回 `private, no-store` 与 `X-Accel-Buffering: no`，不读取 catalog、设置密钥或其他账号状态。
+个人学习数据导出不创建新表。`medical_app.study_export` 通过 SQLite `mode=ro` 与 `query_only` 读取 `study_goals`、`study_items`、`question_notes`、`question_progress`、`collection_question_progress`、`practice_sessions` 和 `practice_session_questions`，每条查询都绑定当前会话的 `profile_id`。JSONL 以 `record_type` 区分学习目标、收藏/错题、笔记、进度、文件进度、会话和逐题作答，会话记录包含 `archived_at`；CSV 使用固定列并中和公式前缀。生成器逐行输出并返回 `private, no-store` 与 `X-Accel-Buffering: no`，不读取 catalog、设置密钥或其他账号状态。
 
 导入预检由 `medical_app.catalog_import` 管理权限固定为 `0700` 的 `state/import-staging/imp_*/`。目录内只保存随机命名的 `source.csv|jsonl|json` 和原子写入的 `manifest.json`；manifest 记录安全文件名、哈希、大小、字段、映射、行数、有限错误摘要与最多 10 条标准化样例。CSV/JSONL 逐行读取，JSON 受 16 MB 硬上限约束；任何预检都不调用 builder、不写 catalog、不改变激活指针或向量。后续正式导入必须从 staging 构建新的不可变 catalog 并在完整性检查后原子激活。
 

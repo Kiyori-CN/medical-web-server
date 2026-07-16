@@ -1,13 +1,19 @@
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from datetime import UTC, datetime, time, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from flask import Flask, g
 
 from medical_app.builder import build_catalog
 from medical_app.catalog import Catalog
-from medical_app.practice import PracticeConflict, PracticeForbidden, PracticeStore
+from medical_app.practice import (
+    PracticeConflict,
+    PracticeForbidden,
+    PracticeNotFound,
+    PracticeStore,
+)
 from medical_app.practice_api import create_practice_blueprint
 
 
@@ -137,6 +143,23 @@ def test_practice_blueprint_requires_login_and_csrf(
     assert history.get_json()["stats"]["complete"] == 1
     assert client.get("/api/study/sessions?status=deleted").status_code == 400
     assert client.get("/api/study/sessions?limit=invalid").status_code == 400
+    archive_url = f"/api/study/sessions/{session['session_id']}/archive"
+    assert client.put(archive_url, json={"archived": True}).status_code == 403
+    assert client.put(
+        archive_url, headers=headers, json={"archived": "true"}
+    ).status_code == 400
+    archived = client.put(archive_url, headers=headers, json={"archived": True})
+    assert archived.status_code == 200
+    assert archived.get_json()["archived"] is True
+    default_history = client.get("/api/study/sessions").get_json()
+    assert default_history["total"] == 0
+    assert default_history["stats"]["archived"] == 1
+    archived_history = client.get("/api/study/sessions?status=archived").get_json()
+    assert archived_history["total"] == 1
+    assert archived_history["items"][0]["archived_at"]
+    restored = client.put(archive_url, headers=headers, json={"archived": False})
+    assert restored.status_code == 200
+    assert restored.get_json()["archived_at"] is None
 
 
 def test_study_goals_use_shanghai_day_boundary_and_track_streak(
@@ -213,7 +236,12 @@ def test_session_history_is_paginated_account_scoped_and_test_safe(
     history = store.session_history(limit=1)
     assert history["total"] == 2
     assert history["has_more"] is True
-    assert history["stats"] == {"total": 2, "active": 1, "complete": 1}
+    assert history["stats"] == {
+        "total": 2,
+        "active": 1,
+        "complete": 1,
+        "archived": 0,
+    }
     second_page = store.session_history(limit=1, offset=1)
     assert len(second_page["items"]) == 1
     active = store.session_history(status="active")
@@ -227,8 +255,87 @@ def test_session_history_is_paginated_account_scoped_and_test_safe(
     assert complete["items"][0]["session_id"] == completed["session_id"]
     assert complete["items"][0]["summary"]["wrong"] == 1
     assert other.session_history()["total"] == 1
+    archived = store.set_session_archived(active_test["session_id"], True)
+    assert archived["archived"] is True
+    assert archived["archived_at"]
+    assert store.set_session_archived(active_test["session_id"], True) == archived
+    visible = store.session_history()
+    assert visible["total"] == 1
+    assert visible["stats"] == {
+        "total": 1,
+        "active": 0,
+        "complete": 1,
+        "archived": 1,
+    }
+    archived_history = store.session_history(status="archived")
+    assert archived_history["total"] == 1
+    assert archived_history["items"][0]["session_id"] == active_test["session_id"]
+    assert archived_history["items"][0]["summary"]["correct"] is None
+    archived_detail = store.get_session(active_test["session_id"])
+    assert archived_detail["archived_at"] == archived["archived_at"]
+    assert archived_detail["solution_visible"] is False
+    assert archived_detail["items"][0]["submission"]["is_correct"] is None
+    with pytest.raises(PracticeConflict):
+        store.submit_answer(active_test["session_id"], position=2, answer="A")
+    with pytest.raises(PracticeConflict):
+        store.finish_session(active_test["session_id"])
+    with pytest.raises(PracticeNotFound):
+        other.set_session_archived(active_test["session_id"], True)
+    restored = store.set_session_archived(active_test["session_id"], False)
+    assert restored["archived"] is False
+    assert restored["archived_at"] is None
+    assert store.session_history(status="active")["total"] == 1
     with pytest.raises(ValueError):
         store.session_history(status="deleted")
+
+
+def test_session_archive_migrates_legacy_state_without_losing_history(
+    sample_source_tree: Path, tmp_path: Path
+):
+    manifest = build_catalog(sample_source_tree, tmp_path / "builds")
+    catalog = Catalog(tmp_path / "builds" / manifest["build_id"] / "catalog.sqlite3")
+    database_path = tmp_path / "state" / "app.sqlite3"
+    database_path.parent.mkdir(parents=True)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE practice_sessions (
+                session_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                collection_id TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'practice',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                total_questions INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                duration_ms INTEGER,
+                saved_kind TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO practice_sessions(
+                session_id, profile_id, total_questions, created_at
+            ) VALUES ('sess_legacy', 'usr_test', 1, '2026-07-15T00:00:00+00:00')
+            """
+        )
+
+    store = PracticeStore(database_path, catalog, "usr_test")
+    assert store.initialize()["schema_revision"] == 6
+    with store.connect() as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(practice_sessions)")
+        }
+        indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(practice_sessions)")
+        }
+    assert "archived_at" in columns
+    assert "idx_practice_sessions_history" in indexes
+    assert store.session_history()["total"] == 1
+    assert store.set_session_archived("sess_legacy", True)["archived_at"]
+    assert store.session_history(status="archived")["total"] == 1
 
 
 def test_collection_order_memorize_mode_and_early_finish(
@@ -253,6 +360,16 @@ def test_collection_order_memorize_mode_and_early_finish(
     practice = store.create_session(
         collection_id=collection["collection_id"], count=None, mode="practice"
     )
+    assert store.collection_outline(collection["collection_id"])["active_session"][
+        "session_id"
+    ] == practice["session_id"]
+    store.set_session_archived(practice["session_id"], True)
+    assert store.collection_outline(collection["collection_id"])["active_session"][
+        "session_id"
+    ] == memorize["session_id"]
+    store.set_session_archived(memorize["session_id"], True)
+    assert store.collection_outline(collection["collection_id"])["active_session"] is None
+    store.set_session_archived(practice["session_id"], False)
     finished = store.finish_session(practice["session_id"])
     assert finished["status"] == "complete"
     assert finished["summary"]["answered"] == 0

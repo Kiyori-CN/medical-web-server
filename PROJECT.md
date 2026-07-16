@@ -60,7 +60,7 @@
 - 收藏是可取消的账号状态，错题可以在原路径目录或错题会话中删除。
 - 个人学习数据导出只读取当前账号的每日学习目标、收藏、错题、私有笔记、规范题/文件题进度、练习会话和逐题作答记录；JSONL/CSV 均流式输出，禁止跨账号读取或写入 catalog。
 - 题号目录重置只删除当前账号、当前 collection 的 `collection_question_progress` 投影，不删除历史会话、收藏、错题或评论；同一规范题在其他文件中的状态不受影响；
-- 练习记录直接读取 `practice_sessions` 与 `practice_session_questions`，不创建重复历史表；列表严格按 `profile_id` 隔离，支持全部/进行中/已完成与 `limit + offset` 分页。进行中的测试模式隐藏正确、错误和正确率，进行中记录恢复答题，已完成记录复用整卷复盘；个人历史不提供删除入口。
+- 练习记录直接读取 `practice_sessions` 与 `practice_session_questions`，不创建重复历史表；`archived_at` 是可逆归档标记，不改变会话状态、答案或进度。列表严格按 `profile_id` 隔离，默认排除归档，支持全部/进行中/已完成/已归档与 `limit + offset` 分页。进行中的测试模式在归档前后都隐藏成绩，归档会话不能提交或交卷；恢复后可继续答题，已完成记录复用整卷复盘，个人历史不提供删除入口。
 - 评论绑定具体 `occurrence_id` 并保存 `question_id` 和作者名快照；评论仅在答案解析解锁后显示于标准解析下方，所有登录用户可读写，作者可删除自己的评论，管理员可删除任意评论；
 - 私有笔记以 `(profile_id, occurrence_id)` 唯一保存，位于标准解析与评论之间；只允许当前账号读写，不进入 catalog、FTS、向量或搜题结果；
 - 练习模式底栏顺序为上一题、题号、提交答案、收藏、可选的删除错题、下一题；其他模式按实际可用操作自动填满宽度。
@@ -125,7 +125,7 @@ AI 会话 API 为 `GET/POST /api/ai/conversations`、`PATCH/DELETE /api/ai/conve
 
 学习目标 API 为 `GET/PUT /api/study/goals`，仅允许当前登录账号读取或更新自己的每日题数（1–1000）和学习时长（1–1440 分钟）目标，写入要求 CSRF。`GET /api/study/today-summary` 同时返回目标进度、连续学习天数和近 7 日趋势。
 
-练习历史 API 为 `GET /api/study/sessions?status=active|complete&limit=20&offset=0`，仅登录用户可读并按当前 `profile_id` 返回会话摘要、状态统计与 `has_more`。未传 `status` 表示全部，非法状态或分页参数返回 400；进行中的测试会话只返回进度，不返回成绩。
+练习历史 API 为 `GET /api/study/sessions?status=active|complete|archived&limit=20&offset=0`，仅登录用户可读并按当前 `profile_id` 返回会话摘要、状态统计与 `has_more`；未传 `status` 表示全部未归档记录。`PUT /api/study/sessions/<session_id>/archive` 以布尔 `archived` 幂等归档或恢复，要求 CSRF 与账号所有权；非法状态、布尔值或分页参数返回 400。归档不解锁进行中测试成绩，且归档活动会话拒绝作答和交卷。
 
 个人学习数据 API 为 `GET /api/study/export?format=jsonl|csv`，仅登录用户可读，按 `profile_id` 导出学习目标、收藏、错题、笔记、进度、会话和作答记录，响应禁止缓存和代理缓冲，CSV 公式前缀会被中和。
 

@@ -280,6 +280,13 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
             )
         )
 
+    @blueprint.put("/study/sessions/<session_id>/archive")
+    @login_required
+    @csrf_required
+    def set_session_archived(session_id: str):
+        data = _json_object()
+        return jsonify(store().set_session_archived(session_id, data.get("archived")))
+
     @blueprint.post("/study/comments/<comment_id>/reaction")
     @login_required
     @csrf_required

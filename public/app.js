@@ -1231,6 +1231,8 @@ function renderPractice() {
   const question = item.question;
   const submitted = item.submission;
   const isComplete = session.status === "complete";
+  const isArchived = Boolean(session.archived_at);
+  const isReadOnly = isComplete || isArchived;
   const mode = session.mode || "practice";
   const meta = modeMeta(mode);
   const reveal = session.solution_visible || (Boolean(submitted) && mode !== "test");
@@ -1238,20 +1240,22 @@ function renderPractice() {
   const source = (question.sources || [])[0] || {};
   const occurrenceId = Number(question.occurrence_id || item.occurrence_id || source.occurrence_id) || null;
   const title = fileTitle(source.relative_path || session.collection_id || "练习");
-  const answerMarkup = renderAnswerArea(item, draft, reveal, isComplete);
+  const answerMarkup = renderAnswerArea(item, draft, reveal, isReadOnly);
   const summary = session.summary || {};
   const canPrev = index > 0;
   const isLast = index === session.items.length - 1;
-  const showSubmit = mode === "practice" && !submitted && !isComplete;
+  const showSubmit = mode === "practice" && !submitted && !isReadOnly;
   const finishButton = ["practice", "test"].includes(mode)
-    ? `<button class="button button-danger button-small" type="button" data-action="finish-session" ${isComplete ? "disabled" : ""}>${isComplete ? "已交卷" : "交卷"}</button>`
+    ? `<button class="button button-danger button-small" type="button" data-action="finish-session" ${isReadOnly ? "disabled" : ""}>${isArchived ? "已归档" : isComplete ? "已交卷" : "交卷"}</button>`
     : "";
   const returnKind = state.sessionReturnTarget?.kind === "personal"
     ? studyReturnLabel(state.sessionReturnTarget.hash)
     : session.saved_kind === "favorite"
       ? "收藏"
       : session.saved_kind === "wrong" ? "错题" : "题库";
-  const statusNote = mode === "speed" && submitted && submitted.is_correct === false
+  const statusNote = isArchived
+    ? `<p class="practice-feedback-note">此练习已归档，恢复后才能继续作答。</p>`
+    : mode === "speed" && submitted && submitted.is_correct === false
     ? `<p class="practice-feedback-note wrong">未选中正确答案，答案与解析已展开；确认后可继续下一题。</p>`
     : mode === "test" && !isComplete
       ? `<p class="practice-feedback-note">测试进行中，交卷前不会显示对错。</p>`
@@ -1270,7 +1274,7 @@ function renderPractice() {
     <div class="practice-top practice-top-immersive ${finishButton ? "has-finish" : ""}">
       <button class="button button-secondary" type="button" data-action="leave-session" aria-label="返回${returnKind}">‹ <span>返回${returnKind}</span></button>
       <div class="practice-top-main"><h1>${escapeHtml(title)}</h1><p><span class="mode-chip mode-${mode}">${meta.label}</span> · ${summary.answered || 0}/${summary.total || session.items.length} 已完成</p></div>
-      <span class="timer-pill" id="practice-timer" aria-label="本次练习用时">◷ ${sessionDuration()}</span>
+      ${isArchived ? `<span class="timer-pill" aria-label="练习归档状态">已归档</span>` : `<span class="timer-pill" id="practice-timer" aria-label="本次练习用时">◷ ${sessionDuration()}</span>`}
       ${finishButton}
     </div>
     <div class="practice-layout">
@@ -1319,7 +1323,7 @@ function renderPractice() {
   }
 }
 
-function renderAnswerArea(item, draft, reveal, isComplete) {
+function renderAnswerArea(item, draft, reveal, isReadOnly) {
   const question = item.question;
   const submitted = item.submission;
   const mode = state.session.mode || "practice";
@@ -1337,8 +1341,8 @@ function renderAnswerArea(item, draft, reveal, isComplete) {
     const selected = new Set(String(submitted?.answer || draft).split(""));
     const correctAnswer = submitted?.correct_answer || (reveal ? question.answer || "" : "");
     const correct = new Set(String(correctAnswer).split(""));
-    const canSpeedRetry = mode === "speed" && submitted && submitted.is_correct === false && !isComplete;
-    const disabled = isComplete || (submitted && !canSpeedRetry);
+    const canSpeedRetry = mode === "speed" && submitted && submitted.is_correct === false && !isReadOnly;
+    const disabled = isReadOnly || (submitted && !canSpeedRetry);
     return `<div class="answer-options">${options.map((option) => {
       const classes = ["answer-option"];
       if (selected.has(option.label)) classes.push("selected");
@@ -1348,7 +1352,7 @@ function renderAnswerArea(item, draft, reveal, isComplete) {
       return `<button class="${classes.join(" ")}" type="button" data-action="select-option" data-label="${escapeAttr(option.label)}" ${disabled ? "disabled" : ""}><span class="option-label">${escapeHtml(option.label)}</span><span class="option-text">${escapeHtml(option.text)}</span>${stateMark ? `<span class="option-state" aria-label="${stateMark}"></span>` : ""}</button>`;
     }).join("")}</div>`;
   }
-  return `<div class="subjective-answer"><label class="field"><span>作答内容</span><textarea id="subjective-draft" data-action="subjective-draft" placeholder="输入你的答案" ${(submitted || isComplete) ? "disabled" : ""}>${escapeHtml(submitted?.answer || draft)}</textarea></label></div>`;
+  return `<div class="subjective-answer"><label class="field"><span>作答内容</span><textarea id="subjective-draft" data-action="subjective-draft" placeholder="输入你的答案" ${(submitted || isReadOnly) ? "disabled" : ""}>${escapeHtml(submitted?.answer || draft)}</textarea></label></div>`;
 }
 
 function renderReviewOptions(options, answer) {
@@ -1686,6 +1690,10 @@ async function finishCurrentSession() {
 
 function startTimer() {
   stopTimer();
+  if (state.session?.status === "complete" || state.session?.archived_at) {
+    updateTimerText();
+    return;
+  }
   state.timerHandle = window.setInterval(updateTimerText, 1000);
   updateTimerText();
 }
@@ -1749,13 +1757,13 @@ async function renderMyHomePage() {
 }
 
 function practiceHistoryRouteHash(status = "") {
-  const normalized = ["active", "complete"].includes(status) ? status : "";
+  const normalized = ["active", "complete", "archived"].includes(status) ? status : "";
   return normalized ? `#history?status=${normalized}` : "#history";
 }
 
 async function renderPracticeHistoryPage(status = "") {
   const container = $("#page-history");
-  state.practiceHistoryStatus = ["active", "complete"].includes(status) ? status : "";
+  state.practiceHistoryStatus = ["active", "complete", "archived"].includes(status) ? status : "";
   container.innerHTML = `${practiceHistoryHeader()}${loadingMarkup("正在读取练习记录")}`;
   try {
     const params = new URLSearchParams({ limit: "20", offset: "0" });
@@ -1779,10 +1787,11 @@ function renderPracticeHistoryContent() {
     ["", "全部", stats.total || 0],
     ["active", "进行中", stats.active || 0],
     ["complete", "已完成", stats.complete || 0],
+    ["archived", "已归档", stats.archived || 0],
   ];
   $("#page-history").innerHTML = `${practiceHistoryHeader()}
     <nav class="history-tabs card" aria-label="练习记录状态">${tabs.map(([value, label, count]) => `<button class="${state.practiceHistoryStatus === value ? "active" : ""}" type="button" data-action="history-status" data-status="${value}" aria-pressed="${state.practiceHistoryStatus === value}"><span>${label}</span><small>${formatNumber(count)}</small></button>`).join("")}</nav>
-    <section class="history-list" aria-live="polite">${items.length ? items.map(practiceHistoryCard).join("") : emptyMarkup("暂无练习记录", state.practiceHistoryStatus === "active" ? "当前没有未完成练习。" : state.practiceHistoryStatus === "complete" ? "完成练习后会显示在这里。" : "开始一次刷题后会保留记录。", "◷")}</section>
+    <section class="history-list" aria-live="polite">${items.length ? items.map(practiceHistoryCard).join("") : emptyMarkup("暂无练习记录", state.practiceHistoryStatus === "active" ? "当前没有未完成练习。" : state.practiceHistoryStatus === "complete" ? "完成练习后会显示在这里。" : state.practiceHistoryStatus === "archived" ? "归档的练习会保留在这里并可随时恢复。" : "开始一次刷题后会保留记录。", "◷")}</section>
     ${payload.has_more ? `<button class="button button-secondary history-load-more" type="button" data-action="history-load-more">加载更多</button>` : ""}`;
 }
 
@@ -1793,13 +1802,21 @@ function practiceModeLabel(mode) {
 function practiceHistoryCard(item) {
   const summary = item.summary || {};
   const completed = item.status === "complete";
+  const archived = Boolean(item.archived_at);
   const resultsVisible = summary.correct !== null && summary.correct !== undefined;
   const resultCopy = resultsVisible
     ? `<span>正确 ${formatNumber(summary.correct || 0)}</span><span>错误 ${formatNumber(summary.wrong || 0)}</span>${summary.accuracy !== null ? `<span>正确率 ${formatNumber(summary.accuracy)}%</span>` : ""}`
     : `<span>测试进行中，交卷前隐藏成绩</span>`;
   const duration = completed && item.duration_ms != null ? ` · ${formatHistoryDuration(item.duration_ms)}` : "";
   const source = item.relative_path ? `<small>${escapeHtml(displaySourcePath(item.relative_path))}</small>` : "";
-  return `<article class="card history-card"><div class="history-card-head"><div><span class="status-pill ${completed ? "complete" : "active"}">${completed ? "已完成" : "进行中"}</span><span class="history-mode">${escapeHtml(practiceModeLabel(item.mode))}</span></div><time>${escapeHtml(formatDate(item.last_activity_at))}</time></div><div class="history-card-title"><h2>${escapeHtml(item.title || "练习")}</h2>${source}</div><div class="history-progress"><span><strong>${formatNumber(summary.answered || 0)} / ${formatNumber(summary.total || 0)}</strong><small>已答题</small></span><progress max="100" value="${Math.max(0, Math.min(100, Number(summary.progress || 0)))}" aria-label="练习完成进度"></progress></div><div class="history-card-foot"><div class="history-results">${resultCopy}<small>创建于 ${escapeHtml(formatDate(item.created_at))}${duration}</small></div><button class="button ${completed ? "button-secondary" : "button-primary"} button-small" type="button" data-action="open-history-session" data-session-id="${escapeAttr(item.session_id)}">${completed ? "查看复盘" : "继续答题"}</button></div></article>`;
+  const statusClass = archived ? "archived" : completed ? "complete" : "active";
+  const statusLabel = archived ? "已归档" : completed ? "已完成" : "进行中";
+  const modeLabel = archived
+    ? `${practiceModeLabel(item.mode)} · ${completed ? "已完成" : "未完成"}`
+    : practiceModeLabel(item.mode);
+  const openAction = archived ? "" : `<button class="button ${completed ? "button-secondary" : "button-primary"} button-small" type="button" data-action="open-history-session" data-session-id="${escapeAttr(item.session_id)}">${completed ? "查看复盘" : "继续答题"}</button>`;
+  const archiveAction = `<button class="button ${archived ? "button-primary" : "button-quiet"} button-small" type="button" data-action="toggle-history-archive" data-session-id="${escapeAttr(item.session_id)}" data-archived="${archived}">${archived ? "恢复" : "归档"}</button>`;
+  return `<article class="card history-card"><div class="history-card-head"><div><span class="status-pill ${statusClass}">${statusLabel}</span><span class="history-mode">${escapeHtml(modeLabel)}</span></div><time>${escapeHtml(formatDate(item.last_activity_at))}</time></div><div class="history-card-title"><h2>${escapeHtml(item.title || "练习")}</h2>${source}</div><div class="history-progress"><span><strong>${formatNumber(summary.answered || 0)} / ${formatNumber(summary.total || 0)}</strong><small>已答题</small></span><progress max="100" value="${Math.max(0, Math.min(100, Number(summary.progress || 0)))}" aria-label="练习完成进度"></progress></div><div class="history-card-foot"><div class="history-results">${resultCopy}<small>创建于 ${escapeHtml(formatDate(item.created_at))}${duration}</small></div><div class="history-card-actions">${openAction}${archiveAction}</div></div></article>`;
 }
 
 function formatHistoryDuration(value) {
@@ -1823,6 +1840,27 @@ async function loadMorePracticeHistory(button) {
     const next = await api(`/study/sessions?${params}`);
     state.practiceHistory = { ...next, items: [...(payload.items || []), ...(next.items || [])] };
     renderPracticeHistoryContent();
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function togglePracticeHistoryArchive(button) {
+  const sessionId = button.dataset.sessionId || "";
+  const archived = button.dataset.archived === "true";
+  if (!sessionId) return;
+  setButtonBusy(button, true, archived ? "恢复中" : "归档中");
+  try {
+    const result = await api(`/study/sessions/${encodeURIComponent(sessionId)}/archive`, {
+      method: "PUT",
+      body: { archived: !archived },
+    });
+    if (state.session?.session_id === sessionId) {
+      state.session.archived_at = result.archived_at || null;
+    }
+    showToast(archived ? "练习已恢复" : "练习已归档");
+    await renderPracticeHistoryPage(state.practiceHistoryStatus);
   } catch (error) {
     showToast(error.message, "error");
     setButtonBusy(button, false);
@@ -3337,6 +3375,7 @@ async function handleClick(event) {
   if (action === "history-status") return navigateHash(practiceHistoryRouteHash(target.dataset.status || ""));
   if (action === "history-load-more") return loadMorePracticeHistory(target);
   if (action === "open-history-session") return openHistorySession(target.dataset.sessionId);
+  if (action === "toggle-history-archive") return togglePracticeHistoryArchive(target);
   if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
   if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(publicProfileRouteHash(target.dataset.userId || state.user.user_id, state.profileReturnHash)); }
   if (action === "open-forum-dynamic") return navigateHash(forumRouteHash({ topic: target.dataset.topic, returnHash: location.hash || "#profile" }));

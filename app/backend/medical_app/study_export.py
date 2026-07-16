@@ -40,6 +40,7 @@ EXPORT_COLUMNS = (
     "filters_json",
     "total_questions",
     "status",
+    "archived_at",
     "completed_at",
     "duration_ms",
     "saved_kind",
@@ -164,7 +165,7 @@ def _iter_records(
             "session",
             """
             SELECT session_id, collection_id, mode, filters_json, total_questions,
-                   status, created_at, completed_at, duration_ms, saved_kind
+                   status, created_at, archived_at, completed_at, duration_ms, saved_kind
             FROM practice_sessions
             WHERE profile_id = ?
             ORDER BY created_at DESC, session_id

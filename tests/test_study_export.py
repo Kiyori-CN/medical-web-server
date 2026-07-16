@@ -43,6 +43,7 @@ def test_personal_study_export_is_streamed_and_account_scoped(
     alice.submit_answer(
         session["session_id"], position=session_item["position"], answer="B"
     )
+    alice.set_session_archived(session["session_id"], True)
     alice.update_study_goal(42, 55)
 
     bob.add_favorite(
@@ -85,6 +86,10 @@ def test_personal_study_export_is_streamed_and_account_scoped(
     study_goal = next(record for record in records if record["record_type"] == "study_goal")
     assert study_goal["daily_question_target"] == 42
     assert study_goal["daily_duration_target_minutes"] == 55
+    exported_session = next(
+        record for record in records if record["record_type"] == "session"
+    )
+    assert exported_session["archived_at"]
     assert not any(
         record["record_type"] in {"study_item", "note"}
         and record.get("occurrence_id") == other_item["occurrence_id"]

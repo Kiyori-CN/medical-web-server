@@ -12,7 +12,7 @@ from .catalog import Catalog
 from .normalize import display_text, normalize_answer
 
 
-APP_SCHEMA_REVISION = 5
+APP_SCHEMA_REVISION = 6
 COMMENT_MAX_LENGTH = 2000
 NOTE_MAX_LENGTH = 10000
 STUDY_TIME_ZONE_NAME = "Asia/Shanghai"
@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS practice_sessions (
     created_at TEXT NOT NULL,
     completed_at TEXT,
     duration_ms INTEGER,
-    saved_kind TEXT NOT NULL DEFAULT ''
+    saved_kind TEXT NOT NULL DEFAULT '',
+    archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS practice_session_questions (
@@ -271,11 +272,18 @@ class PracticeStore:
         for name, declaration in (
             ("duration_ms", "INTEGER"),
             ("saved_kind", "TEXT NOT NULL DEFAULT ''"),
+            ("archived_at", "TEXT"),
         ):
             if name not in session_columns:
                 connection.execute(
                     f"ALTER TABLE practice_sessions ADD COLUMN {name} {declaration}"
                 )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_practice_sessions_history
+            ON practice_sessions(profile_id, archived_at, status, created_at DESC)
+            """
+        )
         question_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(practice_session_questions)")
@@ -624,6 +632,7 @@ class PracticeStore:
             "created_at": session["created_at"],
             "completed_at": session["completed_at"],
             "duration_ms": session["duration_ms"],
+            "archived_at": session["archived_at"],
             "solution_visible": reveal_all,
             "summary": {
                 "total": session["total_questions"],
@@ -643,7 +652,7 @@ class PracticeStore:
         offset: object = 0,
     ) -> dict[str, Any]:
         status_value = display_text(status).lower()
-        if status_value and status_value not in {"active", "complete"}:
+        if status_value and status_value not in {"active", "complete", "archived"}:
             raise ValueError("练习记录状态无效")
         try:
             limit_value = max(1, min(int(limit), 100))
@@ -652,7 +661,11 @@ class PracticeStore:
             raise ValueError("练习记录分页参数无效") from error
         conditions = ["s.profile_id = ?"]
         parameters: list[object] = [self.profile_id]
-        if status_value:
+        if status_value == "archived":
+            conditions.append("s.archived_at IS NOT NULL")
+        else:
+            conditions.append("s.archived_at IS NULL")
+        if status_value in {"active", "complete"}:
             conditions.append("s.status = ?")
             parameters.append(status_value)
         where = " AND ".join(conditions)
@@ -665,28 +678,32 @@ class PracticeStore:
                 f"""
                 SELECT s.session_id, s.collection_id, s.mode, s.filters_json,
                        s.total_questions, s.status, s.created_at, s.completed_at,
-                       s.duration_ms, s.saved_kind,
+                       s.duration_ms, s.saved_kind, s.archived_at,
                        SUM(CASE WHEN q.answered_at IS NOT NULL THEN 1 ELSE 0 END) AS answered,
                        SUM(CASE WHEN q.is_correct = 1 THEN 1 ELSE 0 END) AS correct,
                        SUM(CASE WHEN q.is_correct = 0 THEN 1 ELSE 0 END) AS wrong,
                        SUM(CASE WHEN q.answered_at IS NOT NULL AND q.is_correct IS NULL THEN 1 ELSE 0 END) AS ungraded,
-                       COALESCE(s.completed_at, MAX(q.answered_at), s.created_at) AS last_activity_at
+                       COALESCE(s.archived_at, s.completed_at, MAX(q.answered_at), s.created_at) AS last_activity_at
                 FROM practice_sessions s
                 LEFT JOIN practice_session_questions q ON q.session_id = s.session_id
                 WHERE {where}
                 GROUP BY s.session_id
-                ORDER BY last_activity_at DESC, s.session_id DESC
+                ORDER BY last_activity_at DESC, s.rowid DESC
                 LIMIT ? OFFSET ?
                 """,
                 (*parameters, limit_value, offset_value),
             ).fetchall()
-            stats_rows = connection.execute(
+            stats_row = connection.execute(
                 """
-                SELECT status, COUNT(*) AS count
-                FROM practice_sessions WHERE profile_id = ? GROUP BY status
+                SELECT
+                    SUM(CASE WHEN archived_at IS NULL THEN 1 ELSE 0 END) AS total,
+                    SUM(CASE WHEN archived_at IS NULL AND status = 'active' THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN archived_at IS NULL AND status = 'complete' THEN 1 ELSE 0 END) AS complete,
+                    SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END) AS archived
+                FROM practice_sessions WHERE profile_id = ?
                 """,
                 (self.profile_id,),
-            ).fetchall()
+            ).fetchone()
         finally:
             connection.close()
         collection_ids = list(
@@ -722,6 +739,7 @@ class PracticeStore:
                     "saved_kind": row["saved_kind"],
                     "created_at": row["created_at"],
                     "completed_at": row["completed_at"],
+                    "archived_at": row["archived_at"],
                     "last_activity_at": row["last_activity_at"] or row["created_at"],
                     "duration_ms": row["duration_ms"],
                     "summary": {
@@ -743,11 +761,10 @@ class PracticeStore:
                     },
                 }
             )
-        stats = {"total": 0, "active": 0, "complete": 0}
-        for row in stats_rows:
-            count = int(row["count"])
-            stats[row["status"]] = count
-            stats["total"] += count
+        stats = {
+            key: int(stats_row[key] or 0)
+            for key in ("total", "active", "complete", "archived")
+        }
         return {
             "items": items,
             "total": int(total),
@@ -756,6 +773,45 @@ class PracticeStore:
             "offset": offset_value,
             "has_more": offset_value + len(items) < int(total),
             "stats": stats,
+        }
+
+    def set_session_archived(self, session_id: object, archived: object) -> dict[str, Any]:
+        session_id_value = display_text(session_id)
+        if not isinstance(archived, bool):
+            raise ValueError("归档状态必须是布尔值")
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT status, archived_at FROM practice_sessions
+                WHERE session_id = ? AND profile_id = ?
+                """,
+                (session_id_value, self.profile_id),
+            ).fetchone()
+            if row is None:
+                raise PracticeNotFound("Practice session not found")
+            archived_at = row["archived_at"]
+            if bool(archived_at) != archived:
+                archived_at = _utc_now() if archived else None
+                connection.execute(
+                    """
+                    UPDATE practice_sessions SET archived_at = ?
+                    WHERE session_id = ? AND profile_id = ?
+                    """,
+                    (archived_at, session_id_value, self.profile_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {
+            "session_id": session_id_value,
+            "status": row["status"],
+            "archived": archived,
+            "archived_at": archived_at,
         }
 
     @staticmethod
@@ -797,7 +853,8 @@ class PracticeStore:
                 SELECT session_id, mode, total_questions, created_at
                 FROM practice_sessions
                 WHERE profile_id = ? AND collection_id = ? AND status = 'active'
-                ORDER BY created_at DESC LIMIT 1
+                  AND archived_at IS NULL
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
                 """,
                 (self.profile_id, collection_id),
             ).fetchone()
@@ -2158,7 +2215,7 @@ class PracticeStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT ps.status, ps.mode, ps.collection_id,
+                SELECT ps.status, ps.mode, ps.collection_id, ps.archived_at,
                        psq.question_id, psq.occurrence_id, psq.answered_at
                 FROM practice_sessions ps
                 JOIN practice_session_questions psq ON psq.session_id = ps.session_id
@@ -2168,6 +2225,8 @@ class PracticeStore:
             ).fetchone()
             if row is None:
                 raise PracticeNotFound("Practice question not found")
+            if row["archived_at"]:
+                raise PracticeConflict("归档练习需先恢复")
             if row["answered_at"]:
                 raise PracticeConflict("This question has already been answered")
             if row["status"] != "active":
@@ -2379,7 +2438,7 @@ class PracticeStore:
             with connection:
                 row = connection.execute(
                     """
-                    SELECT created_at, status
+                    SELECT created_at, status, archived_at
                     FROM practice_sessions
                     WHERE session_id = ? AND profile_id = ?
                     """,
@@ -2387,6 +2446,8 @@ class PracticeStore:
                 ).fetchone()
                 if row is None:
                     raise PracticeNotFound("Practice session not found")
+                if row["archived_at"]:
+                    raise PracticeConflict("归档练习需先恢复")
                 if row["status"] == "active":
                     created_at = datetime.fromisoformat(row["created_at"])
                     duration_ms = max(0, int((now - created_at).total_seconds() * 1000))
@@ -2725,7 +2786,7 @@ class PracticeStore:
                 """
                 SELECT
                     (SELECT COUNT(*) FROM practice_sessions) AS sessions,
-                    (SELECT COUNT(*) FROM practice_sessions WHERE status = 'active') AS active_practice,
+                    (SELECT COUNT(*) FROM practice_sessions WHERE status = 'active' AND archived_at IS NULL) AS active_practice,
                     (SELECT COUNT(*) FROM practice_session_questions WHERE answered_at IS NOT NULL) AS answers,
                     (SELECT COUNT(*) FROM study_items WHERE kind = 'favorite') AS favorites,
                     (SELECT COUNT(*) FROM study_items WHERE kind = 'wrong') AS wrong_items,
