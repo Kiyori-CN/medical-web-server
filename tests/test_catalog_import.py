@@ -1,6 +1,7 @@
 from io import BytesIO
 
 import pytest
+from openpyxl import Workbook
 from werkzeug.datastructures import FileStorage
 
 from medical_app.catalog_import import CatalogImportPreviewStore
@@ -8,6 +9,22 @@ from medical_app.catalog_import import CatalogImportPreviewStore
 
 def _upload(filename: str, content: str) -> FileStorage:
     return FileStorage(stream=BytesIO(content.encode("utf-8")), filename=filename)
+
+
+def _xlsx_upload(filename: str = "questions.xlsx") -> FileStorage:
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "第一章"
+    first.append(["题型", "题目", "选项A", "选项B", "答案", "答案解析"])
+    first.append(["单选题", "人体最大的器官是", "皮肤", "肝脏", "A", "皮肤覆盖体表。"])
+    second = workbook.create_sheet("第二章")
+    second.append(["题型", "题目", "选项A", "选项B", "答案", "答案解析"])
+    second.append(["判断题", "成人通常有 32 颗恒牙", "正确", "错误", "A", "不计智齿时会有差异。"])
+    stream = BytesIO()
+    workbook.save(stream)
+    workbook.close()
+    stream.seek(0)
+    return FileStorage(stream=stream, filename=filename)
 
 
 def test_catalog_import_preview_auto_mapping_errors_and_cleanup(tmp_path):
@@ -70,11 +87,39 @@ def test_catalog_import_preview_supports_json_questions_array_and_empty_csv(tmp_
     assert empty_preview["errors"][0]["message"] == "没有可分析的数据行"
 
 
+def test_catalog_import_preview_supports_read_only_multisheet_xlsx(tmp_path):
+    store = CatalogImportPreviewStore(tmp_path / "staging")
+    store.initialize()
+    preview = store.create_preview(_xlsx_upload())
+
+    assert preview["status"] == "ready"
+    assert preview["extension"] == ".xlsx"
+    assert preview["mapping"]["stem"] == "题目"
+    assert preview["total_rows"] == preview["valid_rows"] == 2
+    assert [row["row"] for row in preview["preview"]] == ["第一章!2", "第二章!2"]
+    assert preview["preview"][0]["options"] == ["皮肤", "肝脏"]
+
+
+def test_catalog_import_preview_rejects_invalid_or_expanded_xlsx(
+    tmp_path, monkeypatch
+):
+    store = CatalogImportPreviewStore(tmp_path / "staging")
+    store.initialize()
+    with pytest.raises(ValueError, match="XLSX 文件格式无效"):
+        store.create_preview(_upload("broken.xlsx", "not-an-xlsx"))
+    monkeypatch.setattr(
+        "medical_app.catalog_import.MAX_XLSX_UNCOMPRESSED_BYTES", 1
+    )
+    with pytest.raises(ValueError, match="解压后不能超过"):
+        store.create_preview(_xlsx_upload("expanded.xlsx"))
+    assert store.list_previews() == []
+
+
 def test_catalog_import_preview_rejects_unsafe_inputs(tmp_path, monkeypatch):
     store = CatalogImportPreviewStore(tmp_path / "staging")
     store.initialize()
     with pytest.raises(ValueError, match="仅支持"):
-        store.create_preview(_upload("questions.xlsx", "not-an-xlsx"))
+        store.create_preview(_upload("questions.xls", "not-an-xls"))
     monkeypatch.setattr("medical_app.catalog_import.MAX_IMPORT_BYTES", 4)
     with pytest.raises(ValueError, match="不能超过"):
         store.create_preview(_upload("questions.csv", "题目\n内容过长\n"))

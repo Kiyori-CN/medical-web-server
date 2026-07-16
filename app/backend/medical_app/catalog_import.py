@@ -10,6 +10,7 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+from zipfile import BadZipFile, ZipFile
 
 from flask import Blueprint, jsonify, request
 from werkzeug.datastructures import FileStorage
@@ -23,8 +24,11 @@ MAX_IMPORT_ROWS = 50_000
 MAX_IMPORT_FIELDS = 128
 MAX_STAGED_IMPORTS = 30
 MAX_STAGED_BYTES = 256 * 1024 * 1024
+MAX_XLSX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+MAX_XLSX_ARCHIVE_ENTRIES = 2_000
+MAX_XLSX_HEADER_SCAN_ROWS = 50
 PREVIEW_ROWS = 10
-SUPPORTED_IMPORT_EXTENSIONS = {".csv", ".json", ".jsonl"}
+SUPPORTED_IMPORT_EXTENSIONS = {".csv", ".json", ".jsonl", ".xlsx"}
 IMPORT_FIELDS = (
     "stem",
     "raw_type",
@@ -86,7 +90,7 @@ def create_catalog_import_blueprint(state_root: str | Path) -> Blueprint:
     def create_import():
         upload = request.files.get("file")
         if upload is None:
-            raise ValueError("请选择 CSV、JSONL 或 JSON 文件")
+            raise ValueError("请选择 XLSX、CSV、JSONL 或 JSON 文件")
         return jsonify(store.create_preview(upload)), 201
 
     @blueprint.post("/<import_id>/analyze")
@@ -122,7 +126,7 @@ class CatalogImportPreviewStore:
         filename = _safe_filename(upload.filename)
         extension = Path(filename).suffix.lower()
         if extension not in SUPPORTED_IMPORT_EXTENSIONS:
-            raise ValueError("导入预检仅支持 CSV、JSONL 或 JSON 文件")
+            raise ValueError("导入预检仅支持 XLSX、CSV、JSONL 或 JSON 文件")
         import_id = self._new_import_id()
         directory = self._directory(import_id)
         directory.mkdir(mode=0o700)
@@ -336,6 +340,9 @@ def _iter_records(path: Path, extension: str):
         except UnicodeDecodeError as error:
             raise ValueError("文件必须使用 UTF-8 编码") from error
         return
+    if extension == ".xlsx":
+        yield from _iter_xlsx_records(path)
+        return
     if extension == ".jsonl":
         try:
             with path.open("r", encoding="utf-8-sig") as handle:
@@ -369,6 +376,81 @@ def _iter_records(path: Path, extension: str):
             yield row_number, None, "数组成员必须是 JSON 对象"
             continue
         yield row_number, item, ""
+
+
+def _iter_xlsx_records(path: Path):
+    _validate_xlsx_container(path)
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(
+            path,
+            read_only=True,
+            data_only=True,
+            keep_links=False,
+        )
+    except Exception as error:
+        raise ValueError("XLSX 文件格式无效") from error
+    try:
+        for worksheet in workbook.worksheets:
+            rows = worksheet.iter_rows(values_only=True)
+            headers: tuple[str, ...] = ()
+            header_row_number = 0
+            for header_row_number, row in enumerate(rows, start=1):
+                headers = tuple(display_text(value) for value in row)
+                if any(headers):
+                    break
+                if header_row_number >= MAX_XLSX_HEADER_SCAN_ROWS:
+                    raise ValueError(
+                        f"工作表 {worksheet.title} 前 50 行未找到表头"
+                    )
+            if not headers:
+                continue
+            named_headers = [header for header in headers if header]
+            if len(named_headers) > MAX_IMPORT_FIELDS:
+                raise ValueError("导入字段不能超过 128 个")
+            duplicate_headers = sorted(
+                {header for header in named_headers if named_headers.count(header) > 1}
+            )
+            if duplicate_headers:
+                joined = "、".join(duplicate_headers[:5])
+                raise ValueError(f"工作表 {worksheet.title} 存在重复表头：{joined}")
+            for row_number, row in enumerate(rows, start=header_row_number + 1):
+                if not any(display_text(value) for value in row):
+                    continue
+                record = {
+                    header: row[index] if index < len(row) else None
+                    for index, header in enumerate(headers)
+                    if header
+                }
+                yield f"{worksheet.title}!{row_number}", record, ""
+    except Exception as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+            ("导入字段", "工作表")
+        ):
+            raise
+        raise ValueError("XLSX 文件格式无效") from error
+    finally:
+        workbook.close()
+
+
+def _validate_xlsx_container(path: Path) -> None:
+    try:
+        with ZipFile(path) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_XLSX_ARCHIVE_ENTRIES:
+                raise ValueError("XLSX 压缩包文件数量异常")
+            if any(entry.flag_bits & 0x1 for entry in entries):
+                raise ValueError("XLSX 不支持加密工作簿")
+            if sum(entry.file_size for entry in entries) > MAX_XLSX_UNCOMPRESSED_BYTES:
+                raise ValueError("XLSX 解压后不能超过 256 MB")
+            names = {entry.filename for entry in entries}
+            if len(names) != len(entries):
+                raise ValueError("XLSX 压缩包包含重复成员")
+            if not {"[Content_Types].xml", "xl/workbook.xml"}.issubset(names):
+                raise ValueError("XLSX 文件格式无效")
+    except BadZipFile as error:
+        raise ValueError("XLSX 文件格式无效") from error
 
 
 def _suggest_mapping(columns: list[str]) -> dict[str, str]:

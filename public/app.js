@@ -3032,8 +3032,8 @@ function renderCatalogManagement(catalog, imports) {
     <div class="catalog-import-divider"></div>
     <form id="admin-catalog-import" class="settings-group catalog-import-card">
       <div><h3>导入预检</h3><p>上传文件只进入隔离 staging，用于字段识别、逐行校验和样例预览；预检不会构建、激活或覆盖当前 catalog。</p></div>
-      <label class="field"><span>题库文件</span><input name="file" type="file" accept=".csv,.jsonl,.json,text/csv,application/json" required></label>
-      <div class="catalog-export-actions"><span>支持 UTF-8 CSV、JSONL、JSON，单文件不超过 16 MB、50,000 行。</span><button class="button button-primary" type="submit">上传并预检</button></div>
+      <label class="field"><span>题库文件</span><input name="file" type="file" accept=".xlsx,.csv,.jsonl,.json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,application/json" required></label>
+      <div class="catalog-export-actions"><span>支持 XLSX、UTF-8 CSV、JSONL、JSON；单文件不超过 16 MB、50,000 行。</span><button class="button button-primary" type="submit">上传并预检</button></div>
     </form>
     ${renderCatalogImportWorkspace(activeImport, imports)}
   </section>`;
@@ -3087,6 +3087,13 @@ function renderCatalogImportWorkspace(activeImport, imports) {
   return `<div class="catalog-import-workspace"><aside class="catalog-import-records"><div class="catalog-import-records-head"><strong>暂存记录</strong><span>${formatNumber(imports.length)}</span></div>${records}</aside><div class="catalog-import-detail">${activeImport ? renderCatalogImportDetail(activeImport) : emptyMarkup("选择预检记录", "查看字段映射和样例。", "◌")}</div></div>`;
 }
 
+function catalogImportRowLocation(value) {
+  const location = String(value ?? "").trim();
+  if (!location) return "-";
+  if (location === "0") return "字段映射";
+  return location.includes("!") ? location : `第 ${location} 行`;
+}
+
 function renderCatalogImportDetail(item) {
   const columns = item.columns || [];
   const mapping = item.mapping || {};
@@ -3097,8 +3104,8 @@ function renderCatalogImportDetail(item) {
   return `<div class="catalog-import-detail-head"><div><strong>${escapeHtml(item.filename)}</strong><span>${formatNumber(item.size_bytes || 0)} B · ${escapeHtml(item.extension || "")}</span></div><button class="text-button danger" type="button" data-action="catalog-import-delete" data-import-id="${escapeAttr(item.import_id)}">删除暂存</button></div>
     <div class="admin-mini-stats"><span><strong>${formatNumber(item.total_rows || 0)}</strong>总行数</span><span><strong>${formatNumber(item.valid_rows || 0)}</strong>有效</span><span><strong>${formatNumber(item.error_rows || 0)}</strong>错误</span><span><strong>${formatNumber(columns.length)}</strong>字段</span></div>
     ${mappingForm}
-    ${preview.length ? `<div class="table-wrap"><table class="data-table catalog-import-preview"><thead><tr><th>行</th><th>题型</th><th>题干</th><th>答案</th><th>选项</th></tr></thead><tbody>${preview.map((row) => `<tr><td>${formatNumber(row.row)}</td><td>${escapeHtml(row.raw_type || "-")}</td><td>${escapeHtml(row.stem)}</td><td>${escapeHtml(row.answer || "-")}</td><td>${formatNumber((row.options || []).length)}</td></tr>`).join("")}</tbody></table></div>` : emptyMarkup(item.status === "needs_mapping" ? "需要字段映射" : "没有有效预览", item.status === "needs_mapping" ? "选择题干字段后重新分析。" : "检查错误信息或调整字段映射。", "◌")}
-    ${errors.length ? `<div class="catalog-import-errors"><strong>错误摘要</strong>${errors.slice(0, 12).map((error) => `<span>第 ${formatNumber(error.row)} 行 · ${escapeHtml(error.message)}</span>`).join("")}</div>` : ""}`;
+    ${preview.length ? `<div class="table-wrap"><table class="data-table catalog-import-preview"><thead><tr><th>位置</th><th>题型</th><th>题干</th><th>答案</th><th>选项</th></tr></thead><tbody>${preview.map((row) => `<tr><td>${escapeHtml(catalogImportRowLocation(row.row))}</td><td>${escapeHtml(row.raw_type || "-")}</td><td>${escapeHtml(row.stem)}</td><td>${escapeHtml(row.answer || "-")}</td><td>${formatNumber((row.options || []).length)}</td></tr>`).join("")}</tbody></table></div>` : emptyMarkup(item.status === "needs_mapping" ? "需要字段映射" : "没有有效预览", item.status === "needs_mapping" ? "选择题干字段后重新分析。" : "检查错误信息或调整字段映射。", "◌")}
+    ${errors.length ? `<div class="catalog-import-errors"><strong>错误摘要</strong>${errors.slice(0, 12).map((error) => `<span>${escapeHtml(catalogImportRowLocation(error.row))} · ${escapeHtml(error.message)}</span>`).join("")}</div>` : ""}`;
 }
 
 async function submitCatalogImport(form) {
