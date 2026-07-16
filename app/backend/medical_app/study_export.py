@@ -49,6 +49,8 @@ EXPORT_COLUMNS = (
     "is_correct",
     "answered_at",
     "elapsed_ms",
+    "daily_question_target",
+    "daily_duration_target_minutes",
 )
 
 
@@ -110,6 +112,14 @@ def _iter_records(
     connection: sqlite3.Connection, profile_id: str
 ) -> Iterator[dict[str, Any]]:
     queries = (
+        (
+            "study_goal",
+            """
+            SELECT daily_question_target, daily_duration_target_minutes, updated_at
+            FROM study_goals
+            WHERE profile_id = ?
+            """,
+        ),
         (
             "study_item",
             """

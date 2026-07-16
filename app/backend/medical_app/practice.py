@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +12,13 @@ from .catalog import Catalog
 from .normalize import display_text, normalize_answer
 
 
-APP_SCHEMA_REVISION = 4
+APP_SCHEMA_REVISION = 5
 COMMENT_MAX_LENGTH = 2000
 NOTE_MAX_LENGTH = 10000
+STUDY_TIME_ZONE_NAME = "Asia/Shanghai"
+STUDY_TIME_ZONE = timezone(timedelta(hours=8), STUDY_TIME_ZONE_NAME)
+DEFAULT_DAILY_QUESTION_TARGET = 20
+DEFAULT_DAILY_DURATION_TARGET_MINUTES = 30
 
 
 class PracticeUnavailable(RuntimeError):
@@ -39,6 +43,15 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS practice_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS study_goals (
+    profile_id TEXT PRIMARY KEY,
+    daily_question_target INTEGER NOT NULL DEFAULT 20
+        CHECK (daily_question_target BETWEEN 1 AND 1000),
+    daily_duration_target_minutes INTEGER NOT NULL DEFAULT 30
+        CHECK (daily_duration_target_minutes BETWEEN 1 AND 1440),
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS practice_sessions (
@@ -172,6 +185,12 @@ CREATE TABLE IF NOT EXISTS question_notes (
 CREATE INDEX IF NOT EXISTS idx_session_questions_question
 ON practice_session_questions(question_id);
 
+CREATE INDEX IF NOT EXISTS idx_session_questions_answered
+ON practice_session_questions(answered_at, session_id);
+
+CREATE INDEX IF NOT EXISTS idx_practice_sessions_profile
+ON practice_sessions(profile_id, created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_progress_wrong
 ON question_progress(profile_id, wrong_count, last_seen_at);
 
@@ -206,6 +225,17 @@ ON question_notes(profile_id, updated_at DESC, occurrence_id);
 
 def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def _study_day_bounds(target_day: date | None = None) -> tuple[date, str, str]:
+    local_day = target_day or datetime.now(STUDY_TIME_ZONE).date()
+    start_local = datetime.combine(local_day, time.min, tzinfo=STUDY_TIME_ZONE)
+    end_local = start_local + timedelta(days=1)
+    return (
+        local_day,
+        start_local.astimezone(UTC).isoformat(),
+        end_local.astimezone(UTC).isoformat(),
+    )
 
 
 class PracticeStore:
@@ -1164,37 +1194,101 @@ class PracticeStore:
         ]
         return {"count": len(items), "total": int(total), "offset": offset, "items": items}
 
+    def study_goal(self) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            return self._study_goal_payload(connection)
+        finally:
+            connection.close()
+
+    def update_study_goal(
+        self,
+        daily_question_target: object,
+        daily_duration_target_minutes: object,
+    ) -> dict[str, Any]:
+        try:
+            question_target = int(daily_question_target)
+            duration_target = int(daily_duration_target_minutes)
+        except (TypeError, ValueError) as error:
+            raise ValueError("学习目标必须是整数") from error
+        if not 1 <= question_target <= 1000:
+            raise ValueError("每日题数目标必须在 1 到 1000 之间")
+        if not 1 <= duration_target <= 1440:
+            raise ValueError("每日学习时长目标必须在 1 到 1440 分钟之间")
+        updated_at = _utc_now()
+        connection = self.connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO study_goals(
+                        profile_id, daily_question_target,
+                        daily_duration_target_minutes, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(profile_id) DO UPDATE SET
+                        daily_question_target = excluded.daily_question_target,
+                        daily_duration_target_minutes = excluded.daily_duration_target_minutes,
+                        updated_at = excluded.updated_at
+                    """,
+                    (self.profile_id, question_target, duration_target, updated_at),
+                )
+            return self._study_goal_payload(connection)
+        finally:
+            connection.close()
+
+    def _study_goal_payload(self, connection: sqlite3.Connection) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT daily_question_target, daily_duration_target_minutes, updated_at
+            FROM study_goals WHERE profile_id = ?
+            """,
+            (self.profile_id,),
+        ).fetchone()
+        return {
+            "daily_question_target": int(
+                row["daily_question_target"] if row else DEFAULT_DAILY_QUESTION_TARGET
+            ),
+            "daily_duration_target_minutes": int(
+                row["daily_duration_target_minutes"]
+                if row
+                else DEFAULT_DAILY_DURATION_TARGET_MINUTES
+            ),
+            "updated_at": row["updated_at"] if row else "",
+            "time_zone": STUDY_TIME_ZONE_NAME,
+        }
+
     def today_summary(self) -> dict[str, Any]:
-        day = datetime.now(UTC).date().isoformat()
-        like_day = f"{day}%"
+        local_day, day_start, day_end = _study_day_bounds()
+        day = local_day.isoformat()
         connection = self.connect()
         try:
             answered = connection.execute(
                 """
                 SELECT COUNT(*) FROM practice_session_questions q
                 JOIN practice_sessions s ON s.session_id = q.session_id
-                WHERE s.profile_id = ? AND q.answered_at LIKE ?
+                WHERE s.profile_id = ? AND q.answered_at >= ? AND q.answered_at < ?
                 """,
-                (self.profile_id, like_day),
+                (self.profile_id, day_start, day_end),
             ).fetchone()[0]
             correct = connection.execute(
                 """
                 SELECT COUNT(*) FROM practice_session_questions q
                 JOIN practice_sessions s ON s.session_id = q.session_id
-                WHERE s.profile_id = ? AND q.answered_at LIKE ? AND q.is_correct = 1
+                WHERE s.profile_id = ? AND q.answered_at >= ? AND q.answered_at < ?
+                  AND q.is_correct = 1
                 """,
-                (self.profile_id, like_day),
+                (self.profile_id, day_start, day_end),
             ).fetchone()[0]
             duration_ms = connection.execute(
                 """
                 SELECT COALESCE(SUM(session_elapsed), 0) FROM (
                     SELECT MAX(COALESCE(q.elapsed_ms, 0)) AS session_elapsed
                     FROM practice_session_questions q JOIN practice_sessions s ON s.session_id = q.session_id
-                    WHERE s.profile_id = ? AND q.answered_at LIKE ?
+                    WHERE s.profile_id = ? AND q.answered_at >= ? AND q.answered_at < ?
                     GROUP BY q.session_id
                 )
                 """,
-                (self.profile_id, like_day),
+                (self.profile_id, day_start, day_end),
             ).fetchone()[0]
             totals = {
                 "wrong": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'wrong'", (self.profile_id,)).fetchone()[0],
@@ -1204,26 +1298,122 @@ class PracticeStore:
                 "likes": connection.execute("SELECT COUNT(*) FROM comment_reactions WHERE profile_id = ? AND reaction = 'agree'", (self.profile_id,)).fetchone()[0],
             }
             daily = {
-                "wrong": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'wrong' AND updated_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
-                "favorites": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'favorite' AND updated_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
-                "notes": connection.execute("SELECT COUNT(*) FROM question_notes WHERE profile_id = ? AND updated_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
-                "comments": connection.execute("SELECT COUNT(*) FROM question_comments WHERE author_id = ? AND created_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
-                "likes": connection.execute("SELECT COUNT(*) FROM comment_reactions WHERE profile_id = ? AND reaction = 'agree' AND created_at LIKE ?", (self.profile_id, like_day)).fetchone()[0],
+                "wrong": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'wrong' AND updated_at >= ? AND updated_at < ?", (self.profile_id, day_start, day_end)).fetchone()[0],
+                "favorites": connection.execute("SELECT COUNT(*) FROM study_items WHERE profile_id = ? AND kind = 'favorite' AND updated_at >= ? AND updated_at < ?", (self.profile_id, day_start, day_end)).fetchone()[0],
+                "notes": connection.execute("SELECT COUNT(*) FROM question_notes WHERE profile_id = ? AND updated_at >= ? AND updated_at < ?", (self.profile_id, day_start, day_end)).fetchone()[0],
+                "comments": connection.execute("SELECT COUNT(*) FROM question_comments WHERE author_id = ? AND created_at >= ? AND created_at < ?", (self.profile_id, day_start, day_end)).fetchone()[0],
+                "likes": connection.execute("SELECT COUNT(*) FROM comment_reactions WHERE profile_id = ? AND reaction = 'agree' AND created_at >= ? AND created_at < ?", (self.profile_id, day_start, day_end)).fetchone()[0],
             }
+            goal = self._study_goal_payload(connection)
+            trend = self._weekly_study_trend(connection, local_day)
+            streak_days = self._study_streak(connection, local_day)
         finally:
             connection.close()
         accuracy = round((int(correct) / int(answered)) * 100) if answered else 0
+        duration_minutes = round(int(duration_ms or 0) / 60000, 1)
+        question_progress = min(
+            100,
+            round((int(answered) / goal["daily_question_target"]) * 100),
+        )
+        duration_progress = min(
+            100,
+            round(
+                (duration_minutes / goal["daily_duration_target_minutes"]) * 100
+            ),
+        )
         return {
             "date": day,
             "updated_at": _utc_now(),
             "score": accuracy,
-            "duration_minutes": round(int(duration_ms or 0) / 60000, 1),
+            "duration_minutes": duration_minutes,
             "questions": int(answered),
             "accuracy": accuracy,
-            "rank_label": "未上榜",
+            "streak_days": streak_days,
+            "goal": {
+                **goal,
+                "question_progress": question_progress,
+                "duration_progress": duration_progress,
+                "completed": question_progress >= 100 and duration_progress >= 100,
+            },
+            "weekly_trend": trend,
             "totals": {key: int(value) for key, value in totals.items()},
             "daily": {key: int(value) for key, value in daily.items()},
         }
+
+    def _study_streak(self, connection: sqlite3.Connection, local_day: date) -> int:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT date(q.answered_at, '+8 hours') AS study_day
+            FROM practice_session_questions q
+            JOIN practice_sessions s ON s.session_id = q.session_id
+            WHERE s.profile_id = ? AND q.answered_at IS NOT NULL
+            """,
+            (self.profile_id,),
+        ).fetchall()
+        study_days = {row["study_day"] for row in rows if row["study_day"]}
+        cursor = local_day if local_day.isoformat() in study_days else local_day - timedelta(days=1)
+        streak = 0
+        while cursor.isoformat() in study_days:
+            streak += 1
+            cursor -= timedelta(days=1)
+        return streak
+
+    def _weekly_study_trend(
+        self, connection: sqlite3.Connection, local_day: date
+    ) -> list[dict[str, Any]]:
+        first_day = local_day - timedelta(days=6)
+        range_start = _study_day_bounds(first_day)[1]
+        range_end = _study_day_bounds(local_day)[2]
+        question_rows = connection.execute(
+            """
+            SELECT date(q.answered_at, '+8 hours') AS study_day,
+                   COUNT(*) AS questions,
+                   SUM(CASE WHEN q.is_correct = 1 THEN 1 ELSE 0 END) AS correct
+            FROM practice_session_questions q
+            JOIN practice_sessions s ON s.session_id = q.session_id
+            WHERE s.profile_id = ? AND q.answered_at >= ? AND q.answered_at < ?
+            GROUP BY study_day
+            """,
+            (self.profile_id, range_start, range_end),
+        ).fetchall()
+        duration_rows = connection.execute(
+            """
+            SELECT study_day, COALESCE(SUM(session_elapsed), 0) AS duration_ms
+            FROM (
+                SELECT date(q.answered_at, '+8 hours') AS study_day,
+                       q.session_id,
+                       MAX(COALESCE(q.elapsed_ms, 0)) AS session_elapsed
+                FROM practice_session_questions q
+                JOIN practice_sessions s ON s.session_id = q.session_id
+                WHERE s.profile_id = ? AND q.answered_at >= ? AND q.answered_at < ?
+                GROUP BY study_day, q.session_id
+            )
+            GROUP BY study_day
+            """,
+            (self.profile_id, range_start, range_end),
+        ).fetchall()
+        questions_by_day = {row["study_day"]: row for row in question_rows}
+        duration_by_day = {
+            row["study_day"]: int(row["duration_ms"] or 0) for row in duration_rows
+        }
+        trend = []
+        for offset in range(7):
+            trend_day = first_day + timedelta(days=offset)
+            day_key = trend_day.isoformat()
+            row = questions_by_day.get(day_key)
+            questions = int(row["questions"] if row else 0)
+            correct = int(row["correct"] if row and row["correct"] is not None else 0)
+            trend.append(
+                {
+                    "date": day_key,
+                    "questions": questions,
+                    "accuracy": round((correct / questions) * 100) if questions else 0,
+                    "duration_minutes": round(
+                        duration_by_day.get(day_key, 0) / 60000, 1
+                    ),
+                }
+            )
+        return trend
 
     def react_comment(self, comment_id: str, reaction: str) -> dict[str, Any]:
         comment_id = display_text(comment_id)

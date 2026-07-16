@@ -252,6 +252,23 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
     def today_summary():
         return jsonify(store().today_summary())
 
+    @blueprint.get("/study/goals")
+    @login_required
+    def study_goal():
+        return jsonify(store().study_goal())
+
+    @blueprint.put("/study/goals")
+    @login_required
+    @csrf_required
+    def update_study_goal():
+        data = _json_object()
+        return jsonify(
+            store().update_study_goal(
+                data.get("daily_question_target"),
+                data.get("daily_duration_target_minutes"),
+            )
+        )
+
     @blueprint.post("/study/comments/<comment_id>/reaction")
     @login_required
     @csrf_required

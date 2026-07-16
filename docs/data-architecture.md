@@ -153,6 +153,7 @@ FTS 记录与规范题一一对应，包含题干、选项、考点和解析，�
 - `practice_session_questions`；
 - `question_progress`；
 - `collection_question_progress` 文件维度刷题状态投影；
+- `study_goals` 当前账号每日题数与学习时长目标；
 - `study_items` 收藏和错题。
 - `question_comments` 原题评论。
 
@@ -176,11 +177,11 @@ AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` �
 
 题库导出不创建新的事实源或状态表。`medical_app.catalog_export` 通过 SQLite `mode=ro` 与 `query_only` 读取当前激活 catalog，按 `collection_questions → question_occurrences → question_versions` 输出原题版本，并携带 collection 路径及位置。JSONL 使用结构化 `options`，CSV 使用 A–H 平铺列并中和电子表格公式前缀；生成器逐行读取，响应不缓存、不经 Nginx 缓冲，也不读取 `state/`。
 
-个人学习数据导出不创建新表。`medical_app.study_export` 通过 SQLite `mode=ro` 与 `query_only` 读取 `study_items`、`question_notes`、`question_progress`、`collection_question_progress`、`practice_sessions` 和 `practice_session_questions`，每条查询都绑定当前会话的 `profile_id`。JSONL 以 `record_type` 区分收藏/错题、笔记、进度、文件进度、会话和逐题作答；CSV 使用固定列并中和公式前缀。生成器逐行输出并返回 `private, no-store` 与 `X-Accel-Buffering: no`，不读取 catalog、设置密钥或其他账号状态。
+个人学习数据导出不创建新表。`medical_app.study_export` 通过 SQLite `mode=ro` 与 `query_only` 读取 `study_goals`、`study_items`、`question_notes`、`question_progress`、`collection_question_progress`、`practice_sessions` 和 `practice_session_questions`，每条查询都绑定当前会话的 `profile_id`。JSONL 以 `record_type` 区分学习目标、收藏/错题、笔记、进度、文件进度、会话和逐题作答；CSV 使用固定列并中和公式前缀。生成器逐行输出并返回 `private, no-store` 与 `X-Accel-Buffering: no`，不读取 catalog、设置密钥或其他账号状态。
 
 导入预检由 `medical_app.catalog_import` 管理权限固定为 `0700` 的 `state/import-staging/imp_*/`。目录内只保存随机命名的 `source.csv|jsonl|json` 和原子写入的 `manifest.json`；manifest 记录安全文件名、哈希、大小、字段、映射、行数、有限错误摘要与最多 10 条标准化样例。CSV/JSONL 逐行读取，JSON 受 16 MB 硬上限约束；任何预检都不调用 builder、不写 catalog、不改变激活指针或向量。后续正式导入必须从 staging 构建新的不可变 catalog 并在完整性检查后原子激活。
 
-题库页的紧凑今日统计通过 `/api/study/today-summary` 从当前账号的会话、答题、收藏、错题、笔记、评论和赞同记录实时聚合；目录模式的所有文件夹层级和分类模式共用同一顶部统计与五个入口。更新时间紧邻标题右侧，分类导航只保留标题和分类数量。管理员运行概览继续从 catalog 读取全库统计，普通题库页面不会展示 64,078 等全局数字。
+题库页的紧凑今日统计通过 `/api/study/today-summary` 从当前账号的会话、答题、收藏、错题、笔记、评论和赞同记录实时聚合；“今日”由上海自然日转换出的 UTC 半开区间定义，避免 UTC 凌晨边界错算。`study_goals` 以 `profile_id` 为主键保存每日题数（1–1000）和学习时长（1–1440 分钟），默认 20 题/30 分钟；汇总同时返回目标进度、连续学习天数和包含空白日期的近 7 日趋势。目录模式的所有文件夹层级和分类模式共用同一顶部统计与五个入口。更新时间紧邻标题右侧，分类导航只保留标题和分类数量。管理员运行概览继续从 catalog 读取全库统计，普通题库页面不会展示 64,078 等全局数字。
 
 管理员构建通过 `medical_app.vector_task` 独立进程执行，`state/vector-operation.json` 记录 queued/running/complete/failed 与已完成数量。相同 API URL、模型、维度和文本版本的旧 manifest 可作为增量源；按 `question_id` 复制未变化行，只有新增或变化题目进入上游批次。删除向量只处理 `vector-current.json` 和 `vector-indexes/`，catalog、原始数据与用户 state 永不删除。
 

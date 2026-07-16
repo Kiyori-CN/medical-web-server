@@ -1097,3 +1097,14 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
   .admin-feedback-search .field:first-child, .admin-feedback-search .button { grid-column: 1 / -1; }
   .admin-feedback-item-head, .admin-feedback-item-foot { align-items: flex-start; flex-direction: column; }
 }
+.today-goal-edit { min-height: 32px; margin-left: auto; padding: 0 6px; font-size: 10px; white-space: nowrap; }
+.today-goal-panel { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) minmax(190px, .9fr); align-items: end; gap: 14px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.today-goal-progress { min-width: 0; display: grid; gap: 6px; }.today-goal-progress > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.today-goal-progress strong { font-size: 10px; }.today-goal-progress small { color: var(--muted); font-size: 9px; white-space: nowrap; }.today-goal-progress progress { width: 100%; height: 7px; overflow: hidden; border: 0; border-radius: 999px; background: var(--surface-soft); appearance: none; }.today-goal-progress progress::-webkit-progress-bar { border-radius: 999px; background: var(--surface-soft); }.today-goal-progress progress::-webkit-progress-value { border-radius: 999px; background: linear-gradient(90deg, var(--brand), #e88b79); }.today-goal-progress progress::-moz-progress-bar { border-radius: 999px; background: linear-gradient(90deg, var(--brand), #e88b79); }
+.today-weekly-trend { min-width: 0; display: grid; gap: 5px; }.today-weekly-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.today-weekly-title strong { font-size: 10px; }.today-weekly-title small { color: var(--muted); font-size: 8px; }.today-weekly-bars { height: 28px; display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); align-items: end; gap: 4px; }.today-weekly-bars > span { min-width: 0; height: 28px; display: grid; grid-template-rows: 19px 9px; align-items: end; justify-items: center; }.today-weekly-bars i { width: min(16px, 100%); min-height: 2px; border-radius: 4px 4px 2px 2px; background: var(--line-strong); }.today-weekly-bars i.level-1 { height: 5px; background: #f3c1b8; }.today-weekly-bars i.level-2 { height: 9px; background: #eea797; }.today-weekly-bars i.level-3 { height: 14px; background: #e98c79; }.today-weekly-bars i.level-4 { height: 19px; background: var(--brand); }.today-weekly-bars small { color: var(--muted); font-size: 7px; line-height: 1; }
+.study-goal-modal { width: min(480px, 100%); }
+@media (max-width: 760px) {
+  .today-goal-panel { grid-template-columns: 1fr 1fr; gap: 9px 10px; margin-top: 8px; padding-top: 8px; }
+  .today-weekly-trend { grid-column: 1 / -1; }
+  .today-goal-progress strong { font-size: 9px; }
+  .today-goal-progress small { font-size: 8px; }
+}

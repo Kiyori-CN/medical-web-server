@@ -658,6 +658,7 @@ async function toggleGuideBranch(path) {
 
 function renderTodaySummary() {
   const summary = state.todaySummary || {};
+  const goal = summary.goal || { daily_question_target: 20, daily_duration_target_minutes: 30, question_progress: 0, duration_progress: 0 };
   const libraryReturnHash = normalizeStudyReturnHash(location.hash, "#library");
   const updated = summary.updated_at ? new Date(summary.updated_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "--:--:--";
   const metrics = [
@@ -665,7 +666,7 @@ function renderTodaySummary() {
     ["duration_minutes", `${summary.duration_minutes || 0}m`, "答题时长"],
     ["questions", summary.questions || 0, "做题数量"],
     ["accuracy", `${summary.accuracy || 0}%`, "总正确率"],
-    ["rank_label", summary.rank_label || "未上榜", "刷题榜单"],
+    ["streak_days", `${summary.streak_days || 0}天`, "连续学习"],
   ];
   const shortcuts = [
     ["wrong", "错题", "!", "wrong", "wrong"],
@@ -675,12 +676,28 @@ function renderTodaySummary() {
     ["my-likes", "点赞", "♧", "likes", "likes"],
   ];
   return `<section class="today-summary-card card" aria-label="今日统计">
-    <div class="today-summary-head"><h2>今日统计</h2><time>更新时间 ${updated}</time></div>
+    <div class="today-summary-head"><h2>今日统计</h2><time>更新时间 ${updated}</time><button class="text-button today-goal-edit" type="button" data-action="edit-study-goal">设置目标</button></div>
     <div class="today-summary-metrics">${metrics.map(([key, value, label], index) => index === 0
       ? `<div class="today-score"><span>${escapeHtml(String(value))}</span><small>${label}</small></div>`
       : `<div class="today-metric"><strong>${escapeHtml(String(value))}</strong><small>${label}</small></div>`).join("")}</div>
+    <div class="today-goal-panel">
+      <div class="today-goal-progress"><span><strong>每日题数</strong><small>${formatNumber(summary.questions || 0)} / ${formatNumber(goal.daily_question_target || 20)}</small></span><progress max="100" value="${Math.max(0, Math.min(100, Number(goal.question_progress || 0)))}" aria-label="每日题数目标进度"></progress></div>
+      <div class="today-goal-progress"><span><strong>每日时长</strong><small>${escapeHtml(String(summary.duration_minutes || 0))} / ${formatNumber(goal.daily_duration_target_minutes || 30)} 分钟</small></span><progress max="100" value="${Math.max(0, Math.min(100, Number(goal.duration_progress || 0)))}" aria-label="每日时长目标进度"></progress></div>
+      ${renderWeeklyStudyTrend(summary.weekly_trend || [])}
+    </div>
   </section>
   <nav class="today-shortcuts card" aria-label="学习入口">${shortcuts.map(([page, label, icon, palette, metricKey]) => `<a class="today-shortcut" href="${escapeAttr(studyPageHash(page, libraryReturnHash))}" data-action="open-personal-page" data-page="${page}" data-return-hash="${escapeAttr(libraryReturnHash)}"><span class="today-shortcut-icon shortcut-${palette}">${icon}</span><strong>${label}</strong><small>${formatNumber(summary.totals?.[metricKey] || 0)}</small></a>`).join("")}</nav>`;
+}
+
+function renderWeeklyStudyTrend(items) {
+  if (!items.length) return "";
+  const maximum = Math.max(1, ...items.map((item) => Number(item.questions || 0)));
+  return `<div class="today-weekly-trend" aria-label="近七日做题趋势"><div class="today-weekly-title"><strong>近 7 日</strong><small>按上海时间统计</small></div><div class="today-weekly-bars">${items.map((item) => {
+    const questions = Number(item.questions || 0);
+    const level = questions ? Math.max(1, Math.min(4, Math.ceil((questions / maximum) * 4))) : 0;
+    const label = new Date(`${item.date}T00:00:00+08:00`).toLocaleDateString("zh-CN", { weekday: "narrow" });
+    return `<span title="${escapeAttr(`${item.date} · ${questions} 题 · 正确率 ${item.accuracy || 0}%`)}"><i class="level-${level}" aria-hidden="true"></i><small>${escapeHtml(label)}</small></span>`;
+  }).join("")}</div></div>`;
 }
 
 function secondaryPageHeader(label, copy = "") {
@@ -2032,6 +2049,42 @@ function openFeedbackModal() {
   $("#feedback-form textarea", root).focus();
 }
 
+function openStudyGoalModal() {
+  const root = $("#modal-root");
+  const goal = state.todaySummary?.goal || {
+    daily_question_target: 20,
+    daily_duration_target_minutes: 30,
+  };
+  root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal study-goal-modal" role="dialog" aria-modal="true" aria-labelledby="study-goal-modal-title"><div class="modal-heading"><h2 id="study-goal-modal-title">每日学习目标</h2><button class="icon-button" type="button" data-modal="cancel" aria-label="取消">×</button></div><form id="study-goal-form" class="stack-form"><p class="form-tip">目标按上海时间自然日统计，修改后立即用于今日进度。</p><label class="field"><span>每日做题数量</span><input name="daily_question_target" type="number" min="1" max="1000" value="${Number(goal.daily_question_target || 20)}" required></label><label class="field"><span>每日学习时长（分钟）</span><input name="daily_duration_target_minutes" type="number" min="1" max="1440" value="${Number(goal.daily_duration_target_minutes || 30)}" required></label><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-primary" type="submit">保存目标</button></div></form></section></div>`;
+  const finish = () => { root.innerHTML = ""; };
+  $$('[data-modal="cancel"]', root).forEach((button) => button.addEventListener("click", finish));
+  $(".modal-backdrop", root).addEventListener("click", (event) => { if (event.target.classList.contains("modal-backdrop")) finish(); });
+  $("#study-goal-form", root).addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.target;
+    const button = $('button[type="submit"]', form);
+    const values = Object.fromEntries(new FormData(form));
+    setButtonBusy(button, true, "保存中");
+    try {
+      await api("/study/goals", {
+        method: "PUT",
+        body: {
+          daily_question_target: Number(values.daily_question_target),
+          daily_duration_target_minutes: Number(values.daily_duration_target_minutes),
+        },
+      });
+      state.todaySummary = await api("/study/today-summary");
+      finish();
+      await renderLibrary("library", { preserveContent: true, preserveScroll: true });
+      showToast("每日学习目标已更新");
+    } catch (error) {
+      showToast(error.message || "学习目标保存失败", "error");
+      setButtonBusy(button, false);
+    }
+  });
+  $('#study-goal-form input[name="daily_question_target"]', root).focus();
+}
+
 async function renderMessagesPage() {
   const container = $("#page-messages");
   if (state.messageData) {
@@ -3183,6 +3236,7 @@ async function handleClick(event) {
   if (action === "toggle-follow") return toggleFollowProfile(target);
   if (action === "message-profile") return messageProfile(target.dataset.userId, target.dataset.name);
   if (action === "home-utility") return handleHomeUtility(target.dataset.utility);
+  if (action === "edit-study-goal") return openStudyGoalModal();
   if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
   if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(publicProfileRouteHash(target.dataset.userId || state.user.user_id, state.profileReturnHash)); }
   if (action === "open-forum-dynamic") return navigateHash(forumRouteHash({ topic: target.dataset.topic, returnHash: location.hash || "#profile" }));

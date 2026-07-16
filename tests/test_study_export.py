@@ -43,6 +43,7 @@ def test_personal_study_export_is_streamed_and_account_scoped(
     alice.submit_answer(
         session["session_id"], position=session_item["position"], answer="B"
     )
+    alice.update_study_goal(42, 55)
 
     bob.add_favorite(
         occurrence_id=other_item["occurrence_id"], question_id=other_item["question_id"]
@@ -73,6 +74,7 @@ def test_personal_study_export_is_streamed_and_account_scoped(
     records = [json.loads(line) for line in jsonl.get_data(as_text=True).splitlines()]
     assert {record["record_type"] for record in records} >= {
         "study_item",
+        "study_goal",
         "note",
         "progress",
         "session",
@@ -80,6 +82,9 @@ def test_personal_study_export_is_streamed_and_account_scoped(
     }
     progress = next(record for record in records if record["record_type"] == "progress")
     assert progress["wrong_count"] == 1
+    study_goal = next(record for record in records if record["record_type"] == "study_goal")
+    assert study_goal["daily_question_target"] == 42
+    assert study_goal["daily_duration_target_minutes"] == 55
     assert not any(
         record["record_type"] in {"study_item", "note"}
         and record.get("occurrence_id") == other_item["occurrence_id"]

@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from datetime import UTC, datetime, time, timedelta, timezone
 
 import pytest
 from flask import Flask, g
@@ -96,11 +97,24 @@ def test_practice_blueprint_requires_login_and_csrf(
     app.register_blueprint(create_practice_blueprint(catalog.database_path, store.database_path))
     client = app.test_client()
     assert client.get("/api/practice/health").status_code == 401
+    assert client.get("/api/study/goals").status_code == 401
 
     app.config["AUTHENTICATED"] = True
     client.set_cookie("medical_csrf", "csrf-test")
     headers = {"X-CSRF-Token": "csrf-test"}
     assert client.get("/api/practice/health").status_code == 200
+    assert client.get("/api/study/goals").get_json()["daily_question_target"] == 20
+    assert client.put(
+        "/api/study/goals",
+        json={"daily_question_target": 40, "daily_duration_target_minutes": 60},
+    ).status_code == 403
+    updated_goal = client.put(
+        "/api/study/goals",
+        headers=headers,
+        json={"daily_question_target": 40, "daily_duration_target_minutes": 60},
+    )
+    assert updated_goal.status_code == 200
+    assert updated_goal.get_json()["daily_duration_target_minutes"] == 60
     assert client.post("/api/practice/sessions", json={"count": 1}).status_code == 403
 
     created = client.post(
@@ -117,6 +131,61 @@ def test_practice_blueprint_requires_login_and_csrf(
     )
     assert submitted.status_code == 200
     assert submitted.get_json()["is_correct"] is False
+
+
+def test_study_goals_use_shanghai_day_boundary_and_track_streak(
+    sample_source_tree: Path, tmp_path: Path
+):
+    _, store = _services(sample_source_tree, tmp_path)
+    assert store.study_goal()["daily_question_target"] == 20
+    goal = store.update_study_goal(2, 20)
+    assert goal["daily_question_target"] == 2
+    assert goal["time_zone"] == "Asia/Shanghai"
+    other_store = PracticeStore(store.database_path, store.catalog, "other-user")
+    other_store.initialize()
+    assert other_store.study_goal()["daily_question_target"] == 20
+    with pytest.raises(ValueError):
+        store.update_study_goal(0, 20)
+    with pytest.raises(ValueError):
+        store.update_study_goal(20, 1441)
+
+    sessions = []
+    for _ in range(2):
+        session = store.create_session(count=1, filters={"question_type": "单选题"})
+        store.submit_answer(
+            session["session_id"], position=1, answer="A", elapsed_ms=600_000
+        )
+        sessions.append(session["session_id"])
+
+    shanghai = timezone(timedelta(hours=8), "Asia/Shanghai")
+    today = datetime.now(shanghai).date()
+    today_at_0030 = datetime.combine(today, time(0, 30), tzinfo=shanghai).astimezone(UTC)
+    yesterday_at_noon = datetime.combine(
+        today - timedelta(days=1), time(12, 0), tzinfo=shanghai
+    ).astimezone(UTC)
+    connection = store.connect()
+    try:
+        with connection:
+            connection.execute(
+                "UPDATE practice_session_questions SET answered_at = ? WHERE session_id = ?",
+                (today_at_0030.isoformat(), sessions[0]),
+            )
+            connection.execute(
+                "UPDATE practice_session_questions SET answered_at = ? WHERE session_id = ?",
+                (yesterday_at_noon.isoformat(), sessions[1]),
+            )
+    finally:
+        connection.close()
+
+    summary = store.today_summary()
+    assert summary["date"] == today.isoformat()
+    assert summary["questions"] == 1
+    assert summary["duration_minutes"] == 10
+    assert summary["streak_days"] == 2
+    assert summary["goal"]["question_progress"] == 50
+    assert summary["goal"]["duration_progress"] == 50
+    assert summary["goal"]["completed"] is False
+    assert [item["questions"] for item in summary["weekly_trend"][-2:]] == [1, 1]
 
 
 def test_collection_order_memorize_mode_and_early_finish(
