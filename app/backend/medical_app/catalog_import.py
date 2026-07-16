@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import os
+import posixpath
 import re
 import secrets
 import shutil
+import xml.etree.ElementTree as ElementTree
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -27,6 +31,8 @@ MAX_STAGED_BYTES = 256 * 1024 * 1024
 MAX_XLSX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 MAX_XLSX_ARCHIVE_ENTRIES = 2_000
 MAX_XLSX_HEADER_SCAN_ROWS = 50
+MAX_XLSX_SHARED_STRINGS = 500_000
+MAX_XLSX_SHARED_STRING_CHARS = 50_000_000
 PREVIEW_ROWS = 10
 SUPPORTED_IMPORT_EXTENSIONS = {".csv", ".json", ".jsonl", ".xlsx"}
 IMPORT_FIELDS = (
@@ -40,6 +46,7 @@ IMPORT_FIELDS = (
     *(f"option_{label.lower()}" for label in "ABCDEFGH"),
 )
 _IMPORT_ID_RE = re.compile(r"^imp_[A-Za-z0-9_-]{16,40}$")
+_XLSX_CELL_REFERENCE_RE = re.compile(r"^([A-Z]{1,3})[1-9][0-9]*$", re.IGNORECASE)
 _ALIASES = {
     "stem": ("stem", "题目", "题干", "question", "content"),
     "raw_type": ("raw_type", "题型", "类型", "question_type", "type"),
@@ -381,57 +388,210 @@ def _iter_records(path: Path, extension: str):
 def _iter_xlsx_records(path: Path):
     _validate_xlsx_container(path)
     try:
-        from openpyxl import load_workbook
-
-        workbook = load_workbook(
-            path,
-            read_only=True,
-            data_only=True,
-            keep_links=False,
-        )
-    except Exception as error:
-        raise ValueError("XLSX 文件格式无效") from error
-    try:
-        for worksheet in workbook.worksheets:
-            rows = worksheet.iter_rows(values_only=True)
-            headers: tuple[str, ...] = ()
-            header_row_number = 0
-            for header_row_number, row in enumerate(rows, start=1):
-                headers = tuple(display_text(value) for value in row)
-                if any(headers):
-                    break
-                if header_row_number >= MAX_XLSX_HEADER_SCAN_ROWS:
-                    raise ValueError(
-                        f"工作表 {worksheet.title} 前 50 行未找到表头"
-                    )
-            if not headers:
-                continue
-            named_headers = [header for header in headers if header]
-            if len(named_headers) > MAX_IMPORT_FIELDS:
-                raise ValueError("导入字段不能超过 128 个")
-            duplicate_headers = sorted(
-                {header for header in named_headers if named_headers.count(header) > 1}
-            )
-            if duplicate_headers:
-                joined = "、".join(duplicate_headers[:5])
-                raise ValueError(f"工作表 {worksheet.title} 存在重复表头：{joined}")
-            for row_number, row in enumerate(rows, start=header_row_number + 1):
-                if not any(display_text(value) for value in row):
+        with ZipFile(path) as archive:
+            shared_strings = _xlsx_shared_strings(archive)
+            for worksheet_title, worksheet_path in _xlsx_worksheets(archive):
+                rows = _xlsx_rows(archive, worksheet_path, shared_strings)
+                headers: tuple[str, ...] = ()
+                header_row_number = 0
+                scanned_rows = 0
+                for header_row_number, row in rows:
+                    scanned_rows += 1
+                    headers = tuple(display_text(value) for value in row)
+                    if any(headers):
+                        break
+                    if scanned_rows >= MAX_XLSX_HEADER_SCAN_ROWS:
+                        raise ValueError(
+                            f"工作表 {worksheet_title} 前 50 行未找到表头"
+                        )
+                if not headers:
                     continue
-                record = {
-                    header: row[index] if index < len(row) else None
-                    for index, header in enumerate(headers)
-                    if header
-                }
-                yield f"{worksheet.title}!{row_number}", record, ""
+                named_headers = [header for header in headers if header]
+                if len(named_headers) > MAX_IMPORT_FIELDS:
+                    raise ValueError("导入字段不能超过 128 个")
+                duplicate_headers = sorted(
+                    {header for header in named_headers if named_headers.count(header) > 1}
+                )
+                if duplicate_headers:
+                    joined = "、".join(duplicate_headers[:5])
+                    raise ValueError(f"工作表 {worksheet_title} 存在重复表头：{joined}")
+                for row_number, row in rows:
+                    if not any(display_text(value) for value in row):
+                        continue
+                    record = {
+                        header: row[index] if index < len(row) else None
+                        for index, header in enumerate(headers)
+                        if header
+                    }
+                    yield f"{worksheet_title}!{row_number}", record, ""
     except Exception as error:
         if isinstance(error, ValueError) and str(error).startswith(
-            ("导入字段", "工作表")
+            ("导入字段", "工作表", "XLSX")
         ):
             raise
         raise ValueError("XLSX 文件格式无效") from error
-    finally:
-        workbook.close()
+
+
+def _xlsx_worksheets(archive: ZipFile) -> list[tuple[str, str]]:
+    relationships: dict[str, str] = {}
+    with _xlsx_xml_stream(archive, "xl/_rels/workbook.xml.rels") as stream:
+        for _, element in ElementTree.iterparse(stream, events=("end",)):
+            if _xml_local_name(element.tag) == "Relationship":
+                relationship_id = display_text(element.attrib.get("Id"))
+                target = display_text(element.attrib.get("Target"))
+                if relationship_id and target:
+                    relationships[relationship_id] = target
+            element.clear()
+    worksheets = []
+    with _xlsx_xml_stream(archive, "xl/workbook.xml") as stream:
+        for _, element in ElementTree.iterparse(stream, events=("end",)):
+            if _xml_local_name(element.tag) != "sheet":
+                element.clear()
+                continue
+            title = display_text(element.attrib.get("name")) or "工作表"
+            relationship_id = next(
+                (
+                    display_text(value)
+                    for key, value in element.attrib.items()
+                    if _xml_local_name(key) == "id"
+                ),
+                "",
+            )
+            target = relationships.get(relationship_id, "")
+            if not target:
+                raise ValueError(f"XLSX 工作表关系缺失：{title}")
+            worksheet_path = _xlsx_member_path(target)
+            if worksheet_path not in archive.namelist():
+                raise ValueError(f"XLSX 工作表文件缺失：{title}")
+            worksheets.append((title, worksheet_path))
+            element.clear()
+    if not worksheets:
+        raise ValueError("XLSX 没有可读取的工作表")
+    return worksheets
+
+
+def _xlsx_shared_strings(archive: ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    values: list[str] = []
+    total_characters = 0
+    with _xlsx_xml_stream(archive, "xl/sharedStrings.xml") as stream:
+        for _, element in ElementTree.iterparse(stream, events=("end",)):
+            if _xml_local_name(element.tag) != "si":
+                continue
+            value = "".join(
+                child.text or ""
+                for child in element.iter()
+                if _xml_local_name(child.tag) == "t"
+            )
+            values.append(value)
+            total_characters += len(value)
+            if len(values) > MAX_XLSX_SHARED_STRINGS:
+                raise ValueError("XLSX 共享字符串数量过多")
+            if total_characters > MAX_XLSX_SHARED_STRING_CHARS:
+                raise ValueError("XLSX 共享字符串内容过大")
+            element.clear()
+    return values
+
+
+def _xlsx_rows(archive: ZipFile, path: str, shared_strings: list[str]):
+    with _xlsx_xml_stream(archive, path) as stream:
+        for _, element in ElementTree.iterparse(stream, events=("end",)):
+            if _xml_local_name(element.tag) != "row":
+                continue
+            row_number = int(element.attrib.get("r") or 0)
+            values: dict[int, str] = {}
+            fallback_index = 0
+            for cell in element:
+                if _xml_local_name(cell.tag) != "c":
+                    continue
+                reference = display_text(cell.attrib.get("r"))
+                column_index = _xlsx_column_index(reference)
+                if column_index is None:
+                    column_index = fallback_index
+                fallback_index = column_index + 1
+                values[column_index] = _xlsx_cell_value(cell, shared_strings)
+            maximum = max(values, default=-1)
+            yield row_number, tuple(values.get(index, "") for index in range(maximum + 1))
+            element.clear()
+
+
+def _xlsx_cell_value(element: ElementTree.Element, shared_strings: list[str]) -> str:
+    cell_type = element.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        return "".join(
+            child.text or ""
+            for child in element.iter()
+            if _xml_local_name(child.tag) == "t"
+        )
+    value = next(
+        (
+            child.text or ""
+            for child in element
+            if _xml_local_name(child.tag) == "v"
+        ),
+        "",
+    )
+    if cell_type == "s":
+        try:
+            index = int(value)
+            if index < 0:
+                raise ValueError
+            return shared_strings[index]
+        except (IndexError, ValueError) as error:
+            raise ValueError("XLSX 共享字符串索引无效") from error
+    if cell_type == "b":
+        return "正确" if value == "1" else "错误"
+    return value
+
+
+def _xlsx_column_index(reference: str) -> int | None:
+    match = _XLSX_CELL_REFERENCE_RE.fullmatch(reference)
+    if not match:
+        return None
+    index = 0
+    for character in match.group(1).upper():
+        index = index * 26 + ord(character) - ord("A") + 1
+    return index - 1
+
+
+def _xlsx_member_path(target: str) -> str:
+    target = target.replace("\\", "/").lstrip("/")
+    candidate = target if target.startswith("xl/") else f"xl/{target}"
+    normalized = posixpath.normpath(candidate)
+    if normalized == "xl" or not normalized.startswith("xl/") or ".." in normalized.split("/"):
+        raise ValueError("XLSX 工作表路径无效")
+    return normalized
+
+
+@contextmanager
+def _xlsx_xml_stream(archive: ZipFile, name: str):
+    try:
+        source = archive.open(name)
+    except KeyError as error:
+        raise ValueError(f"XLSX 缺少必要文件：{name}") from error
+    with source, io.BufferedReader(source) as stream:
+        yield _SafeXlsxXmlReader(stream)
+
+
+class _SafeXlsxXmlReader:
+    _FORBIDDEN = (b"<!DOCTYPE", b"<!ENTITY")
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.tail = b""
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self.stream.read(size)
+        probe = (self.tail + chunk).upper()
+        if any(token in probe for token in self._FORBIDDEN):
+            raise ValueError("XLSX XML 不允许 DTD 或实体声明")
+        self.tail = probe[-16:]
+        return chunk
+
+
+def _xml_local_name(value: str) -> str:
+    return value.rsplit("}", 1)[-1]
 
 
 def _validate_xlsx_container(path: Path) -> None:

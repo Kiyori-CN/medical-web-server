@@ -72,7 +72,7 @@ AI 页面可在本地登录后验证会话新建、选择、重命名、删除�
 
 “我的 → 下载数据”需验证登录用户可以下载 JSONL/CSV 学习数据，且只包含当前账号的收藏、错题、私有笔记、规范题/文件题进度、练习会话和逐题作答记录。测试应覆盖未登录 401、非法格式 400、`private, no-store`/`X-Accel-Buffering` 响应头、CSV BOM 与公式中和，以及切换账号后的数据隔离；导出只能只读 state，不能写入 catalog、向量或设置密钥。
 
-导入预检需覆盖 XLSX、CSV、JSONL、JSON、自动映射、手动映射、结构化 options、无效 JSON 行、空题干、错误扩展名、路径穿越 ID、16 MB 文件上限和 JSON 413。XLSX 测试至少包含多工作表、工作表行定位、损坏容器与解压体积拒绝，且确认只读解析不加载外链。上传后只能在 `state/import-staging/` 看到随机目录；删除暂存后目录消失，catalog/向量指针和 `app.sqlite3` 不得变化。手机端题库管理的文件选择、映射和样例表格不得造成页面横向溢出。
+导入预检需覆盖 XLSX、CSV、JSONL、JSON、自动映射、手动映射、结构化 options、无效 JSON 行、空题干、错误扩展名、路径穿越 ID、16 MB 文件上限和 JSON 413。XLSX 测试至少包含多工作表、工作表行定位、共享/内联字符串、损坏或重复容器、DTD/实体与解压体积拒绝，且确认标准库流式解析只读缓存值、不加载外链或成为 API 启动依赖。上传后只能在 `state/import-staging/` 看到随机目录；删除暂存后目录消失，catalog/向量指针和 `app.sqlite3` 不得变化。手机端题库管理的文件选择、映射和样例表格不得造成页面横向溢出。
 
 向量生命周期由 `/api/admin/vectors` 管理：构建请求启动独立 `medical_app.vector_task` 进程，状态写入 `state/vector-operation.json`，构建中断可续建；同配置 catalog 更新时按 `question_id` 增量复用旧向量。删除接口必须收到确认字段，只清除激活指针与向量制品。
 

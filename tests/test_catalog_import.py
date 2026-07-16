@@ -1,4 +1,5 @@
 from io import BytesIO
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from openpyxl import Workbook
@@ -23,6 +24,36 @@ def _xlsx_upload(filename: str = "questions.xlsx") -> FileStorage:
     stream = BytesIO()
     workbook.save(stream)
     workbook.close()
+    stream.seek(0)
+    return FileStorage(stream=stream, filename=filename)
+
+
+def _shared_string_xlsx_upload(
+    filename: str = "shared.xlsx", workbook_prefix: str = ""
+) -> FileStorage:
+    stream = BytesIO()
+    with ZipFile(stream, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            "<?xml version='1.0' encoding='UTF-8'?><Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'/>",
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            workbook_prefix
+            + "<workbook xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main' xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><sheets><sheet name='共享题' sheetId='1' r:id='rId1'/></sheets></workbook>",
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' Target='worksheets/sheet1.xml'/></Relationships>",
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            "<sst xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><si><t>题目</t></si><si><t>答案</t></si><si><r><t>共享</t></r><r><t>字符串题干</t></r></si><si><t>A</t></si></sst>",
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1' t='s'><v>1</v></c></row><row r='2'><c r='A2' t='s'><v>2</v></c><c r='B2' t='s'><v>3</v></c></row></sheetData></worksheet>",
+        )
     stream.seek(0)
     return FileStorage(stream=stream, filename=filename)
 
@@ -98,6 +129,27 @@ def test_catalog_import_preview_supports_read_only_multisheet_xlsx(tmp_path):
     assert preview["total_rows"] == preview["valid_rows"] == 2
     assert [row["row"] for row in preview["preview"]] == ["第一章!2", "第二章!2"]
     assert preview["preview"][0]["options"] == ["皮肤", "肝脏"]
+
+
+def test_catalog_import_preview_supports_shared_and_rich_xlsx_strings(tmp_path):
+    store = CatalogImportPreviewStore(tmp_path / "staging")
+    store.initialize()
+    preview = store.create_preview(_shared_string_xlsx_upload())
+
+    assert preview["status"] == "ready"
+    assert preview["total_rows"] == preview["valid_rows"] == 1
+    assert preview["preview"][0]["row"] == "共享题!2"
+    assert preview["preview"][0]["stem"] == "共享字符串题干"
+    assert preview["preview"][0]["answer"] == "A"
+
+
+def test_catalog_import_preview_rejects_late_xlsx_dtd(tmp_path):
+    store = CatalogImportPreviewStore(tmp_path / "staging")
+    store.initialize()
+    prefix = "<?xml version='1.0'?>" + (" " * 9_000) + "<!DOCTYPE workbook [<!ENTITY x 'blocked'>]>"
+    with pytest.raises(ValueError, match="DTD"):
+        store.create_preview(_shared_string_xlsx_upload("dtd.xlsx", prefix))
+    assert store.list_previews() == []
 
 
 def test_catalog_import_preview_rejects_invalid_or_expanded_xlsx(
