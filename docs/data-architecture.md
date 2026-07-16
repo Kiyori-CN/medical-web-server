@@ -165,6 +165,8 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 
 `collection_question_progress` 以 `(profile_id, collection_id, occurrence_id)` 唯一定位题号目录状态。提交答案时同步更新该投影；点击题库重置只删除当前账号在当前 collection 的投影行。`practice_sessions` 和 `practice_session_questions` 仍保留为历史试卷，`question_progress`、`study_items` 和 `question_comments` 均不随文件重置删除。同一道规范题出现在其他文件时也不会被连带重置。
 
+练习记录不新增重复表。`PracticeStore.session_history()` 直接聚合当前 `profile_id` 的 `practice_sessions` 与 `practice_session_questions`，按最近答题或交卷时间倒序，以 `status + limit + offset` 返回摘要、状态统计和 `has_more`。进行中的 `test` 会话只暴露总题数、已答数和进度，正确数、错误数、未判数与正确率均返回空值；会话完成后复用既有详情接口解锁完整复盘。前端历史 hash 保存当前筛选，恢复会话后仍能返回同一历史列表；不提供删除历史的写接口。
+
 `question_comments` 绑定具体 `occurrence_id`，同时保存 `question_id`、作者账号 ID、作者名快照、正文和时间。评论不写入 catalog、不依赖用户外键；所有登录用户可查看和发表，只有作者本人或管理员可以删除，正文去除首尾空白且最长 2000 字。
 
 运行状态补充实体：`user_avatars` 以 `user_id` 保存服务端重编码后的 512×512 WebP；`question_notes` 以 `(profile_id, occurrence_id)` 唯一保存个人笔记；头像、笔记和评论均属于 state，不写入 catalog 或任何检索索引。笔记正文最长 10000 字，支持更新和删除，个人笔记列表通过 occurrence 反查原文件路径和题号。

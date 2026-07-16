@@ -269,6 +269,17 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
             )
         )
 
+    @blueprint.get("/study/sessions")
+    @login_required
+    def session_history():
+        return jsonify(
+            store().session_history(
+                status=request.args.get("status", ""),
+                limit=request.args.get("limit", 20),
+                offset=request.args.get("offset", 0),
+            )
+        )
+
     @blueprint.post("/study/comments/<comment_id>/reaction")
     @login_required
     @csrf_required

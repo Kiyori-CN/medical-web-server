@@ -98,6 +98,7 @@ def test_practice_blueprint_requires_login_and_csrf(
     client = app.test_client()
     assert client.get("/api/practice/health").status_code == 401
     assert client.get("/api/study/goals").status_code == 401
+    assert client.get("/api/study/sessions").status_code == 401
 
     app.config["AUTHENTICATED"] = True
     client.set_cookie("medical_csrf", "csrf-test")
@@ -131,6 +132,11 @@ def test_practice_blueprint_requires_login_and_csrf(
     )
     assert submitted.status_code == 200
     assert submitted.get_json()["is_correct"] is False
+    history = client.get("/api/study/sessions?status=complete")
+    assert history.status_code == 200
+    assert history.get_json()["stats"]["complete"] == 1
+    assert client.get("/api/study/sessions?status=deleted").status_code == 400
+    assert client.get("/api/study/sessions?limit=invalid").status_code == 400
 
 
 def test_study_goals_use_shanghai_day_boundary_and_track_streak(
@@ -186,6 +192,43 @@ def test_study_goals_use_shanghai_day_boundary_and_track_streak(
     assert summary["goal"]["duration_progress"] == 50
     assert summary["goal"]["completed"] is False
     assert [item["questions"] for item in summary["weekly_trend"][-2:]] == [1, 1]
+
+
+def test_session_history_is_paginated_account_scoped_and_test_safe(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, store = _services(sample_source_tree, tmp_path)
+    active_test = store.create_session(
+        count=2, filters={"question_type": "单选题"}, mode="test"
+    )
+    store.submit_answer(active_test["session_id"], position=1, answer="B")
+    completed = store.create_session(
+        count=1, filters={"question_type": "单选题"}, mode="practice"
+    )
+    store.submit_answer(completed["session_id"], position=1, answer="B")
+    other = PracticeStore(store.database_path, catalog, "other-user")
+    other.initialize()
+    other.create_session(count=1, filters={"question_type": "单选题"})
+
+    history = store.session_history(limit=1)
+    assert history["total"] == 2
+    assert history["has_more"] is True
+    assert history["stats"] == {"total": 2, "active": 1, "complete": 1}
+    second_page = store.session_history(limit=1, offset=1)
+    assert len(second_page["items"]) == 1
+    active = store.session_history(status="active")
+    assert active["total"] == 1
+    assert active["items"][0]["session_id"] == active_test["session_id"]
+    assert active["items"][0]["summary"]["answered"] == 1
+    assert active["items"][0]["summary"]["correct"] is None
+    assert active["items"][0]["summary"]["accuracy"] is None
+    complete = store.session_history(status="complete")
+    assert complete["total"] == 1
+    assert complete["items"][0]["session_id"] == completed["session_id"]
+    assert complete["items"][0]["summary"]["wrong"] == 1
+    assert other.session_history()["total"] == 1
+    with pytest.raises(ValueError):
+        store.session_history(status="deleted")
 
 
 def test_collection_order_memorize_mode_and_early_finish(

@@ -635,6 +635,144 @@ class PracticeStore:
             "items": items,
         }
 
+    def session_history(
+        self,
+        *,
+        status: object = "",
+        limit: object = 20,
+        offset: object = 0,
+    ) -> dict[str, Any]:
+        status_value = display_text(status).lower()
+        if status_value and status_value not in {"active", "complete"}:
+            raise ValueError("练习记录状态无效")
+        try:
+            limit_value = max(1, min(int(limit), 100))
+            offset_value = max(0, int(offset))
+        except (TypeError, ValueError) as error:
+            raise ValueError("练习记录分页参数无效") from error
+        conditions = ["s.profile_id = ?"]
+        parameters: list[object] = [self.profile_id]
+        if status_value:
+            conditions.append("s.status = ?")
+            parameters.append(status_value)
+        where = " AND ".join(conditions)
+        connection = self.connect()
+        try:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM practice_sessions s WHERE {where}", parameters
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"""
+                SELECT s.session_id, s.collection_id, s.mode, s.filters_json,
+                       s.total_questions, s.status, s.created_at, s.completed_at,
+                       s.duration_ms, s.saved_kind,
+                       SUM(CASE WHEN q.answered_at IS NOT NULL THEN 1 ELSE 0 END) AS answered,
+                       SUM(CASE WHEN q.is_correct = 1 THEN 1 ELSE 0 END) AS correct,
+                       SUM(CASE WHEN q.is_correct = 0 THEN 1 ELSE 0 END) AS wrong,
+                       SUM(CASE WHEN q.answered_at IS NOT NULL AND q.is_correct IS NULL THEN 1 ELSE 0 END) AS ungraded,
+                       COALESCE(s.completed_at, MAX(q.answered_at), s.created_at) AS last_activity_at
+                FROM practice_sessions s
+                LEFT JOIN practice_session_questions q ON q.session_id = s.session_id
+                WHERE {where}
+                GROUP BY s.session_id
+                ORDER BY last_activity_at DESC, s.session_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*parameters, limit_value, offset_value),
+            ).fetchall()
+            stats_rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM practice_sessions WHERE profile_id = ? GROUP BY status
+                """,
+                (self.profile_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        collection_ids = list(
+            dict.fromkeys(row["collection_id"] for row in rows if row["collection_id"])
+        )
+        collections = {
+            collection_id: self.catalog.get_collection(collection_id)
+            for collection_id in collection_ids
+        }
+        items = []
+        for row in rows:
+            try:
+                filters = json.loads(row["filters_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                filters = {}
+            if not isinstance(filters, dict):
+                filters = {}
+            collection = collections.get(row["collection_id"])
+            answered = int(row["answered"] or 0)
+            correct = int(row["correct"] or 0)
+            wrong = int(row["wrong"] or 0)
+            ungraded = int(row["ungraded"] or 0)
+            reveal_results = row["mode"] != "test" or row["status"] == "complete"
+            graded = correct + wrong
+            items.append(
+                {
+                    "session_id": row["session_id"],
+                    "title": self._session_history_title(row, collection, filters),
+                    "collection_id": row["collection_id"],
+                    "relative_path": collection.get("relative_path", "") if collection else "",
+                    "mode": row["mode"],
+                    "status": row["status"],
+                    "saved_kind": row["saved_kind"],
+                    "created_at": row["created_at"],
+                    "completed_at": row["completed_at"],
+                    "last_activity_at": row["last_activity_at"] or row["created_at"],
+                    "duration_ms": row["duration_ms"],
+                    "summary": {
+                        "total": int(row["total_questions"]),
+                        "answered": answered,
+                        "correct": correct if reveal_results else None,
+                        "wrong": wrong if reveal_results else None,
+                        "ungraded": ungraded if reveal_results else None,
+                        "accuracy": (
+                            round((correct / graded) * 100)
+                            if reveal_results and graded
+                            else None
+                        ),
+                        "progress": round(
+                            (answered / int(row["total_questions"])) * 100
+                        )
+                        if row["total_questions"]
+                        else 0,
+                    },
+                }
+            )
+        stats = {"total": 0, "active": 0, "complete": 0}
+        for row in stats_rows:
+            count = int(row["count"])
+            stats[row["status"]] = count
+            stats["total"] += count
+        return {
+            "items": items,
+            "total": int(total),
+            "status": status_value,
+            "limit": limit_value,
+            "offset": offset_value,
+            "has_more": offset_value + len(items) < int(total),
+            "stats": stats,
+        }
+
+    @staticmethod
+    def _session_history_title(
+        session: sqlite3.Row,
+        collection: dict[str, Any] | None,
+        filters: dict[str, Any],
+    ) -> str:
+        if collection:
+            return display_text(collection.get("title")) or "题库练习"
+        if session["saved_kind"] == "favorite":
+            return "收藏练习"
+        if session["saved_kind"] == "wrong":
+            return "错题重练"
+        question_type = display_text(filters.get("question_type"))
+        return f"{question_type}练习" if question_type else "随机练习"
+
     def collection_outline(self, collection_id: str) -> dict[str, Any]:
         collection_id = display_text(collection_id)
         collection = self.catalog.get_collection(collection_id)

@@ -65,6 +65,8 @@ const state = {
   myComments: null,
   myNotes: null,
   myLikes: null,
+  practiceHistory: null,
+  practiceHistoryStatus: "",
   messageTab: "system",
   messageData: null,
   notificationPollHandle: null,
@@ -215,6 +217,7 @@ async function enterApp(user) {
   state.myComments = null;
   state.myNotes = null;
   state.myLikes = null;
+  state.practiceHistory = null;
   state.messageData = null;
   state.profileConnections = null;
   $("#auth-page").hidden = true;
@@ -254,7 +257,7 @@ async function route() {
     return;
   }
   document.body.classList.remove("in-session", "outline-open");
-  const allowed = ["library", "search", "favorites", "wrong", "profile", "profile-detail", "connections", "settings", "messages", "my-comments", "notes", "my-likes", "ai", "forum", "admin"];
+  const allowed = ["library", "search", "favorites", "wrong", "profile", "profile-detail", "connections", "history", "settings", "messages", "my-comments", "notes", "my-likes", "ai", "forum", "admin"];
   if (!allowed.includes(target)) {
     await navigateHash("#library", { replace: true });
     return;
@@ -267,7 +270,7 @@ async function route() {
   stopTimer();
   showPage(page);
   const studyPages = ["my-comments", "notes", "my-likes", "favorites", "wrong"];
-  const accountPages = ["profile-detail", "connections", "settings", "messages"];
+  const accountPages = ["profile-detail", "connections", "history", "settings", "messages"];
   if (studyPages.includes(page)) {
     state.studyReturnHash = descriptor.returnHash || "#library";
   }
@@ -306,6 +309,8 @@ async function route() {
       descriptor.tab,
       descriptor.query
     );
+  } else if (page === "history") {
+    await renderPracticeHistoryPage(descriptor.status);
   } else if (page === "settings") {
     renderSettingsPage();
   } else if (page === "messages") {
@@ -381,6 +386,7 @@ function parseRouteHash() {
     query: params.get("query") || "",
     topicId: params.get("topic") || "",
     sectionId: params.get("section") || "",
+    status: params.get("status") || "",
     returnHash: normalizeStudyReturnHash(params.get("return") || ""),
   };
 }
@@ -389,7 +395,7 @@ function normalizeStudyReturnHash(value, fallback = "") {
   const candidate = String(value || "").trim();
   if (!candidate.startsWith("#")) return fallback;
   const target = candidate.slice(1).split("?", 1)[0];
-  const allowed = new Set(["library", "profile", "profile-detail", "connections", "favorites", "wrong", "my-comments", "notes", "my-likes"]);
+  const allowed = new Set(["library", "profile", "profile-detail", "connections", "history", "favorites", "wrong", "my-comments", "notes", "my-likes"]);
   return allowed.has(target) ? candidate : fallback;
 }
 
@@ -403,6 +409,7 @@ function studyReturnLabel(hash = state.studyReturnHash) {
     "my-comments": "我的评论",
     notes: "我的笔记",
     "my-likes": "我的点赞",
+    history: "练习记录",
   })[target] || "上一页";
 }
 
@@ -1728,7 +1735,7 @@ async function renderMyHomePage() {
     const profile = await api(`/profiles/${encodeURIComponent(user.user_id)}`);
     state.publicProfile = profile;
     const stats = profile.stats || {};
-    const commonActions = `${user.role === "admin" ? homeUtility("系统管理", "admin", "admin", "open-admin") : ""}${homeUtility("下载数据", "download", "download")}`;
+    const commonActions = `${user.role === "admin" ? homeUtility("系统管理", "admin", "admin", "open-admin") : ""}${homeUtility("练习记录", "history", "history")}${homeUtility("下载数据", "download", "download")}`;
     container.innerHTML = `<div class="my-home">
       <section class="my-home-hero" data-action="open-own-profile" role="button" tabindex="0"><span class="profile-avatar profile-avatar-xl">${avatarVisual(profile, profile.username)}</span><div><h1>${escapeHtml(profile.username || "我的")}</h1><p>IP属地 ${escapeHtml(profile.ip_location || "本地")} · ${escapeHtml(profile.school || "学校未设置")}</p></div><span class="my-home-chevron">›</span></section>
       <nav class="my-home-stats card" aria-label="个人数据">${profileStatLink("dynamics", "动态", stats.dynamics || 0, "profile-detail", profile.user_id, "#profile")}${profileStatLink("following", "关注", stats.following || 0, "connections", profile.user_id, "#profile")}${profileStatLink("followers", "粉丝", stats.followers || 0, "connections", profile.user_id, "#profile")}</nav>
@@ -1739,6 +1746,94 @@ async function renderMyHomePage() {
   } catch (error) {
     container.innerHTML = emptyMarkup("个人空间读取失败", error.message, "!");
   }
+}
+
+function practiceHistoryRouteHash(status = "") {
+  const normalized = ["active", "complete"].includes(status) ? status : "";
+  return normalized ? `#history?status=${normalized}` : "#history";
+}
+
+async function renderPracticeHistoryPage(status = "") {
+  const container = $("#page-history");
+  state.practiceHistoryStatus = ["active", "complete"].includes(status) ? status : "";
+  container.innerHTML = `${practiceHistoryHeader()}${loadingMarkup("正在读取练习记录")}`;
+  try {
+    const params = new URLSearchParams({ limit: "20", offset: "0" });
+    if (state.practiceHistoryStatus) params.set("status", state.practiceHistoryStatus);
+    state.practiceHistory = await api(`/study/sessions?${params}`);
+    renderPracticeHistoryContent();
+  } catch (error) {
+    container.innerHTML = `${practiceHistoryHeader()}${emptyMarkup("练习记录读取失败", error.message, "!")}`;
+  }
+}
+
+function practiceHistoryHeader() {
+  return `<div class="page-header account-page-header"><div class="page-title"><p class="eyebrow">学习记录</p><h1>练习记录</h1><p class="section-copy">继续未完成练习，或打开历史试卷复盘。</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-to-profile">‹ 返回我的</button></div></div>`;
+}
+
+function renderPracticeHistoryContent() {
+  const payload = state.practiceHistory || {};
+  const stats = payload.stats || {};
+  const items = payload.items || [];
+  const tabs = [
+    ["", "全部", stats.total || 0],
+    ["active", "进行中", stats.active || 0],
+    ["complete", "已完成", stats.complete || 0],
+  ];
+  $("#page-history").innerHTML = `${practiceHistoryHeader()}
+    <nav class="history-tabs card" aria-label="练习记录状态">${tabs.map(([value, label, count]) => `<button class="${state.practiceHistoryStatus === value ? "active" : ""}" type="button" data-action="history-status" data-status="${value}" aria-pressed="${state.practiceHistoryStatus === value}"><span>${label}</span><small>${formatNumber(count)}</small></button>`).join("")}</nav>
+    <section class="history-list" aria-live="polite">${items.length ? items.map(practiceHistoryCard).join("") : emptyMarkup("暂无练习记录", state.practiceHistoryStatus === "active" ? "当前没有未完成练习。" : state.practiceHistoryStatus === "complete" ? "完成练习后会显示在这里。" : "开始一次刷题后会保留记录。", "◷")}</section>
+    ${payload.has_more ? `<button class="button button-secondary history-load-more" type="button" data-action="history-load-more">加载更多</button>` : ""}`;
+}
+
+function practiceModeLabel(mode) {
+  return ({ practice: "练习", speed: "快刷", test: "测试", memorize: "背题" })[mode] || "练习";
+}
+
+function practiceHistoryCard(item) {
+  const summary = item.summary || {};
+  const completed = item.status === "complete";
+  const resultsVisible = summary.correct !== null && summary.correct !== undefined;
+  const resultCopy = resultsVisible
+    ? `<span>正确 ${formatNumber(summary.correct || 0)}</span><span>错误 ${formatNumber(summary.wrong || 0)}</span>${summary.accuracy !== null ? `<span>正确率 ${formatNumber(summary.accuracy)}%</span>` : ""}`
+    : `<span>测试进行中，交卷前隐藏成绩</span>`;
+  const duration = completed && item.duration_ms != null ? ` · ${formatHistoryDuration(item.duration_ms)}` : "";
+  const source = item.relative_path ? `<small>${escapeHtml(displaySourcePath(item.relative_path))}</small>` : "";
+  return `<article class="card history-card"><div class="history-card-head"><div><span class="status-pill ${completed ? "complete" : "active"}">${completed ? "已完成" : "进行中"}</span><span class="history-mode">${escapeHtml(practiceModeLabel(item.mode))}</span></div><time>${escapeHtml(formatDate(item.last_activity_at))}</time></div><div class="history-card-title"><h2>${escapeHtml(item.title || "练习")}</h2>${source}</div><div class="history-progress"><span><strong>${formatNumber(summary.answered || 0)} / ${formatNumber(summary.total || 0)}</strong><small>已答题</small></span><progress max="100" value="${Math.max(0, Math.min(100, Number(summary.progress || 0)))}" aria-label="练习完成进度"></progress></div><div class="history-card-foot"><div class="history-results">${resultCopy}<small>创建于 ${escapeHtml(formatDate(item.created_at))}${duration}</small></div><button class="button ${completed ? "button-secondary" : "button-primary"} button-small" type="button" data-action="open-history-session" data-session-id="${escapeAttr(item.session_id)}">${completed ? "查看复盘" : "继续答题"}</button></div></article>`;
+}
+
+function formatHistoryDuration(value) {
+  const totalMinutes = Math.max(0, Math.round(Number(value || 0) / 60000));
+  if (totalMinutes < 60) return `${totalMinutes} 分钟`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours} 小时${minutes ? ` ${minutes} 分钟` : ""}`;
+}
+
+async function loadMorePracticeHistory(button) {
+  const payload = state.practiceHistory;
+  if (!payload?.has_more) return;
+  setButtonBusy(button, true, "加载中");
+  const params = new URLSearchParams({
+    limit: String(payload.limit || 20),
+    offset: String((payload.items || []).length),
+  });
+  if (state.practiceHistoryStatus) params.set("status", state.practiceHistoryStatus);
+  try {
+    const next = await api(`/study/sessions?${params}`);
+    state.practiceHistory = { ...next, items: [...(payload.items || []), ...(next.items || [])] };
+    renderPracticeHistoryContent();
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+function openHistorySession(sessionId) {
+  if (!sessionId) return;
+  const returnHash = practiceHistoryRouteHash(state.practiceHistoryStatus);
+  state.sessionReturnTarget = { kind: "personal", collectionId: "", path: "", hash: returnHash };
+  return navigateHash(`#session/${encodeURIComponent(sessionId)}?return=${encodeURIComponent(returnHash)}`);
 }
 
 function profileStatLink(key, label, value, page, userId = "", returnHash = "", visible = true) {
@@ -1756,6 +1851,7 @@ function utilityIcon(name) {
   const paths = {
     admin: '<rect x="4" y="3" width="16" height="18" rx="3"></rect><path d="M8 8h8M8 12h8M8 16h5"></path>',
     download: '<path d="M12 3v12M7.5 10.5 12 15l4.5-4.5"></path><path d="M5 20h14"></path>',
+    history: '<path d="M4 5h16v15H4z"></path><path d="M8 3v4M16 3v4M8 11h8M8 15h5"></path>',
     help: '<circle cx="12" cy="12" r="9"></circle><path d="M9.8 9a2.4 2.4 0 1 1 3.1 2.3c-.9.4-.9 1.2-.9 1.7M12 17h.01"></path>',
     contact: '<path d="M5 15v-3a7 7 0 0 1 14 0v3"></path><path d="M5 14H4a2 2 0 0 0-2 2v1a2 2 0 0 0 2 2h2v-5H5ZM19 14h1a2 2 0 0 1 2 2v1a2 2 0 0 1-2 2h-2v-5h1ZM18 19c-1 1.3-2.7 2-5 2"></path>',
     feedback: '<path d="M4 5h16v11H9l-5 4V5Z"></path><path d="M8 9h8M8 12h5"></path>',
@@ -2019,6 +2115,7 @@ async function messageProfile(userId, name) {
 
 function handleHomeUtility(utility) {
   if (utility === "settings") return navigateHash("#settings");
+  if (utility === "history") return navigateHash("#history");
   if (utility === "download") return exportPersonalStudy();
   if (utility === "feedback") return openFeedbackModal();
   const labels = { download: "下载", help: "帮助中心", contact: "联系客服", feedback: "意见反馈" };
@@ -3237,6 +3334,9 @@ async function handleClick(event) {
   if (action === "message-profile") return messageProfile(target.dataset.userId, target.dataset.name);
   if (action === "home-utility") return handleHomeUtility(target.dataset.utility);
   if (action === "edit-study-goal") return openStudyGoalModal();
+  if (action === "history-status") return navigateHash(practiceHistoryRouteHash(target.dataset.status || ""));
+  if (action === "history-load-more") return loadMorePracticeHistory(target);
+  if (action === "open-history-session") return openHistorySession(target.dataset.sessionId);
   if (action === "show-placeholder") return showToast(`${target.dataset.title || "该功能"}即将开放`);
   if (action === "open-profile") { state.profileEditing = false; state.profileReturnHash = location.hash || "#profile"; return navigateHash(publicProfileRouteHash(target.dataset.userId || state.user.user_id, state.profileReturnHash)); }
   if (action === "open-forum-dynamic") return navigateHash(forumRouteHash({ topic: target.dataset.topic, returnHash: location.hash || "#profile" }));
@@ -3534,6 +3634,9 @@ async function logout() {
   state.notes = {};
   state.myComments = null;
   state.myNotes = null;
+  state.myLikes = null;
+  state.practiceHistory = null;
+  state.todaySummary = null;
   location.hash = "";
   showAuth("login");
 }
