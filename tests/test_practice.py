@@ -133,6 +133,16 @@ def test_practice_blueprint_requires_login_and_csrf(
         headers=headers,
         json={"count": 1, "order_mode": "unsupported"},
     ).status_code == 400
+    collection = _file_collection(catalog, "第一章.xlsx")
+    assert client.post(
+        "/api/practice/sessions",
+        headers=headers,
+        json={
+            "collection_id": collection["collection_id"],
+            "order_mode": "random",
+            "occurrence_order": [],
+        },
+    ).status_code == 400
 
     created = client.post(
         "/api/practice/sessions",
@@ -541,6 +551,7 @@ def test_collection_session_order_is_frozen_by_position_type_or_year(
         "sequential": [1, 2, 3, 4],
         "position_desc": [4, 3, 2, 1],
         "type": [1, 3, 4, 2],
+        "type_desc": [2, 3, 4, 1],
         "year_desc": [1, 3, 4, 2],
         "year_asc": [3, 4, 1, 2],
     }
@@ -552,7 +563,8 @@ def test_collection_session_order_is_frozen_by_position_type_or_year(
         )
         assert [item["collection_position"] for item in session["items"]] == positions
         assert session["filters"]["order_mode"] == order_mode
-        assert session["items"][0]["question"]["question_year"] is not None or order_mode == "sequential"
+        if order_mode.startswith("year_"):
+            assert session["items"][0]["question"]["question_year"] is not None
 
     random_session = store.create_session(
         collection_id=collection["collection_id"],
@@ -563,6 +575,53 @@ def test_collection_session_order_is_frozen_by_position_type_or_year(
         item["collection_position"] for item in random_session["items"]
     ) == [1, 2, 3, 4]
     assert random_session["filters"]["order_mode"] == "random"
+
+    explicit_order = [
+        item["occurrence_id"]
+        for item in (outline[2], outline[0], outline[3], outline[1])
+    ]
+    preview_session = store.create_session(
+        collection_id=collection["collection_id"],
+        count=None,
+        order_mode="random",
+        occurrence_order=explicit_order,
+    )
+    assert [item["collection_position"] for item in preview_session["items"]] == [
+        3,
+        1,
+        4,
+        2,
+    ]
+    exact_random = store.create_session(
+        collection_id=collection["collection_id"],
+        count=None,
+        order_mode="random",
+        occurrence_order=explicit_order,
+        start_position=4,
+        start_exact=True,
+    )
+    assert [item["collection_position"] for item in exact_random["items"]] == [4, 2]
+    with pytest.raises(ValueError, match="exact permutation"):
+        store.create_session(
+            collection_id=collection["collection_id"],
+            count=None,
+            order_mode="random",
+            occurrence_order=explicit_order[:-1],
+        )
+    with pytest.raises(ValueError, match="positive occurrence IDs"):
+        store.create_session(
+            collection_id=collection["collection_id"],
+            count=None,
+            order_mode="random",
+            occurrence_order=[str(item) for item in explicit_order],
+        )
+    with pytest.raises(ValueError, match="allowed only"):
+        store.create_session(
+            collection_id=collection["collection_id"],
+            count=None,
+            order_mode="type",
+            occurrence_order=explicit_order,
+        )
 
     exact = store.create_session(
         collection_id=collection["collection_id"],

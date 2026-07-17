@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from flask import Blueprint, g, jsonify, request
+import json
+from collections.abc import Iterable
+from typing import Any
+
+from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
 
 from .ai import AIAccessDenied, AIConflict, AINotFound, AIStore, AIUnavailable
 from .auth import csrf_required, login_required
@@ -92,11 +96,32 @@ def create_ai_blueprint(
             )
         ), 201
 
+    @blueprint.post("/conversations/<conversation_id>/messages/stream")
+    @login_required
+    @csrf_required
+    def stream_message(conversation_id: str):
+        data = _json_object()
+        ai_store = store()
+        plan = ai_store.prepare_stream_message(
+            conversation_id,
+            data.get("content", ""),
+            context=data.get("context"),
+        )
+        return _event_stream(ai_store.stream_prepared_message(plan))
+
     @blueprint.post("/conversations/<conversation_id>/regenerate")
     @login_required
     @csrf_required
     def regenerate_message(conversation_id: str):
         return jsonify(store().regenerate_last(conversation_id))
+
+    @blueprint.post("/conversations/<conversation_id>/regenerate/stream")
+    @login_required
+    @csrf_required
+    def stream_regenerated_message(conversation_id: str):
+        ai_store = store()
+        plan = ai_store.prepare_stream_regeneration(conversation_id)
+        return _event_stream(ai_store.stream_prepared_regeneration(plan))
 
     return blueprint
 
@@ -106,3 +131,45 @@ def _json_object() -> dict:
     if not isinstance(data, dict):
         raise ValueError("请求体必须是 JSON 对象")
     return data
+
+
+def _event_stream(events: Iterable[tuple[str, dict[str, Any]]]) -> Response:
+    @stream_with_context
+    def generate():
+        try:
+            for event, payload in events:
+                yield _sse(event, payload)
+        except GeneratorExit:
+            raise
+        except AIUnavailable as error:
+            yield _sse("error", {"status": "ai_unavailable", "error": str(error)})
+        except AIConflict as error:
+            yield _sse("error", {"status": "conflict", "error": str(error)})
+        except AINotFound as error:
+            yield _sse("error", {"status": "not_found", "error": str(error)})
+        except AIAccessDenied as error:
+            yield _sse("error", {"status": "forbidden", "error": str(error)})
+        except ValueError as error:
+            yield _sse("error", {"status": "invalid_request", "error": str(error)})
+        except Exception:
+            current_app.logger.exception("AI stream failed")
+            yield _sse(
+                "error",
+                {"status": "stream_error", "error": "AI 回答意外中断，请稍后重试"},
+            )
+
+    return Response(
+        generate(),
+        status=200,
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Accel-Buffering": "no",
+            "Vary": "Cookie",
+        },
+    )
+
+
+def _sse(event: str, payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {data}\n\n"

@@ -4,28 +4,29 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f5f6fa">
-  <meta name="description" content="医考知库：按原始题库目录精确检索、刷题与复习。">
-  <title>医考知库</title>
+  <meta id="site-meta-description" name="description" content="知库：可私有部署的通用题库检索、练习与复习平台。">
+  <title>知库</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='17' fill='%235a5bd7'/%3E%3Cpath d='M18 19h20c5 0 8 3 8 8v19H26c-5 0-8-3-8-8V19zm8 8v5h12v-5H26zm0 10v4h8v-4h-8z' fill='white'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/style.css?rev=outline-order-20260717">
+  <link rel="stylesheet" href="/style.css?rev=admin-purge-lazy-20260718">
 </head>
 <body>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
   <div id="notification-hint-region" class="notification-hint-region" aria-live="polite"></div>
 
   <main id="auth-page" class="auth-page" hidden>
-    <section class="auth-intro" aria-labelledby="auth-brand-title">
-      <a class="brand brand-large" href="#library" aria-label="医考知库首页">
+    <section id="auth-intro" class="auth-intro" aria-labelledby="auth-brand-title">
+      <img id="auth-site-background" class="auth-intro-background" alt="" hidden>
+      <a class="brand brand-large" href="#library" aria-label="知库首页">
         <span class="brand-mark" aria-hidden="true">知</span>
-        <span><strong id="auth-brand-title">医考知库</strong><small>Medical Exam Workspace</small></span>
+        <span><strong id="auth-brand-title">知库</strong><small data-site-subtitle>Question Bank Workspace</small></span>
       </a>
       <div class="auth-copy">
-        <p class="eyebrow">本地医学题库工作台</p>
-        <h1>把检索、练习与复习，放回同一条学习路径。</h1>
-        <p>保留原题库目录、原文件和原题号，支持精确搜题、语义检索与跨设备练习。</p>
+        <p id="auth-site-eyebrow" class="eyebrow">通用题库学习工作台</p>
+        <h1 id="auth-site-title">把检索、练习与复习，放在同一条学习路径。</h1>
+        <p id="auth-site-description">保留题库目录、来源文件和原题号，支持精确搜题、智能检索与跨设备练习。</p>
       </div>
-      <ul class="auth-points" aria-label="产品能力">
-        <li><span>01</span>按原文件精确刷题</li>
+      <ul id="auth-site-features" class="auth-points" aria-label="产品能力">
+        <li><span>01</span>按来源文件精确刷题</li>
         <li><span>02</span>收藏与错题自动归档</li>
         <li><span>03</span>账号数据完全本地保存</li>
       </ul>
@@ -60,7 +61,7 @@
       <div class="topbar-inner">
         <a class="brand" href="#library" data-nav="library" data-action="library-home">
           <span class="brand-mark" aria-hidden="true">知</span>
-          <span><strong id="site-brand-name">医考知库</strong><small>医学题库工作台</small></span>
+          <span><strong id="site-brand-name">知库</strong><small data-site-subtitle>Question Bank Workspace</small></span>
         </a>
         <nav class="desktop-nav" aria-label="主导航">
           <a href="#library" data-nav="library">题库</a>
@@ -112,6 +113,6 @@
 
   <div id="practice-ai-drawer-root"></div>
   <div id="modal-root"></div>
-  <script src="/app.js?rev=outline-order-20260717" defer></script>
+  <script src="/app.js?rev=admin-purge-lazy-20260718" defer></script>
 </body>
 </html>

@@ -104,6 +104,7 @@ PRACTICE_ORDER_MODES = (
     "sequential",
     "position_desc",
     "type",
+    "type_desc",
     "year_desc",
     "year_asc",
     "random",
@@ -290,7 +291,7 @@ def sort_practice_items(
 
     if mode == "position_desc":
         return sorted(items, key=lambda item: (-position(item), occurrence(item)))
-    if mode == "type":
+    if mode in {"type", "type_desc"}:
         def type_order(item: dict[str, Any]) -> int:
             try:
                 value = item.get("type_order")
@@ -298,10 +299,11 @@ def sort_practice_items(
             except (TypeError, ValueError):
                 return 90
 
+        descending = mode == "type_desc"
         return sorted(
             items,
             key=lambda item: (
-                type_order(item),
+                -type_order(item) if descending else type_order(item),
                 position(item),
                 occurrence(item),
             ),

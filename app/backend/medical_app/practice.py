@@ -22,6 +22,21 @@ DEFAULT_DAILY_QUESTION_TARGET = 20
 DEFAULT_DAILY_DURATION_TARGET_MINUTES = 30
 
 
+def _normalize_occurrence_order(value: object) -> list[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value or len(value) > 5000:
+        raise ValueError("occurrence_order must be a non-empty array with at most 5000 items")
+    normalized: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise ValueError("occurrence_order must contain positive occurrence IDs")
+        normalized.append(item)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("occurrence_order must not contain duplicate occurrence IDs")
+    return normalized
+
+
 class PracticeUnavailable(RuntimeError):
     pass
 
@@ -421,6 +436,7 @@ class PracticeStore:
         start_position: int = 1,
         start_exact: bool = False,
         saved_kind: str = "",
+        occurrence_order: object = None,
     ) -> dict[str, Any]:
         filters = filters or {}
         collection_id = display_text(collection_id)
@@ -430,6 +446,11 @@ class PracticeStore:
         order_mode = normalize_practice_order_mode(order_mode)
         if not isinstance(start_exact, bool):
             raise ValueError("start_exact must be a boolean")
+        normalized_occurrence_order = _normalize_occurrence_order(occurrence_order)
+        if normalized_occurrence_order is not None and order_mode != "random":
+            raise ValueError("occurrence_order is allowed only for random order")
+        if normalized_occurrence_order is not None and not collection_id:
+            raise ValueError("occurrence_order requires collection_id")
         saved_kind = display_text(saved_kind).lower()
         if saved_kind not in {"", "favorite", "wrong"}:
             raise ValueError("saved_kind must be favorite or wrong")
@@ -442,6 +463,7 @@ class PracticeStore:
                 start_exact=start_exact,
                 order_mode=order_mode,
                 canonical_type=filters.get("question_type", ""),
+                occurrence_order=normalized_occurrence_order,
             )
         elif collection_id:
             selected_items = self.catalog.select_practice_items(
@@ -451,6 +473,7 @@ class PracticeStore:
                 start_exact=start_exact,
                 order_mode=order_mode,
                 canonical_type=filters.get("question_type", ""),
+                occurrence_order=normalized_occurrence_order,
             )
         else:
             question_count = 10 if count in (None, 0, "") else int(count)
@@ -1166,6 +1189,51 @@ class PracticeStore:
             connection.close()
         return cursor.rowcount == 1
 
+    def delete_comments_bulk(self, comment_ids: object) -> dict[str, Any]:
+        if not isinstance(comment_ids, list) or not 1 <= len(comment_ids) <= 100:
+            raise ValueError("批量评论必须包含 1 到 100 条评论")
+        normalized_ids = [display_text(value) for value in comment_ids]
+        if (
+            any(not value or len(value) > 128 for value in normalized_ids)
+            or len(set(normalized_ids)) != len(normalized_ids)
+        ):
+            raise ValueError("批量评论 ID 必须有效且不能重复")
+        placeholders = ",".join("?" for _ in normalized_ids)
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                f"SELECT comment_id FROM question_comments WHERE comment_id IN ({placeholders})",
+                normalized_ids,
+            ).fetchall()
+            if len(existing) != len(normalized_ids):
+                raise PracticeNotFound("部分评论不存在，请刷新列表后重试")
+            connection.execute(
+                f"DELETE FROM comment_reactions WHERE comment_id IN ({placeholders})",
+                normalized_ids,
+            )
+            connection.execute(
+                f"DELETE FROM notifications WHERE comment_id IN ({placeholders})",
+                normalized_ids,
+            )
+            connection.execute(
+                f"UPDATE question_comments SET parent_comment_id = NULL WHERE parent_comment_id IN ({placeholders})",
+                normalized_ids,
+            )
+            cursor = connection.execute(
+                f"DELETE FROM question_comments WHERE comment_id IN ({placeholders})",
+                normalized_ids,
+            )
+            if cursor.rowcount != len(normalized_ids):
+                raise PracticeConflict("评论批量删除发生并发变化，请刷新后重试")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {"count": len(normalized_ids), "comment_ids": normalized_ids}
+
     def update_comment(self, comment_id: str, body: object) -> dict[str, Any]:
         comment_id = display_text(comment_id)
         normalized_body = _comment_body(body)
@@ -1263,6 +1331,7 @@ class PracticeStore:
         return {
             "count": len(rows),
             "total": int(total),
+            "limit": limit,
             "offset": offset,
             "query": normalized_query,
             "items": self._decorate_comments(
@@ -2662,6 +2731,7 @@ class PracticeStore:
         start_exact: bool = False,
         order_mode: str = "sequential",
         canonical_type: str = "",
+        occurrence_order: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         limit = 5000 if count in (None, 0, "") else max(1, min(int(count), 5000))
         connection = self.connect()
@@ -2690,11 +2760,6 @@ class PracticeStore:
         selected: list[dict[str, Any]] = []
         if collection_id:
             for item in self.catalog.collection_outline(collection_id):
-                if (
-                    not start_exact
-                    and item["collection_position"] < max(1, int(start_position))
-                ):
-                    continue
                 saved = by_occurrence.get(item["occurrence_id"])
                 if not saved:
                     continue
@@ -2703,7 +2768,36 @@ class PracticeStore:
                 selected.append(
                     item
                 )
-            if order_mode == "random":
+            explicit_random_positions: dict[int, int] | None = None
+            if occurrence_order is not None:
+                expected_occurrences = [
+                    int(item["occurrence_id"]) for item in selected
+                ]
+                if (
+                    len(occurrence_order) != len(expected_occurrences)
+                    or len(set(occurrence_order)) != len(occurrence_order)
+                    or set(occurrence_order) != set(expected_occurrences)
+                ):
+                    raise ValueError(
+                        "occurrence_order must be an exact permutation of the selected collection"
+                    )
+                explicit_random_positions = {
+                    occurrence_id: position
+                    for position, occurrence_id in enumerate(occurrence_order)
+                }
+            if not start_exact:
+                selected = [
+                    item
+                    for item in selected
+                    if item["collection_position"] >= max(1, int(start_position))
+                ]
+            if order_mode == "random" and explicit_random_positions is not None:
+                selected.sort(
+                    key=lambda item: explicit_random_positions[
+                        int(item["occurrence_id"])
+                    ]
+                )
+            elif order_mode == "random":
                 secrets.SystemRandom().shuffle(selected)
             else:
                 selected = sort_practice_items(selected, order_mode)

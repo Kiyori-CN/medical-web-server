@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import io
 from collections.abc import Callable
 from typing import Any
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 
 from .auth import admin_required, csrf_required, login_required
 from .providers import (
@@ -15,7 +16,11 @@ from .providers import (
     provider_models_url,
     test_chat_provider,
 )
-from .settings import SettingsStore, SettingsUnavailable
+from .settings import (
+    LOGIN_BACKGROUND_MAX_BYTES,
+    SettingsStore,
+    SettingsUnavailable,
+)
 
 
 def create_settings_blueprint(
@@ -37,6 +42,33 @@ def create_settings_blueprint(
     @blueprint.errorhandler(ValueError)
     def handle_value_error(error):
         return jsonify({"error": str(error)}), 400
+
+    @blueprint.get("/site")
+    def site_settings():
+        response = jsonify(store.public_site_settings())
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+    @blueprint.get("/site/login-background")
+    def login_background():
+        asset = store.login_background()
+        if asset is None:
+            return jsonify({"error": "登录背景图片不存在"}), 404
+        immutable = request.args.get("v", "") == asset["sha256"][:20]
+        response = send_file(
+            io.BytesIO(asset["content"]),
+            mimetype=asset["media_type"],
+            download_name=f"login-background-{asset['sha256'][:20]}.webp",
+            conditional=True,
+            etag=asset["sha256"],
+            max_age=31536000 if immutable else 0,
+        )
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable"
+            if immutable
+            else "public, no-cache"
+        )
+        return response
 
     @blueprint.get("/settings")
     @login_required
@@ -63,6 +95,24 @@ def create_settings_blueprint(
         payload["vector_index"] = vector_status() if vector_status else {"status": "unavailable"}
         return jsonify(payload)
 
+    @blueprint.post("/admin/settings/login-background")
+    @admin_required
+    @csrf_required
+    def update_login_background():
+        upload = request.files.get("background")
+        if upload is None or not upload.filename:
+            raise ValueError("请选择登录背景图片")
+        payload = upload.stream.read(LOGIN_BACKGROUND_MAX_BYTES + 1)
+        site = store.set_login_background(payload)
+        return jsonify({"site": site})
+
+    @blueprint.delete("/admin/settings/login-background")
+    @admin_required
+    @csrf_required
+    def delete_login_background():
+        removed = store.delete_login_background()
+        return jsonify({"removed": removed, "site": store.site_settings()})
+
     @blueprint.post("/admin/settings/test")
     @admin_required
     @csrf_required
@@ -79,7 +129,7 @@ def create_settings_blueprint(
                 model=config["model"],
                 dimensions=config["dimensions"],
                 timeout=provider_timeout,
-            ).embed(["医学题库嵌入模型连接测试"])
+            ).embed(["题库嵌入模型连接测试"])
             return jsonify(
                 {
                     "status": "ok",

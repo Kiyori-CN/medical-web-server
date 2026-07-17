@@ -1,5 +1,17 @@
 const API = "/api";
 const PREFERENCE_KEY = "medical-exam-preferences";
+const DEFAULT_SITE_APPEARANCE = Object.freeze({
+  site_name: "知库",
+  site_mark: "知",
+  site_subtitle: "Question Bank Workspace",
+  site_description: "知库：可私有部署的通用题库检索、练习与复习平台。",
+  login_eyebrow: "通用题库学习工作台",
+  login_title: "把检索、练习与复习，放在同一条学习路径。",
+  login_description: "保留题库目录、来源文件和原题号，支持精确搜题、智能检索与跨设备练习。",
+  login_features: ["按来源文件精确刷题", "收藏与错题自动归档", "账号数据完全本地保存"],
+  login_background: { configured: false, version: "", width: 0, height: 0 },
+  allow_registration: true,
+});
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -8,6 +20,7 @@ const state = {
   user: null,
   setupRequired: false,
   authMode: "login",
+  site: { ...DEFAULT_SITE_APPEARANCE },
   settings: null,
   stats: null,
   todaySummary: null,
@@ -23,6 +36,7 @@ const state = {
   outline: null,
   outlineMode: "practice",
   outlineOrderMode: "type",
+  outlineRandomOccurrenceOrder: [],
   session: null,
   sessionIndex: 0,
   sessionReturnTarget: null,
@@ -47,6 +61,12 @@ const state = {
   lastSearchQuery: "",
   adminTab: "overview",
   adminData: null,
+  adminRuntime: {},
+  adminGeneration: 0,
+  adminSelections: { users: new Set(), comments: new Set(), forum: new Set() },
+  siteBackgroundPreviewUrl: "",
+  siteBackgroundPending: false,
+  siteSettingsDirty: false,
   feedback: null,
   catalogImportPreview: null,
   profileAvatarDraft: null,
@@ -89,6 +109,8 @@ const state = {
     sending: false,
     pending: null,
     abortController: null,
+    streamRenderFrame: null,
+    error: "",
     draft: "",
     drafts: {},
     contextOccurrence: null,
@@ -106,6 +128,7 @@ const state = {
     topic: null,
     composerOpen: false,
     replyTo: null,
+    renderToken: 0,
   },
 };
 
@@ -122,10 +145,13 @@ window.addEventListener("resize", handlePracticeResize);
 async function boot() {
   applyTheme();
   try {
-    const [setup, me] = await Promise.all([
+    const [site, setup, me] = await Promise.all([
+      api("/site", { authRedirect: false }).catch(() => null),
       api("/auth/setup", { authRedirect: false }),
       api("/auth/me", { authRedirect: false }),
     ]);
+    if (site) state.site = normalizeSiteAppearance(site);
+    applySiteAppearance(state.site);
     state.setupRequired = Boolean(setup.setup_required);
     if (me.authenticated && me.user) {
       await enterApp(me.user);
@@ -175,10 +201,188 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function apiEventStream(path, { body, signal, onEvent } = {}) {
+  const headers = new Headers({
+    Accept: "text/event-stream",
+    "Content-Type": "application/json",
+  });
+  const csrf = getCookie("medical_csrf");
+  if (csrf) headers.set("X-CSRF-Token", csrf);
+  const response = await fetch(`${API}${path}`, {
+    method: "POST",
+    headers,
+    credentials: "same-origin",
+    signal,
+    body: JSON.stringify(body || {}),
+  });
+  const contentType = response.headers.get("content-type") || "";
+  if (!response.ok) {
+    let payload = {};
+    try {
+      payload = contentType.includes("application/json")
+        ? await response.json()
+        : { error: await response.text() };
+    } catch (_) {
+      payload = {};
+    }
+    if (response.status === 401) {
+      state.user = null;
+      showAuth("login");
+    }
+    const error = new Error(payload.error || `请求失败（${response.status}）`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  if (!contentType.includes("text/event-stream") || !response.body) {
+    throw new Error("AI 服务未返回流式响应");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let completed = false;
+  let result = null;
+
+  const dispatch = (block) => {
+    const lines = block.split("\n");
+    let eventName = "message";
+    const dataLines = [];
+    for (const line of lines) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    }
+    if (!dataLines.length) return;
+    let payload;
+    try {
+      payload = JSON.parse(dataLines.join("\n"));
+    } catch (_) {
+      throw new Error("AI 流式响应格式无效");
+    }
+    if (eventName === "error") {
+      const error = new Error(payload.error || "AI 回答意外中断");
+      error.payload = payload;
+      error.status = payload.status || "stream_error";
+      throw error;
+    }
+    if (eventName === "complete") {
+      completed = true;
+      result = payload;
+    }
+    onEvent?.(eventName, payload);
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      buffer = buffer.replace(/\r\n|\r/g, "\n");
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary).trim();
+        buffer = buffer.slice(boundary + 2);
+        if (block) dispatch(block);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
+    }
+    if (buffer.trim()) dispatch(buffer.trim());
+    if (!completed || !result) throw new Error("AI 流式连接在完成前中断");
+    return result;
+  } catch (error) {
+    try { await reader.cancel(error); } catch (_) { /* connection is already closed */ }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function getCookie(name) {
   const prefix = `${name}=`;
   const item = document.cookie.split("; ").find((value) => value.startsWith(prefix));
   return item ? decodeURIComponent(item.slice(prefix.length)) : "";
+}
+
+function normalizeSiteAppearance(value = {}) {
+  const features = Array.isArray(value.login_features)
+    ? value.login_features.slice(0, 3).map((item) => String(item || ""))
+    : [...DEFAULT_SITE_APPEARANCE.login_features];
+  while (features.length < 3) features.push("");
+  const background = value.login_background && typeof value.login_background === "object"
+    ? value.login_background
+    : DEFAULT_SITE_APPEARANCE.login_background;
+  return {
+    ...DEFAULT_SITE_APPEARANCE,
+    ...value,
+    login_features: features,
+    login_background: {
+      configured: Boolean(background.configured),
+      version: String(background.version || ""),
+      width: Number(background.width || 0),
+      height: Number(background.height || 0),
+    },
+    allow_registration: value.allow_registration !== false,
+  };
+}
+
+function siteBackgroundUrl(site = state.site) {
+  const background = site?.login_background || {};
+  return background.configured && background.version
+    ? `${API}/site/login-background?v=${encodeURIComponent(background.version)}`
+    : "";
+}
+
+function applySiteAppearance(value = state.site) {
+  const site = normalizeSiteAppearance(value);
+  state.site = site;
+  document.title = site.site_name;
+  const meta = $("#site-meta-description");
+  if (meta) meta.setAttribute("content", site.site_description);
+  $$(".brand-mark").forEach((node) => {
+    node.textContent = site.site_mark;
+    node.classList.toggle("compact", [...site.site_mark].length > 2);
+  });
+  const authName = $("#auth-brand-title");
+  const siteName = $("#site-brand-name");
+  if (authName) authName.textContent = site.site_name;
+  if (siteName) siteName.textContent = site.site_name;
+  $$("[data-site-subtitle]").forEach((node) => {
+    node.textContent = site.site_subtitle;
+    node.hidden = !site.site_subtitle;
+  });
+  const authBrand = $(".brand-large");
+  if (authBrand) authBrand.setAttribute("aria-label", `${site.site_name}首页`);
+  const eyebrow = $("#auth-site-eyebrow");
+  const title = $("#auth-site-title");
+  const description = $("#auth-site-description");
+  if (eyebrow) { eyebrow.textContent = site.login_eyebrow; eyebrow.hidden = !site.login_eyebrow; }
+  if (title) title.textContent = site.login_title;
+  if (description) { description.textContent = site.login_description; description.hidden = !site.login_description; }
+  const features = $("#auth-site-features");
+  if (features) {
+    features.replaceChildren(...site.login_features.filter(Boolean).map((text, index) => {
+      const item = document.createElement("li");
+      const number = document.createElement("span");
+      number.textContent = String(index + 1).padStart(2, "0");
+      item.append(number, document.createTextNode(text));
+      return item;
+    }));
+    features.hidden = !features.children.length;
+  }
+  const intro = $("#auth-intro");
+  if (intro) {
+    const backgroundUrl = siteBackgroundUrl(site);
+    intro.classList.toggle("has-custom-background", Boolean(backgroundUrl));
+    const background = $("#auth-site-background");
+    if (background) {
+      background.hidden = !backgroundUrl;
+      if (backgroundUrl && background.getAttribute("src") !== backgroundUrl) {
+        background.setAttribute("src", backgroundUrl);
+      } else if (!backgroundUrl) {
+        background.removeAttribute("src");
+      }
+    }
+  }
 }
 
 function showAuth(mode) {
@@ -187,6 +391,7 @@ function showAuth(mode) {
   stopNotificationPolling();
   resetPreferenceSaveRuntime();
   document.body.classList.remove("in-session", "outline-open");
+  if (mode === "register" && !state.site.allow_registration) mode = "login";
   state.authMode = mode;
   $("#app-shell").hidden = true;
   $("#auth-page").hidden = false;
@@ -201,7 +406,9 @@ function showAuth(mode) {
           ? "注册后即可同步保存练习进度、收藏与错题。"
           : "登录后继续你的检索与训练记录。"
     }</p>`;
-  $("#auth-tabs").innerHTML = setup
+  const authTabs = $("#auth-tabs");
+  authTabs.hidden = setup || !state.site.allow_registration;
+  authTabs.innerHTML = setup || !state.site.allow_registration
     ? ""
     : `<button type="button" role="tab" class="${mode === "login" ? "active" : ""}" data-action="auth-mode" data-mode="login">登录</button>
        <button type="button" role="tab" class="${mode === "register" ? "active" : ""}" data-action="auth-mode" data-mode="register">注册</button>`;
@@ -247,7 +454,10 @@ async function enterApp(user) {
   syncUserChrome(user);
   try {
     [state.settings, state.stats] = await Promise.all([api("/settings"), api("/stats")]);
-    $("#site-brand-name").textContent = state.settings.site_name || "医考知库";
+    applySiteAppearance({
+      ...(state.settings.site || state.site),
+      allow_registration: state.settings.allow_registration,
+    });
     state.searchMode = state.settings.default_search_mode || "keyword";
   } catch (error) {
     showToast(error.message, "error");
@@ -409,6 +619,7 @@ function parseRouteHash() {
     query: params.get("query") || "",
     topicId: params.get("topic") || "",
     sectionId: params.get("section") || "",
+    sort: params.get("sort") || "",
     status: params.get("status") || "",
     returnHash: normalizeStudyReturnHash(params.get("return") || ""),
   };
@@ -418,7 +629,7 @@ function normalizeStudyReturnHash(value, fallback = "") {
   const candidate = String(value || "").trim();
   if (!candidate.startsWith("#")) return fallback;
   const target = candidate.slice(1).split("?", 1)[0];
-  const allowed = new Set(["library", "profile", "profile-detail", "connections", "history", "favorites", "wrong", "my-comments", "notes", "my-likes"]);
+  const allowed = new Set(["library", "profile", "profile-detail", "connections", "history", "favorites", "wrong", "my-comments", "notes", "my-likes", "forum"]);
   return allowed.has(target) ? candidate : fallback;
 }
 
@@ -764,6 +975,7 @@ function libraryItem(item, kind, type) {
 
 async function openCollection(kind, collectionId, parentPath = state.libraryPath[kind] || "") {
   state.outline = null;
+  state.outlineRandomOccurrenceOrder = [];
   const content = $(`#${kind}-content`);
   content.innerHTML = loadingMarkup("正在读取题号目录");
   try {
@@ -788,8 +1000,11 @@ function renderOutline() {
   const outlineItems = payload.items || [];
   const hasItems = outlineItems.length > 0;
   const orderMode = normalizeOutlineOrderMode(state.outlineOrderMode, "type");
-  const orderedItems = orderPracticeItems(outlineItems, orderMode);
-  const groups = groupOutlineItems(orderedItems, orderMode, { preserveOrder: true, randomPreview: true });
+  const randomOrder = orderMode === "random"
+    ? ensureOutlineRandomOccurrenceOrder(outlineItems)
+    : [];
+  const orderedItems = orderPracticeItems(outlineItems, orderMode, randomOrder);
+  const groups = groupOutlineItems(orderedItems, orderMode, { preserveOrder: true });
   const groupMarkup = groups.map(([label, items]) => `
     <section class="outline-group">
       <h3 class="outline-group-title"><span class="type-dot ${outlineGroupDotClass(orderMode, label)}"></span><span>${escapeHtml(label)}</span><span>${items.length} 题</span></h3>
@@ -805,7 +1020,7 @@ function renderOutline() {
     <div class="breadcrumbs"><button type="button" data-action="close-outline" data-kind="${kind}">‹ 返回当前目录</button></div>
     <div class="page-header">
       <div class="page-title"><h1>${escapeHtml(fileTitle(collection.relative_path))}</h1><p class="section-copy">${escapeHtml(displaySourcePath(collection.relative_path))} · ${formatNumber((payload.items || []).length)} 题</p></div>
-      ${hasItems ? `<div class="header-actions"><button class="button button-primary" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="1">${modeMeta(state.outlineMode).cta}</button></div>` : ""}
+      ${hasItems ? `<div class="header-actions"><button class="button button-secondary" type="button" data-action="reset-collection-progress" data-id="${escapeAttr(collection.collection_id)}">重置练习</button><button class="button button-primary" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="1">${modeMeta(state.outlineMode).cta}</button></div>` : ""}
     </div>
     ${hasItems ? `<div class="card outline-card">
       <div class="outline-toolbar">
@@ -813,10 +1028,8 @@ function renderOutline() {
           <div class="segmented" aria-label="学习模式">
             ${["practice", "speed", "test", "memorize"].map((mode) => `<button class="${state.outlineMode === mode ? "active" : ""}" type="button" data-action="outline-mode" data-mode="${mode}">${modeMeta(mode).label}</button>`).join("")}
           </div>
-          <button class="button button-secondary button-small outline-reset" type="button" data-action="reset-collection-progress" data-id="${escapeAttr(collection.collection_id)}">重置</button>
         </div>
         ${renderOutlineOrderControls(orderMode)}
-        <p class="mode-description">${modeMeta(state.outlineMode).description}</p>
         <span class="outline-summary">已答 ${summary.answered || 0} · 正确 ${summary.correct || 0} · 错误 ${summary.wrong || 0} · 未答 ${Math.max(0, (summary.total || payload.items.length) - (summary.answered || 0))}</span>
       </div>
       <div class="outline-groups">${groupMarkup}</div>
@@ -865,7 +1078,7 @@ async function resetCollectionProgress(button) {
 
 function normalizeOutlineOrderMode(value, fallback = "sequential") {
   const normalized = String(value || "").trim().toLowerCase();
-  return ["sequential", "position_desc", "type", "year_desc", "year_asc", "random"].includes(normalized)
+  return ["sequential", "position_desc", "type", "type_desc", "year_desc", "year_asc", "random"].includes(normalized)
     ? normalized
     : fallback;
 }
@@ -873,12 +1086,13 @@ function normalizeOutlineOrderMode(value, fallback = "sequential") {
 function outlineOrderMeta(orderMode) {
   const normalized = normalizeOutlineOrderMode(orderMode, "sequential");
   const modes = {
-    sequential: { key: "position", direction: "asc", directionLabel: "1 → N", sessionLabel: "题号正序" },
-    position_desc: { key: "position", direction: "desc", directionLabel: "N → 1", sessionLabel: "题号倒序" },
-    type: { key: "type", direction: "fixed", directionLabel: "标准顺序", sessionLabel: "题型排序" },
-    year_desc: { key: "year", direction: "desc", directionLabel: "新 → 旧", sessionLabel: "年份新到旧" },
-    year_asc: { key: "year", direction: "asc", directionLabel: "旧 → 新", sessionLabel: "年份旧到新" },
-    random: { key: "random", direction: "fixed", directionLabel: "每次打乱", sessionLabel: "随机顺序" },
+    sequential: { key: "position", direction: "asc", directionLabel: "正序", nextLabel: "倒序", sessionLabel: "题号正序" },
+    position_desc: { key: "position", direction: "desc", directionLabel: "倒序", nextLabel: "正序", sessionLabel: "题号倒序" },
+    type: { key: "type", direction: "asc", directionLabel: "标准", nextLabel: "逆序", sessionLabel: "题型标准顺序" },
+    type_desc: { key: "type", direction: "desc", directionLabel: "逆序", nextLabel: "标准", sessionLabel: "题型逆标准顺序" },
+    year_desc: { key: "year", direction: "desc", directionLabel: "新→旧", nextLabel: "旧→新", sessionLabel: "年份新到旧" },
+    year_asc: { key: "year", direction: "asc", directionLabel: "旧→新", nextLabel: "新→旧", sessionLabel: "年份旧到新" },
+    random: { key: "random", direction: "random", directionLabel: "再打乱", nextLabel: "再打乱", sessionLabel: "随机顺序" },
   };
   return modes[normalized];
 }
@@ -911,17 +1125,26 @@ function itemQuestionYear(item) {
   return Number.isInteger(year) && year >= 1900 && year <= 2099 ? year : null;
 }
 
-function orderPracticeItems(items, orderMode) {
+function orderPracticeItems(items, orderMode, randomOccurrenceOrder = []) {
   const mode = normalizeOutlineOrderMode(orderMode, "sequential");
-  if (mode === "random") return [...items];
+  if (mode === "random") {
+    const randomPositions = new Map(
+      randomOccurrenceOrder.map((occurrenceId, index) => [Number(occurrenceId), index])
+    );
+    return [...items].sort((left, right) => (
+      (randomPositions.get(itemOccurrenceId(left)) ?? Number.MAX_SAFE_INTEGER)
+      - (randomPositions.get(itemOccurrenceId(right)) ?? Number.MAX_SAFE_INTEGER)
+    ));
+  }
   return [...items].sort((left, right) => {
     const leftPosition = itemCollectionPosition(left);
     const rightPosition = itemCollectionPosition(right);
     if (mode === "position_desc") {
       return rightPosition - leftPosition || itemOccurrenceId(left) - itemOccurrenceId(right);
     }
-    if (mode === "type") {
-      return itemTypeOrder(left) - itemTypeOrder(right)
+    if (["type", "type_desc"].includes(mode)) {
+      const typeDifference = itemTypeOrder(left) - itemTypeOrder(right);
+      return (mode === "type_desc" ? -typeDifference : typeDifference)
         || leftPosition - rightPosition
         || itemOccurrenceId(left) - itemOccurrenceId(right);
     }
@@ -938,17 +1161,17 @@ function orderPracticeItems(items, orderMode) {
   });
 }
 
-function groupOutlineItems(items, orderMode = "type", { preserveOrder = false, randomPreview = false } = {}) {
+function groupOutlineItems(items, orderMode = "type", { preserveOrder = false } = {}) {
   const mode = normalizeOutlineOrderMode(orderMode, "type");
   const ordered = preserveOrder ? [...items] : orderPracticeItems(items, mode);
   const groups = new Map();
   ordered.forEach((item) => {
-    const label = mode === "type"
+    const label = ["type", "type_desc"].includes(mode)
       ? itemTypeLabel(item)
       : ["year_desc", "year_asc"].includes(mode)
         ? (itemQuestionYear(item) ? `${itemQuestionYear(item)} 年` : "年份未知")
         : mode === "random"
-          ? (randomPreview ? "开始时随机打乱" : "本次随机顺序")
+          ? "随机顺序"
           : outlineOrderMeta(mode).sessionLabel;
     if (!groups.has(label)) groups.set(label, []);
     groups.get(label).push(item);
@@ -973,24 +1196,60 @@ function outlineItemTitle(item, groupLabel) {
   return details.join(" · ");
 }
 
+function occurrenceOrderMatchesItems(order, items) {
+  if (!Array.isArray(order) || order.length !== items.length) return false;
+  const expected = new Set(items.map((item) => itemOccurrenceId(item)).filter(Boolean));
+  return expected.size === items.length
+    && new Set(order.map(Number)).size === order.length
+    && order.every((occurrenceId) => expected.has(Number(occurrenceId)));
+}
+
+function shuffledOccurrenceOrder(items, previous = []) {
+  const order = items.map((item) => itemOccurrenceId(item)).filter(Boolean);
+  for (let index = order.length - 1; index > 0; index -= 1) {
+    let randomIndex;
+    if (window.crypto?.getRandomValues) {
+      const value = new Uint32Array(1);
+      window.crypto.getRandomValues(value);
+      randomIndex = value[0] % (index + 1);
+    } else {
+      randomIndex = Math.floor(Math.random() * (index + 1));
+    }
+    [order[index], order[randomIndex]] = [order[randomIndex], order[index]];
+  }
+  if (order.length > 1 && order.every((value, index) => value === Number(previous[index]))) {
+    order.push(order.shift());
+  }
+  return order;
+}
+
+function ensureOutlineRandomOccurrenceOrder(items) {
+  if (!occurrenceOrderMatchesItems(state.outlineRandomOccurrenceOrder, items)) {
+    state.outlineRandomOccurrenceOrder = shuffledOccurrenceOrder(items);
+  }
+  return state.outlineRandomOccurrenceOrder;
+}
+
 function renderOutlineOrderControls(orderMode) {
   const meta = outlineOrderMeta(orderMode);
-  const directionDisabled = meta.direction === "fixed";
-  const helper = meta.key === "random"
-    ? "每次开始重新打乱，本次会话内顺序固定"
-    : "刷题导航与题号抽屉沿用此顺序";
-  const directionLabel = meta.key === "type"
-    ? "题型使用标准医学顺序"
-    : meta.key === "random"
-      ? "每次开始都会重新打乱"
-      : `切换${meta.key === "year" ? "年份" : "题号"}排序方向`;
   return `<div class="outline-order-row">
-    <div class="outline-order-copy"><strong>目录排序</strong><small>${helper}</small></div>
-    <div class="outline-order-controls">
-      <div class="segmented outline-order-segmented" role="group" aria-label="题号目录排序">
-        ${[["position", "题号"], ["type", "题型"], ["year", "年份"], ["random", "随机"]].map(([key, label]) => `<button class="${meta.key === key ? "active" : ""}" type="button" data-action="outline-order-key" data-order-key="${key}" aria-pressed="${meta.key === key}">${label}</button>`).join("")}
-      </div>
-      <button class="button button-secondary button-small outline-order-direction" type="button" data-action="outline-order-direction" ${directionDisabled ? "disabled" : ""} aria-label="${directionLabel}">${meta.directionLabel}</button>
+    <div class="segmented outline-order-segmented" role="group" aria-label="题号排列方式">
+      ${[["position", "题号"], ["type", "题型"], ["year", "年份"], ["random", "随机"]].map(([key, label]) => {
+        const active = meta.key === key;
+        const directionArrow = active && key !== "random"
+          ? (meta.direction === "asc" ? "↑" : "↓")
+          : "";
+        const inactiveAriaLabel = {
+          position: "按题号正序排列",
+          type: "按题型标准顺序排列",
+          year: "按年份从新到旧排列",
+          random: "随机打乱题号",
+        }[key];
+        const ariaLabel = active
+          ? `${label}${meta.directionLabel}，点击${key === "random" ? "重新打乱" : `切换为${meta.nextLabel}`}`
+          : inactiveAriaLabel;
+        return `<button class="${active ? "active" : ""}" type="button" data-action="outline-order-key" data-order-key="${key}" aria-label="${ariaLabel}" aria-pressed="${active}"><span>${label}</span>${directionArrow ? `<span class="outline-order-arrow" aria-hidden="true">${directionArrow}</span>` : ""}</button>`;
+      }).join("")}
     </div>
   </div>`;
 }
@@ -1009,25 +1268,21 @@ function modeMeta(mode) {
       label: "练习模式",
       short: "练习",
       cta: "开始练习",
-      description: "逐题作答，提交后立即查看正确答案与解析。",
     },
     speed: {
       label: "快刷模式",
       short: "快刷",
       cta: "开始快刷",
-      description: "选对即进入下一题，选错停留并展开解析。",
     },
     test: {
       label: "测试模式",
       short: "测试",
       cta: "开始测试",
-      description: "作答后自动进入下一题，交卷前不显示对错。",
     },
     memorize: {
       label: "背题模式",
       short: "背题",
       cta: "开始背题",
-      description: "直接查看答案、考点与解析，不需要提交作答。",
     },
   };
   return modes[mode] || modes.practice;
@@ -1319,6 +1574,16 @@ async function startSession({
     order_mode: normalizedOrderMode,
     mode,
   };
+  if (
+    normalizedOrderMode === "random"
+    && state.outline?.payload?.collection?.collection_id === collectionId
+  ) {
+    const outlineItems = state.outline.payload.items || [];
+    const occurrenceOrder = ensureOutlineRandomOccurrenceOrder(outlineItems);
+    if (occurrenceOrderMatchesItems(occurrenceOrder, outlineItems)) {
+      body.occurrence_order = [...occurrenceOrder];
+    }
+  }
   if (kind === "favorites") body.saved_kind = "favorite";
   if (kind === "wrong") body.saved_kind = "wrong";
   try {
@@ -2614,11 +2879,6 @@ function showNotificationHint(message) {
   }, 2800);
 }
 
-function renderPlaceholderPage(page) {
-  const meta = page === "ai" ? ["AI", "AI 助手", "对话与智能学习功能将在后续接入。", "✦"] : ["论坛", "学习论坛", "主题讨论功能将在后续开放。", "◌"];
-  $(`#page-${page}`).innerHTML = emptyMarkup(meta[1], meta[2], meta[3]);
-}
-
 function activateAIConversation(id) {
   const nextId = String(id || "");
   if (state.ai.activeId) state.ai.drafts[state.ai.activeId] = state.ai.draft || "";
@@ -2628,9 +2888,10 @@ function activateAIConversation(id) {
 
 function aiConversationMarkup(item, activeId) {
   const active = item.conversation_id === activeId ? " active" : "";
-  return `<button class="ai-conversation${active}" type="button" data-action="ai-select" data-id="${escapeAttr(item.conversation_id)}">
-    <strong>${escapeHtml(item.title || "新对话")}</strong>
-    <span>${escapeHtml(item.preview || "暂无消息")}</span>
+  const locked = state.ai.sending && item.conversation_id !== activeId;
+  return `<button class="ai-conversation${active}" type="button" data-action="ai-select" data-id="${escapeAttr(item.conversation_id)}" ${locked ? "disabled" : ""} ${active ? 'aria-current="true"' : ""}>
+    <span class="ai-conversation-icon" aria-hidden="true">${item.context_occurrence_id ? "题" : "✦"}</span>
+    <span class="ai-conversation-copy"><strong>${escapeHtml(item.title || "新对话")}</strong><span>${escapeHtml(item.preview || "暂无消息")}</span></span>
     <small>${formatDate(item.updated_at)}</small>
   </button>`;
 }
@@ -2643,10 +2904,14 @@ function aiMessageMarkup(message, { canRegenerate = false, surface = "page" } = 
       : `<a href="#search" data-action="ai-citation" data-query="${escapeAttr(item.source || item.question_id || "")}">${label}</a>`;
   }).join("");
   const content = escapeHtml(message.content || "").replace(/\n/g, "<br>");
-  const actions = message.role === "assistant" ? `<div class="ai-message-actions"><button class="text-button" type="button" data-action="ai-copy" data-message-id="${escapeAttr(message.message_id)}">复制</button><button class="text-button" type="button" data-action="ai-continue" data-message-id="${escapeAttr(message.message_id)}">继续追问</button>${canRegenerate ? `<button class="text-button" type="button" data-action="ai-regenerate" data-message-id="${escapeAttr(message.message_id)}">重新生成</button>` : ""}</div>` : "";
-  return `<article class="ai-message ${message.role === "user" ? "user" : "assistant"}${message.pending ? " pending" : ""}">
-    <div class="ai-message-role">${message.role === "user" ? `我${message.pending ? " · 等待回答" : ""}` : "AI 学习助手"}</div>
-    <div class="ai-message-body">${content}</div>
+  const actions = message.role === "assistant" && !message.streaming ? `<div class="ai-message-actions"><button class="text-button" type="button" data-action="ai-copy" data-message-id="${escapeAttr(message.message_id)}">复制</button><button class="text-button" type="button" data-action="ai-continue" data-message-id="${escapeAttr(message.message_id)}">继续追问</button>${canRegenerate ? `<button class="text-button" type="button" data-action="ai-regenerate" data-message-id="${escapeAttr(message.message_id)}">重新生成</button>` : ""}</div>` : "";
+  const roleLabel = message.role === "user"
+    ? `我${message.pending ? " · 已发送" : ""}`
+    : `AI 学习助手${message.streaming ? " · 正在回答" : ""}`;
+  const streamingPlaceholder = message.streaming && !content ? `<span class="ai-stream-cursor" aria-label="正在生成"></span>` : "";
+  return `<article class="ai-message ${message.role === "user" ? "user" : "assistant"}${message.pending ? " pending" : ""}${message.streaming ? " streaming" : ""}" ${message.streaming ? `aria-busy="true" data-ai-stream-conversation="${escapeAttr(message.conversationId || "")}"` : ""}>
+    <div class="ai-message-role">${roleLabel}</div>
+    <div class="ai-message-body" ${message.streaming ? 'data-ai-stream-content="true"' : ""}>${content}${streamingPlaceholder}${message.streaming && content ? `<span class="ai-stream-cursor" aria-hidden="true"></span>` : ""}</div>
     ${citations ? `<div class="ai-citations"><span>题库引用</span>${citations}</div>` : ""}
     ${actions}
   </article>`;
@@ -2655,12 +2920,19 @@ function aiMessageMarkup(message, { canRegenerate = false, surface = "page" } = 
 function aiConversationMessages(activeId, surface = "page") {
   const stored = state.ai.messages[activeId] || [];
   const pending = state.ai.pending?.conversationId === activeId
-    ? [...stored, { role: "user", content: state.ai.pending.content, citations: [], pending: true }]
+    ? state.ai.pending.mode === "regenerate"
+      ? stored.map((message) => message.message_id === state.ai.pending.messageId
+        ? { ...message, content: state.ai.pending.streamContent, citations: state.ai.pending.citations || [], streaming: true, conversationId: activeId }
+        : message)
+      : [...stored,
+        { role: "user", content: state.ai.pending.content, citations: [], pending: true },
+        { role: "assistant", content: state.ai.pending.streamContent, citations: state.ai.pending.citations || [], streaming: true, conversationId: activeId },
+      ]
     : stored;
   return pending.length
     ? pending.map((message, index) => aiMessageMarkup(message, {
       surface,
-      canRegenerate: !message.pending && message.role === "assistant" && index === pending.length - 1,
+      canRegenerate: !state.ai.sending && !message.pending && !message.streaming && message.role === "assistant" && index === pending.length - 1,
     })).join("")
     : "";
 }
@@ -2670,10 +2942,32 @@ function aiComposerMarkup({ surface = "page" } = {}) {
   return `<form id="${drawer ? "practice-ai-chat-form" : "ai-chat-form"}" class="ai-composer" data-form="ai-chat" data-ai-surface="${surface}">
     ${drawer
       ? `<input type="hidden" name="scope" value="question"><div class="ai-drawer-scope"><span>仅围绕当前题对话</span><small>关闭后答题位置和草稿保持不变</small></div>`
-      : `<label class="ai-context-label"><span>检索范围</span><select name="scope"><option value="catalog"${state.ai.contextOccurrence ? "" : " selected"}>全题库</option><option value="question"${state.ai.contextOccurrence ? " selected" : " disabled"}>当前题（从刷题页发起）</option><option value="collection"${state.ai.contextCollection ? "" : " disabled"}>当前文件（从刷题页发起）</option></select></label>`}
-    <textarea name="content" rows="3" maxlength="8000" placeholder="${drawer ? "继续追问本题，按 Ctrl/⌘ + Enter 发送" : "输入你的问题，按 Ctrl/⌘ + Enter 发送"}" required>${escapeHtml(state.ai.draft || "")}</textarea>
-    <div class="ai-composer-foot"><span>AI 回答可能有误，请以原题与标准解析为准。</span>${state.ai.sending ? `<button class="button button-secondary" type="button" data-action="ai-stop">停止</button>` : `<button class="button button-primary" type="submit">发送</button>`}</div>
+      : `<label class="ai-context-label"><span>检索范围</span><select name="scope" ${state.ai.sending ? "disabled" : ""}><option value="catalog"${state.ai.contextOccurrence ? "" : " selected"}>全题库</option><option value="question"${state.ai.contextOccurrence ? " selected" : " disabled"}>当前题（从刷题页发起）</option><option value="collection"${state.ai.contextCollection ? "" : " disabled"}>当前文件（从刷题页发起）</option></select></label>`}
+    <div class="ai-composer-box"><textarea name="content" rows="3" maxlength="8000" placeholder="${drawer ? "继续追问本题" : "输入医学问题"}" ${state.ai.sending ? "disabled" : ""} required>${escapeHtml(state.ai.draft || "")}</textarea><button class="ai-send-button${state.ai.sending ? " stop" : ""}" type="${state.ai.sending ? "button" : "submit"}" ${state.ai.sending ? 'data-action="ai-stop" aria-label="停止生成"' : 'aria-label="发送问题"'}>${state.ai.sending ? "■" : "↑"}</button></div>
+    <div class="ai-composer-foot"><span>${state.ai.sending ? "正在接收回答，可随时停止" : "Ctrl / ⌘ + Enter 发送 · 回答请结合原题核对"}</span><span class="ai-draft-count">${formatNumber((state.ai.draft || "").length)} / 8000</span></div>
   </form>`;
+}
+
+function scheduleAIStreamRender() {
+  if (state.ai.streamRenderFrame) return;
+  state.ai.streamRenderFrame = window.requestAnimationFrame(() => {
+    state.ai.streamRenderFrame = null;
+    const pending = state.ai.pending;
+    if (!pending) return;
+    const boxes = $$(".ai-messages").map((box) => ({
+      box,
+      stick: box.scrollHeight - box.scrollTop - box.clientHeight < 100,
+    }));
+    $$('[data-ai-stream-content="true"]').forEach((node) => {
+      const article = node.closest("[data-ai-stream-conversation]");
+      if (article?.dataset.aiStreamConversation !== pending.conversationId) return;
+      const content = pending.streamContent || "";
+      node.innerHTML = content
+        ? `${escapeHtml(content).replace(/\n/g, "<br>")}<span class="ai-stream-cursor" aria-hidden="true"></span>`
+        : `<span class="ai-stream-cursor" aria-label="正在生成"></span>`;
+    });
+    boxes.forEach(({ box, stick }) => { if (stick) box.scrollTop = box.scrollHeight; });
+  });
 }
 
 function renderAIContent() {
@@ -2683,18 +2977,15 @@ function renderAIContent() {
   if (active && active.conversation_id !== state.ai.activeId) activateAIConversation(active.conversation_id);
   const messages = state.ai.messages[state.ai.activeId] || [];
   const messagesMarkup = aiConversationMessages(state.ai.activeId, "page");
-  container.innerHTML = `<section class="ai-page-header page-header page-header-compact">
-    <div class="page-title"><p class="eyebrow">AI 学习</p><h1>把题库变成可追问的学习助手</h1><p class="section-copy">回答会绑定当前账号，会话和题库引用只保存在本地状态库。</p></div>
-    <button class="button button-primary" type="button" data-action="ai-new">新建会话</button>
-  </section>
-  <div class="ai-layout">
+  container.innerHTML = `<div class="ai-layout">
     <aside class="card ai-sidebar" aria-label="AI 会话列表">
-      <div class="ai-sidebar-head"><strong>会话</strong><span>${formatNumber(conversations.length)}</span></div>
+      <div class="ai-sidebar-head"><div><strong>最近会话</strong><span>${formatNumber(conversations.length)}</span></div><button class="button button-primary button-small" type="button" data-action="ai-new" ${state.ai.sending ? "disabled" : ""}><span aria-hidden="true">＋</span> 新建</button></div>
       <div class="ai-conversation-list">${conversations.length ? conversations.map((item) => aiConversationMarkup(item, state.ai.activeId)).join("") : `<p class="ai-sidebar-empty">还没有会话</p>`}</div>
     </aside>
     <section class="card ai-chat-panel">
-      ${active ? `<div class="ai-chat-head"><div><strong>${escapeHtml(active.title || "新对话")}</strong><small>非流式回答 · 最多保留最近 12 条上下文</small></div><div class="ai-chat-actions"><button class="text-button" type="button" data-action="ai-rename">重命名</button><button class="text-button danger" type="button" data-action="ai-delete">删除</button></div></div>
-      <div class="ai-messages" aria-live="polite">${messagesMarkup || `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>从一道题开始</h2><p>可以问“这道题为什么选 B？”或“帮我总结这组题的易错点”。发送后会自动检索相关题库材料并附上来源。</p></div>`}</div>
+      ${active ? `<div class="ai-chat-head"><div><strong>${escapeHtml(active.title || "新对话")}</strong><small>${active.context_occurrence_id ? "当前题目会话" : "全题库检索"} · 流式回答</small></div><div class="ai-chat-actions"><button class="text-button" type="button" data-action="ai-rename" ${state.ai.sending ? "disabled" : ""}>重命名</button><button class="text-button danger" type="button" data-action="ai-delete" ${state.ai.sending ? "disabled" : ""}>删除</button></div></div>
+      ${state.ai.error ? `<div class="ai-inline-error" role="alert"><span>${escapeHtml(state.ai.error)}</span><button class="text-button" type="button" data-action="ai-dismiss-error">关闭</button></div>` : ""}
+      <div class="ai-messages" aria-live="polite" aria-busy="${state.ai.sending}">${messagesMarkup || `<div class="ai-welcome"><span aria-hidden="true">✦</span><h2>开始一次学习对话</h2><div class="ai-starter-prompts"><button type="button" data-action="ai-starter" data-prompt="帮我梳理一个医学知识点，并列出高频考法。">梳理知识点</button><button type="button" data-action="ai-starter" data-prompt="请根据题库总结一个容易混淆的鉴别要点。">辨析易错点</button><button type="button" data-action="ai-starter" data-prompt="给我制定一个针对薄弱知识点的复习步骤。">制定复习步骤</button></div></div>`}</div>
       ${aiComposerMarkup({ surface: "page" })}` : `<div class="ai-no-conversation">${emptyMarkup("创建一个 AI 会话", "会话按账号隔离，回答可引用全题库内容。", "✦")}<button class="button button-primary" type="button" data-action="ai-new">新建会话</button></div>`}
     </section>
   </div>`;
@@ -2722,8 +3013,9 @@ function renderPracticeAIDrawer() {
     ? `<div class="practice-ai-drawer-state">${loadingMarkup("正在恢复本题 AI 对话")}</div>`
     : state.ai.drawerError
       ? `<div class="practice-ai-drawer-state">${emptyMarkup("AI 对话暂时无法打开", state.ai.drawerError, "!")}<button class="button button-secondary" type="button" data-action="retry-practice-ai">重试</button></div>`
-      : `<div class="practice-ai-quick-prompts" aria-label="快捷提问">${PRACTICE_AI_PROMPTS.map(([label, prompt]) => `<button type="button" data-action="ai-quick-prompt" data-prompt="${escapeAttr(prompt)}">${escapeHtml(label)}</button>`).join("")}</div>
-        <div class="ai-messages practice-ai-messages" aria-live="polite">${messagesMarkup || `<div class="ai-welcome practice-ai-welcome"><span aria-hidden="true">✦</span><h2>这道题想问什么？</h2><p>选择一个快捷问题，或在下方输入。打开抽屉不会自动调用模型。</p></div>`}</div>
+      : `<div class="practice-ai-quick-prompts" aria-label="快捷提问">${PRACTICE_AI_PROMPTS.map(([label, prompt]) => `<button type="button" data-action="ai-quick-prompt" data-prompt="${escapeAttr(prompt)}" ${state.ai.sending ? "disabled" : ""}>${escapeHtml(label)}</button>`).join("")}</div>
+        ${state.ai.error ? `<div class="ai-inline-error" role="alert"><span>${escapeHtml(state.ai.error)}</span><button class="text-button" type="button" data-action="ai-dismiss-error">关闭</button></div>` : ""}
+        <div class="ai-messages practice-ai-messages" aria-live="polite" aria-busy="${state.ai.sending}">${messagesMarkup || `<div class="ai-welcome practice-ai-welcome"><span aria-hidden="true">✦</span><h2>这道题想问什么？</h2><p>选择一个快捷问题，或在下方输入。打开抽屉不会自动调用模型。</p></div>`}</div>
         ${aiComposerMarkup({ surface: "drawer" })}`;
   root.innerHTML = `<button class="practice-ai-drawer-backdrop" type="button" data-action="close-practice-ai" aria-label="关闭 AI 解题助手"></button>
     <aside class="practice-ai-drawer" role="dialog" aria-modal="true" aria-labelledby="practice-ai-drawer-title">
@@ -2838,6 +3130,7 @@ async function openPracticeAIDrawer(button) {
     sourceCode: item.question?.source_code || "",
     stem: String(item.question?.stem || "").slice(0, 160),
   };
+  state.ai.error = "";
   state.ai.drawerOpen = true;
   await loadPracticeAIDrawerConversation();
   window.requestAnimationFrame(() => {
@@ -2872,6 +3165,7 @@ async function renderAIPage({ force = false } = {}) {
 }
 
 async function createAIConversation() {
+  if (state.ai.sending) return showToast("请先停止当前回答", "error");
   try {
     const item = await api("/ai/conversations", { method: "POST", body: {} });
     state.ai.conversations = [item, ...(state.ai.conversations || [])];
@@ -2883,7 +3177,9 @@ async function createAIConversation() {
 }
 
 async function selectAIConversation(id) {
+  if (state.ai.sending && id !== state.ai.activeId) return showToast("请先停止当前回答", "error");
   activateAIConversation(id);
+  state.ai.error = "";
   if (!state.ai.messages[id]) {
     try {
       const payload = await api(`/ai/conversations/${encodeURIComponent(id)}/messages`);
@@ -2894,6 +3190,7 @@ async function selectAIConversation(id) {
 }
 
 async function renameAIConversation() {
+  if (state.ai.sending) return;
   const active = (state.ai.conversations || []).find((item) => item.conversation_id === state.ai.activeId);
   if (!active) return;
   const title = window.prompt("会话名称", active.title || "新对话");
@@ -2906,6 +3203,7 @@ async function renameAIConversation() {
 }
 
 async function deleteAIConversation() {
+  if (state.ai.sending) return;
   if (!state.ai.activeId || !window.confirm("删除当前 AI 会话及其消息？")) return;
   const id = state.ai.activeId;
   try {
@@ -2934,20 +3232,41 @@ async function sendAIMessage(form) {
   state.ai.draft = "";
   state.ai.drafts[conversationId] = "";
   state.ai.sending = true;
-  state.ai.pending = { conversationId, content };
+  state.ai.error = "";
+  state.ai.pending = { conversationId, content, streamContent: "", citations: [], mode: "message", surface };
   state.ai.abortController = new AbortController();
   renderAIViews();
   try {
-    const payload = await api(`/ai/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "POST", signal: state.ai.abortController.signal, body: { content, context: { scope, occurrence_id: occurrenceId, collection_id: collectionId } } });
+    const payload = await apiEventStream(`/ai/conversations/${encodeURIComponent(conversationId)}/messages/stream`, {
+      signal: state.ai.abortController.signal,
+      body: { content, context: { scope, occurrence_id: occurrenceId, collection_id: collectionId } },
+      onEvent: (eventName, eventPayload) => {
+        if (!state.ai.pending || state.ai.pending.conversationId !== conversationId) return;
+        if (eventName === "start") {
+          state.ai.pending.citations = eventPayload.citations || [];
+          renderAIViews();
+        } else if (eventName === "delta") {
+          state.ai.pending.streamContent += String(eventPayload.delta || "");
+          scheduleAIStreamRender();
+        }
+      },
+    });
     state.ai.messages[conversationId] = [...(state.ai.messages[conversationId] || []), payload.user, payload.assistant];
-    state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === conversationId ? { ...item, ...payload.conversation, preview: payload.assistant.content, message_count: (item.message_count || 0) + 2 } : item);
+    const current = (state.ai.conversations || []).find((item) => item.conversation_id === conversationId) || {};
+    const updated = { ...current, ...payload.conversation, preview: payload.assistant.content, message_count: (current.message_count || 0) + 2 };
+    state.ai.conversations = [updated, ...(state.ai.conversations || []).filter((item) => item.conversation_id !== conversationId)];
   } catch (error) {
     state.ai.draft = content;
     state.ai.drafts[conversationId] = content;
-    if (error?.name === "AbortError") showToast("已停止等待本次回答");
-    else showToast(error.message, "error");
+    if (error?.name === "AbortError") showToast("已停止本次回答");
+    else {
+      state.ai.error = error.message || "AI 回答失败，请重试";
+      showToast(state.ai.error, "error");
+    }
   }
   finally {
+    if (state.ai.streamRenderFrame) window.cancelAnimationFrame(state.ai.streamRenderFrame);
+    state.ai.streamRenderFrame = null;
     state.ai.sending = false;
     state.ai.pending = null;
     state.ai.abortController = null;
@@ -2987,6 +3306,15 @@ function continueAIMessage(messageId) {
   $(`${state.ai.drawerOpen ? "#practice-ai-chat-form" : "#ai-chat-form"} textarea`)?.focus();
 }
 
+function useAIStarter(button) {
+  if (state.ai.sending || !state.ai.activeId) return;
+  state.ai.draft = button.dataset.prompt || "";
+  state.ai.drafts[state.ai.activeId] = state.ai.draft;
+  state.ai.error = "";
+  renderAIViews();
+  window.requestAnimationFrame(() => $("#ai-chat-form textarea")?.focus());
+}
+
 async function regenerateAIMessage(messageId) {
   if (state.ai.sending) return;
   const conversationId = state.ai.activeId;
@@ -2994,47 +3322,77 @@ async function regenerateAIMessage(messageId) {
   const message = messages.find((item) => item.message_id === messageId && item.role === "assistant");
   if (!message || messages[messages.length - 1]?.message_id !== messageId) return;
   state.ai.sending = true;
+  state.ai.error = "";
+  state.ai.pending = { conversationId, content: "", streamContent: "", citations: [], mode: "regenerate", messageId };
   state.ai.abortController = new AbortController();
   renderAIViews();
   try {
-    const payload = await api(`/ai/conversations/${encodeURIComponent(conversationId)}/regenerate`, {
-      method: "POST",
+    const payload = await apiEventStream(`/ai/conversations/${encodeURIComponent(conversationId)}/regenerate/stream`, {
       signal: state.ai.abortController.signal,
       body: {},
+      onEvent: (eventName, eventPayload) => {
+        if (!state.ai.pending || state.ai.pending.conversationId !== conversationId) return;
+        if (eventName === "start") {
+          state.ai.pending.citations = eventPayload.citations || [];
+          renderAIViews();
+        } else if (eventName === "delta") {
+          state.ai.pending.streamContent += String(eventPayload.delta || "");
+          scheduleAIStreamRender();
+        }
+      },
     });
     state.ai.messages[conversationId] = (state.ai.messages[conversationId] || []).map((item) => item.message_id === messageId ? payload.assistant : item);
-    state.ai.conversations = (state.ai.conversations || []).map((item) => item.conversation_id === conversationId ? { ...item, ...payload.conversation, preview: payload.assistant.content } : item);
+    const current = (state.ai.conversations || []).find((item) => item.conversation_id === conversationId) || {};
+    const updated = { ...current, ...payload.conversation, preview: payload.assistant.content };
+    state.ai.conversations = [updated, ...(state.ai.conversations || []).filter((item) => item.conversation_id !== conversationId)];
   } catch (error) {
     if (error?.name === "AbortError") showToast("已停止等待重新生成");
-    else showToast(error.message, "error");
+    else {
+      state.ai.error = error.message || "重新生成失败，请重试";
+      showToast(state.ai.error, "error");
+    }
   }
   finally {
+    if (state.ai.streamRenderFrame) window.cancelAnimationFrame(state.ai.streamRenderFrame);
+    state.ai.streamRenderFrame = null;
     state.ai.sending = false;
+    state.ai.pending = null;
     state.ai.abortController = null;
     renderAIViews();
   }
 }
 
-function forumRouteHash({ topic = "", section = "", query = "", returnHash = "" } = {}) {
+function normalizeForumSort(value) {
+  return new Set(["latest", "newest", "replies"]).has(value) ? value : "latest";
+}
+
+function forumRouteHash({ topic = "", section = "", query = "", sort = "latest", returnHash = "" } = {}) {
   const params = new URLSearchParams();
   if (topic) params.set("topic", topic);
   if (section) params.set("section", section);
   if (query) params.set("query", query);
+  const normalizedSort = normalizeForumSort(sort);
+  if (normalizedSort !== "latest") params.set("sort", normalizedSort);
   const safeReturn = normalizeStudyReturnHash(returnHash);
   if (safeReturn) params.set("return", safeReturn);
   return `#forum${params.size ? `?${params}` : ""}`;
 }
 
 function forumSectionChips(sections, selected) {
-  return `<div class="forum-section-chips"><button class="forum-section-chip ${selected ? "" : "active"}" type="button" data-action="forum-section" data-section="">全部</button>${sections.map((item) => `<button class="forum-section-chip ${selected === item.section_id ? "active" : ""}" type="button" data-action="forum-section" data-section="${escapeAttr(item.section_id)}">${escapeHtml(item.name)}<small>${formatNumber(item.topic_count)}</small></button>`).join("")}</div>`;
+  return `<div class="forum-section-chips"><button class="forum-section-chip ${selected ? "" : "active"}" type="button" data-action="forum-section" data-section="" aria-pressed="${!selected}">全部</button>${sections.map((item) => `<button class="forum-section-chip ${selected === item.section_id ? "active" : ""}" type="button" data-action="forum-section" data-section="${escapeAttr(item.section_id)}" aria-pressed="${selected === item.section_id}">${escapeHtml(item.name)}<small>${formatNumber(item.topic_count)}</small></button>`).join("")}</div>`;
 }
 
-function forumTopicCard(item) {
-  return `<button class="card forum-topic-card" type="button" data-action="forum-open-topic" data-topic="${escapeAttr(item.topic_id)}">
-    <div class="forum-topic-meta"><span>${escapeHtml(item.section_name)}</span><time datetime="${escapeAttr(item.last_activity)}">${escapeHtml(formatDate(item.last_activity))}</time></div>
+function forumSortControls(selected) {
+  const active = normalizeForumSort(selected);
+  return `<div class="forum-sort-controls" role="group" aria-label="主题排序">${[["latest", "最近活跃"], ["newest", "最新发布"], ["replies", "回复最多"]].map(([value, label]) => `<button class="${active === value ? "active" : ""}" type="button" data-action="forum-sort" data-sort="${value}" aria-pressed="${active === value}">${label}</button>`).join("")}</div>`;
+}
+
+function forumTopicCard(item, returnHash) {
+  return `<button class="card forum-topic-card" type="button" data-action="forum-open-topic" data-topic="${escapeAttr(item.topic_id)}" data-return="${escapeAttr(returnHash)}">
+    <div class="forum-topic-meta"><span class="forum-section-label">${escapeHtml(item.section_name)}</span><span>${escapeHtml(item.author_name)}</span><time datetime="${escapeAttr(item.last_activity)}">${escapeHtml(formatDate(item.last_activity))}</time></div>
     <h2>${escapeHtml(item.title)}</h2>
     <p>${escapeHtml(item.preview || "")}</p>
-    <div class="forum-topic-foot"><span>${escapeHtml(item.author_name)}</span><strong>${formatNumber(item.agree_count || 0)} 赞同 · ${formatNumber(item.reply_count)} 回复</strong></div>
+    <div class="forum-topic-foot"><span>${formatNumber(item.reply_count)} 条回复</span><span>${formatNumber(item.agree_count || 0)} 人赞同</span><span>${formatNumber(item.disagree_count || 0)} 人反对</span></div>
   </button>`;
 }
 
@@ -3048,39 +3406,48 @@ function forumReplyActions(reply, topicId) {
   return `<div class="forum-manage-actions"><button class="text-button" type="button" data-action="forum-reply-to" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topicId)}" data-name="${escapeAttr(reply.author_name)}">回复</button>${reply.can_manage ? `<button class="text-button" type="button" data-action="forum-edit-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topicId)}">编辑</button><button class="text-button danger" type="button" data-action="forum-delete-reply" data-reply="${escapeAttr(reply.reply_id)}" data-topic="${escapeAttr(topicId)}">删除</button>` : ""}</div>`;
 }
 
-function forumComposerMarkup(sections) {
+function forumComposerMarkup(sections, selectedSection = "") {
   if (!state.forum.composerOpen) return "";
   return `<form id="forum-topic-form" class="card forum-composer" data-form="forum-topic">
-    <div class="forum-composer-head"><div><strong>发布主题</strong><span>围绕学习与题目展开具体讨论</span></div><button class="text-button" type="button" data-action="forum-toggle-composer">取消</button></div>
-    <label><span>分区</span><select name="section_id" required>${sections.map((item) => `<option value="${escapeAttr(item.section_id)}">${escapeHtml(item.name)}</option>`).join("")}</select></label>
+    <div class="forum-composer-head"><strong>发布主题</strong><button class="text-button" type="button" data-action="forum-toggle-composer">取消</button></div>
+    <label><span>分区</span><select name="section_id" required>${sections.map((item) => `<option value="${escapeAttr(item.section_id)}" ${selectedSection === item.section_id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}</select></label>
     <label><span>标题</span><input name="title" type="text" minlength="4" maxlength="120" required placeholder="用一句话说明讨论主题"></label>
     <label><span>正文</span><textarea name="body" rows="6" minlength="4" maxlength="20000" required placeholder="补充背景、你的思路或具体问题"></textarea></label>
-    <div class="forum-composer-actions"><span>内容仅保存在本地社区数据库</span><button class="button button-primary" type="submit">发布主题</button></div>
+    <div class="forum-composer-actions"><span>发布后可继续编辑或删除</span><button class="button button-primary" type="submit">发布主题</button></div>
   </form>`;
 }
 
 async function renderForumPage(descriptor = parseRouteHash(), { force = false } = {}) {
   const container = $("#page-forum");
-  container.innerHTML = loadingMarkup("正在读取论坛");
+  const renderToken = ++state.forum.renderToken;
+  if (!state.forum.sections || force || descriptor.topicId || !state.forum.topics) {
+    container.innerHTML = loadingMarkup("正在读取论坛");
+  }
   try {
     if (!state.forum.sections || force) {
       const payload = await api("/forum/sections");
+      if (renderToken !== state.forum.renderToken) return;
       state.forum.sections = payload.sections || [];
     }
     if (descriptor.topicId) {
       if (state.forum.replyTo?.topicId !== descriptor.topicId) state.forum.replyTo = null;
       const payload = await api(`/forum/topics/${encodeURIComponent(descriptor.topicId)}`);
+      if (renderToken !== state.forum.renderToken) return;
       state.forum.topic = payload;
       renderForumTopic(payload, descriptor);
       return;
     }
     state.forum.replyTo = null;
-    const params = new URLSearchParams({ limit: "20", offset: "0", sort: "latest" });
+    state.forum.topic = null;
+    const params = new URLSearchParams({ limit: "20", offset: "0", sort: normalizeForumSort(descriptor.sort) });
     if (descriptor.sectionId) params.set("section", descriptor.sectionId);
     if (descriptor.query) params.set("query", descriptor.query);
-    state.forum.topics = await api(`/forum/topics?${params}`);
+    const topics = await api(`/forum/topics?${params}`);
+    if (renderToken !== state.forum.renderToken) return;
+    state.forum.topics = topics;
     renderForumListing(descriptor);
   } catch (error) {
+    if (renderToken !== state.forum.renderToken) return;
     container.innerHTML = emptyMarkup("论坛读取失败", error.message, "!");
   }
 }
@@ -3089,10 +3456,17 @@ function renderForumListing(descriptor = parseRouteHash()) {
   const container = $("#page-forum");
   const sections = state.forum.sections || [];
   const payload = state.forum.topics || { items: [], total: 0 };
-  container.innerHTML = `<section class="page-header page-header-compact forum-page-header"><div class="page-title"><h1>学习论坛</h1><p class="section-copy">围绕题目、知识点和复习方法持续讨论。</p></div><button class="button button-primary" type="button" data-action="forum-toggle-composer">${state.forum.composerOpen ? "收起发布" : "发布主题"}</button></section>
-    ${forumComposerMarkup(sections)}
-    <div class="card forum-toolbar">${forumSectionChips(sections, descriptor.sectionId)}<form id="forum-search-form" data-form="forum-search"><input name="query" type="search" maxlength="80" value="${escapeAttr(descriptor.query)}" placeholder="搜索主题、正文或作者"><button class="button button-secondary button-small" type="submit">搜索</button></form></div>
-    <div class="forum-list">${payload.items?.length ? payload.items.map(forumTopicCard).join("") : emptyMarkup("暂无主题", descriptor.query ? "换一个关键词，或发布新的讨论。" : "成为第一个发起讨论的人。", "◌")}</div>
+  const sort = normalizeForumSort(descriptor.sort);
+  const listHash = forumRouteHash({ section: descriptor.sectionId, query: descriptor.query, sort });
+  const resultTitle = descriptor.query ? `“${descriptor.query}”的搜索结果` : descriptor.sectionId ? (sections.find((item) => item.section_id === descriptor.sectionId)?.name || "当前分区") : "全部主题";
+  container.innerHTML = `<div class="forum-commandbar">
+      <form id="forum-search-form" data-form="forum-search" role="search"><input name="query" type="search" maxlength="80" value="${escapeAttr(descriptor.query)}" placeholder="搜索主题、正文或作者" aria-label="搜索论坛">${descriptor.query ? `<button class="text-button forum-search-clear" type="button" data-action="forum-clear-search">清除</button>` : ""}<button class="button button-secondary button-small" type="submit">搜索</button></form>
+      <button class="button button-primary" type="button" data-action="forum-toggle-composer">${state.forum.composerOpen ? "收起发布" : "发布主题"}</button>
+    </div>
+    ${forumComposerMarkup(sections, descriptor.sectionId)}
+    <div class="card forum-toolbar"><div class="forum-filter-group"><span>分区</span>${forumSectionChips(sections, descriptor.sectionId)}</div><div class="forum-filter-group"><span>排序</span>${forumSortControls(sort)}</div></div>
+    <div class="forum-result-meta"><strong>${escapeHtml(resultTitle)}</strong><span>${formatNumber(payload.total || 0)} 个主题</span></div>
+    <div class="forum-list">${payload.items?.length ? payload.items.map((item) => forumTopicCard(item, listHash)).join("") : emptyMarkup("暂无主题", descriptor.query ? "换一个关键词，或清除搜索条件。" : "可以发布第一个讨论主题。", "◌")}</div>
     ${(payload.items || []).length < Number(payload.total || 0) ? `<div class="forum-load-more"><span>已显示 ${formatNumber(payload.items.length)} / ${formatNumber(payload.total)}</span><button class="button button-secondary button-small" type="button" data-action="forum-load-more">加载更多</button></div>` : ""}`;
 }
 
@@ -3116,10 +3490,10 @@ function renderForumTopic(payload, descriptor = parseRouteHash()) {
   const topicManageActions = topic.can_manage && topic.status !== "deleted"
     ? `<div class="forum-manage-actions">${topic.status === "open" ? `<button class="text-button" type="button" data-action="forum-edit-topic" data-topic="${escapeAttr(topic.topic_id)}">编辑主题</button>` : ""}<button class="text-button danger" type="button" data-action="forum-delete-topic" data-topic="${escapeAttr(topic.topic_id)}">删除主题</button></div>`
     : "";
-  container.innerHTML = `<div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back" data-return="${escapeAttr(returnHash)}">‹ 返回${descriptor.returnHash ? "个人主页" : "论坛"}</button>${topicManageActions}</div>
-    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span>${escapeHtml(topic.section_name)}</span>${topic.status !== "open" ? `<span class="status-pill ${topic.status === "hidden" ? "pending" : "disabled"}">${topic.status === "hidden" ? "已隐藏" : "已删除"}</span>` : ""}<time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(topic.author_id)}" aria-label="查看${escapeAttr(topic.author_name)}的个人资料">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主 · 查看主页</small></span></button><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div>${topic.status === "open" ? forumReactionMarkup(topic, "topic", topic.topic_id, topic.topic_id) : ""}</article>
-    <section class="forum-replies"><div class="forum-replies-head"><h2>全部回复</h2><span>${formatNumber(topic.reply_count || replies.length)}</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(reply.author_id)}" aria-label="查看${escapeAttr(reply.author_name)}的个人资料">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${index + 1} 楼 · ${escapeHtml(formatDate(reply.created_at))}</small></span></button>${forumReplyActions(reply, topic.topic_id)}</div>${reply.parent_author_name ? `<div class="forum-reply-parent">回复 @${escapeHtml(reply.parent_author_name)}</div>` : ""}<p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p>${reply.status === "visible" ? forumReactionMarkup(reply, "reply", reply.reply_id, topic.topic_id) : ""}</article>`).join("") : `<div class="forum-reply-empty">还没有回复，来说说你的看法。</div>`}</section>
-    ${replyForm}`;
+  container.innerHTML = `<div class="forum-detail-shell"><div class="forum-detail-head"><button class="profile-back-button" type="button" data-action="forum-back" data-return="${escapeAttr(returnHash)}">‹ 返回${descriptor.returnHash?.startsWith("#profile") ? "个人主页" : "论坛"}</button>${topicManageActions}</div>
+    <article class="card forum-topic-detail"><div class="forum-topic-meta"><span class="forum-section-label">${escapeHtml(topic.section_name)}</span>${topic.status !== "open" ? `<span class="status-pill ${topic.status === "hidden" ? "pending" : "disabled"}">${topic.status === "hidden" ? "已隐藏" : "已删除"}</span>` : ""}<time datetime="${escapeAttr(topic.created_at)}">${escapeHtml(formatDate(topic.created_at))}</time></div><h1>${escapeHtml(topic.title)}</h1><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(topic.author_id)}" aria-label="查看${escapeAttr(topic.author_name)}的个人资料">${avatarVisual(topic, topic.author_name)}<span><strong>${escapeHtml(topic.author_name)}</strong><small>楼主 · 查看主页</small></span></button><div class="forum-body">${escapeHtml(topic.body).replace(/\n/g, "<br>")}</div>${topic.status === "open" ? forumReactionMarkup(topic, "topic", topic.topic_id, topic.topic_id) : ""}</article>
+    <section class="forum-replies"><div class="forum-replies-head"><h2>讨论回复</h2><span>${formatNumber(topic.reply_count || replies.length)} 条</span></div>${replies.length ? replies.map((reply, index) => `<article class="card forum-reply"><div class="forum-reply-head"><button class="forum-author forum-author-link" type="button" data-action="open-profile" data-user-id="${escapeAttr(reply.author_id)}" aria-label="查看${escapeAttr(reply.author_name)}的个人资料">${avatarVisual(reply, reply.author_name)}<span><strong>${escapeHtml(reply.author_name)}</strong><small>${escapeHtml(formatDate(reply.created_at))}</small></span></button><span class="forum-floor">${index + 1} 楼</span>${forumReplyActions(reply, topic.topic_id)}</div>${reply.parent_author_name ? `<div class="forum-reply-parent"><span>回复</span> @${escapeHtml(reply.parent_author_name)}</div>` : ""}<p>${escapeHtml(reply.body).replace(/\n/g, "<br>")}</p>${reply.status === "visible" ? forumReactionMarkup(reply, "reply", reply.reply_id, topic.topic_id) : ""}</article>`).join("") : `<div class="forum-reply-empty">还没有回复，可以写下第一条观点。</div>`}</section>
+    ${replyForm}</div>`;
 }
 
 async function submitForumTopic(form) {
@@ -3130,7 +3504,9 @@ async function submitForumTopic(form) {
     const topic = await api("/forum/topics", { method: "POST", body: values });
     state.forum.composerOpen = false;
     state.forum.sections = null;
-    return navigateHash(forumRouteHash({ topic: topic.topic_id }));
+    const descriptor = parseRouteHash();
+    const returnHash = forumRouteHash({ section: descriptor.sectionId, query: descriptor.query, sort: descriptor.sort });
+    return navigateHash(forumRouteHash({ topic: topic.topic_id, returnHash }));
   } catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
 }
 
@@ -3149,12 +3525,14 @@ async function submitForumReply(form) {
 async function loadMoreForumTopics(button) {
   const descriptor = parseRouteHash();
   const current = state.forum.topics || { items: [] };
+  const renderToken = state.forum.renderToken;
   setButtonBusy(button, true, "加载中");
   try {
-    const params = new URLSearchParams({ limit: "20", offset: String(current.items.length), sort: "latest" });
+    const params = new URLSearchParams({ limit: "20", offset: String(current.items.length), sort: normalizeForumSort(descriptor.sort) });
     if (descriptor.sectionId) params.set("section", descriptor.sectionId);
     if (descriptor.query) params.set("query", descriptor.query);
     const next = await api(`/forum/topics?${params}`);
+    if (renderToken !== state.forum.renderToken) return;
     state.forum.topics = { ...next, items: [...current.items, ...(next.items || [])] };
     renderForumListing(descriptor);
   } catch (error) { showToast(error.message, "error"); setButtonBusy(button, false); }
@@ -3165,7 +3543,7 @@ async function deleteForumTopic(id) {
   try {
     await api(`/forum/topics/${encodeURIComponent(id)}`, { method: "DELETE", body: {} });
     state.forum.sections = null;
-    await navigateHash("#forum");
+    await navigateHash(parseRouteHash().returnHash || "#forum");
   }
   catch (error) { showToast(error.message, "error"); }
 }
@@ -3429,27 +3807,132 @@ async function saveProfilePassword(form) {
   }
 }
 
+const ADMIN_TAB_META = Object.freeze({
+  overview: { label: "运行概览", group: "运行与配置" },
+  site: { label: "网站设置", group: "运行与配置" },
+  catalog: { label: "题库管理", group: "内容与用户" },
+  users: { label: "账号管理", group: "内容与用户" },
+  comments: { label: "评论管理", group: "内容与用户" },
+  forum: { label: "论坛管理", group: "内容与用户" },
+  feedback: { label: "用户反馈", group: "内容与用户" },
+  models: { label: "模型管理", group: "智能能力" },
+});
+
+function emptyAdminData() {
+  return {
+    dashboard: null,
+    settings: null,
+    users: [],
+    userMeta: null,
+    comments: null,
+    forum: null,
+    feedback: null,
+    vectors: null,
+    imports: null,
+  };
+}
+
+function emptyAdminRuntime() {
+  return Object.fromEntries(
+    Object.keys(ADMIN_TAB_META).map((tab) => [
+      tab,
+      { status: "idle", error: "", loadedAt: 0, token: 0 },
+    ])
+  );
+}
+
+function adminTabHasData(tab) {
+  const data = state.adminData || {};
+  if (tab === "overview") return Boolean(data.dashboard);
+  if (tab === "catalog") return Boolean(data.dashboard) && Array.isArray(data.imports);
+  if (tab === "users") return Boolean(data.userMeta);
+  if (tab === "comments") return Boolean(data.comments);
+  if (tab === "forum") return Boolean(data.forum);
+  if (tab === "feedback") return Boolean(data.feedback);
+  if (tab === "models") return Boolean(data.settings) && Boolean(data.vectors);
+  if (tab === "site") return Boolean(data.settings);
+  return false;
+}
+
 async function renderAdminPage() {
-  const container = $("#page-admin");
-  container.innerHTML = `${adminHeaderMarkup()}${loadingMarkup("正在读取系统状态")}`;
+  clearAdminSelections();
+  stopVectorPoll();
+  state.siteBackgroundPending = false;
+  state.siteSettingsDirty = false;
+  state.adminGeneration += 1;
+  state.adminData = emptyAdminData();
+  state.adminRuntime = emptyAdminRuntime();
+  renderAdminContent();
+  await loadAdminTab(state.adminTab);
+}
+
+async function loadAdminTab(tab, { force = false } = {}) {
+  if (!ADMIN_TAB_META[tab] || !state.adminData) return;
+  const runtime = state.adminRuntime[tab] || (state.adminRuntime[tab] = { status: "idle", error: "", loadedAt: 0, token: 0 });
+  if (!force && runtime.status === "ready" && adminTabHasData(tab)) return;
+  const token = runtime.token + 1;
+  const generation = state.adminGeneration;
+  runtime.token = token;
+  runtime.status = "loading";
+  runtime.error = "";
+  renderAdminContent();
   try {
-    const [dashboard, settings, users, comments, forum, feedback, vectors, imports] = await Promise.all([
-      api("/admin/dashboard"),
-      api("/admin/settings"),
-      api("/admin/users"),
-      api("/admin/comments?limit=100"),
-      api("/admin/forum/content?limit=100"),
-      api("/admin/feedback?limit=100"),
-      api("/admin/vectors"),
-      api("/admin/catalog/imports"),
-    ]);
-    state.adminData = { dashboard, settings, users: users.users || [], comments, forum, feedback, vectors, imports: imports.imports || [] };
-    if (state.catalogImportPreview && !state.adminData.imports.some((item) => item.import_id === state.catalogImportPreview.import_id)) state.catalogImportPreview = null;
-    renderAdminContent();
-    if (["queued", "running"].includes(vectors.operation?.status)) scheduleVectorPoll();
+    if (tab === "overview") {
+      const dashboard = await api("/admin/dashboard");
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.dashboard = dashboard;
+    } else if (tab === "catalog") {
+      const [dashboard, imports] = await Promise.all([
+        api("/admin/dashboard"),
+        api("/admin/catalog/imports"),
+      ]);
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.dashboard = dashboard;
+      state.adminData.imports = imports.imports || [];
+      if (state.catalogImportPreview && !state.adminData.imports.some((item) => item.import_id === state.catalogImportPreview.import_id)) state.catalogImportPreview = null;
+    } else if (tab === "users") {
+      const users = await api("/admin/users");
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.userMeta = users;
+      state.adminData.users = users.users || [];
+    } else if (tab === "comments") {
+      const comments = await api("/admin/comments?limit=100");
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.comments = comments;
+    } else if (tab === "forum") {
+      const forum = await api("/admin/forum/content?limit=100");
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.forum = forum;
+    } else if (tab === "feedback") {
+      const feedback = await api("/admin/feedback?limit=100");
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.feedback = feedback;
+    } else if (tab === "models") {
+      const [settings, vectors] = await Promise.all([
+        api("/admin/settings"),
+        api("/admin/vectors"),
+      ]);
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.settings = settings;
+      state.adminData.vectors = vectors;
+      state.settings = settings;
+      if (["queued", "running"].includes(vectors.operation?.status)) scheduleVectorPoll();
+    } else if (tab === "site") {
+      const settings = await api("/admin/settings");
+      if (runtime.token !== token || state.adminGeneration !== generation) return;
+      state.adminData.settings = settings;
+      state.settings = settings;
+    }
+    if (runtime.token !== token || state.adminGeneration !== generation) return;
+    runtime.status = "ready";
+    runtime.loadedAt = Date.now();
+    runtime.error = "";
   } catch (error) {
-    container.innerHTML += emptyMarkup("管理数据读取失败", error.message, "!");
+    if (runtime.token !== token || state.adminGeneration !== generation) return;
+    runtime.status = adminTabHasData(tab) ? "stale" : "error";
+    runtime.error = error.message || "读取失败";
   }
+  renderAdminContent();
 }
 
 function renderAdminContent() {
@@ -3459,32 +3942,52 @@ function renderAdminContent() {
     ${adminHeaderMarkup()}
     <div class="admin-layout">
       <nav class="card admin-nav" aria-label="管理导航">
-        ${adminTabButton("overview", "运行概览")}${adminTabButton("catalog", "题库管理")}${adminTabButton("users", "账号管理")}${adminTabButton("comments", "评论管理")}${adminTabButton("forum", "论坛管理")}${adminTabButton("feedback", "用户反馈")}${adminTabButton("models", "模型管理")}${adminTabButton("site", "网站设置")}
+        <div class="admin-nav-group"><span>运行与配置</span>${adminTabButton("overview")}${adminTabButton("site")}</div>
+        <div class="admin-nav-group"><span>内容与用户</span>${adminTabButton("catalog")}${adminTabButton("users")}${adminTabButton("comments")}${adminTabButton("forum")}${adminTabButton("feedback")}</div>
+        <div class="admin-nav-group"><span>智能能力</span>${adminTabButton("models")}</div>
       </nav>
       <div class="admin-content">${renderAdminTab()}</div>
     </div>`;
+  window.requestAnimationFrame(syncAdminSelectionControls);
 }
 
 function adminHeaderMarkup() {
-  return `<div class="page-header"><div class="page-title"><p class="eyebrow">系统管理</p><h1>管理控制台</h1><p class="section-copy">题库、账号、社区、模型与运行状态集中管理。</p></div><div class="header-actions"><button class="button button-secondary button-small" type="button" data-action="return-from-admin">‹ 返回</button></div></div>`;
+  const meta = ADMIN_TAB_META[state.adminTab] || ADMIN_TAB_META.overview;
+  const runtime = state.adminRuntime[state.adminTab] || {};
+  const stateText = runtime.status === "loading"
+    ? (adminTabHasData(state.adminTab) ? "正在刷新" : "正在加载")
+    : runtime.status === "stale"
+      ? "数据可能已过期"
+      : runtime.loadedAt
+        ? `更新于 ${new Date(runtime.loadedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+        : "按需加载";
+  return `<div class="admin-page-toolbar"><button class="button button-secondary button-small" type="button" data-action="return-from-admin">‹ 返回</button><div class="admin-toolbar-context"><strong>${escapeHtml(meta.label)}</strong><span>${escapeHtml(stateText)}</span></div><button class="button button-secondary button-small" type="button" data-action="admin-refresh" ${runtime.status === "loading" ? "disabled" : ""}>刷新</button></div>`;
 }
 
-function adminTabButton(tab, label) {
-  return `<button class="${state.adminTab === tab ? "active" : ""}" type="button" data-action="admin-tab" data-tab="${tab}">${label}</button>`;
+function adminTabButton(tab) {
+  const runtime = state.adminRuntime[tab] || {};
+  const label = ADMIN_TAB_META[tab]?.label || tab;
+  return `<button class="${state.adminTab === tab ? "active" : ""}" type="button" data-action="admin-tab" data-tab="${tab}"><span>${escapeHtml(label)}</span><i class="admin-nav-state ${escapeAttr(runtime.status || "idle")}" aria-hidden="true"></i></button>`;
 }
 
 function renderAdminTab() {
+  const runtime = state.adminRuntime[state.adminTab] || {};
+  const hasData = adminTabHasData(state.adminTab);
+  if (!hasData && runtime.status === "error") return `<section class="card admin-section admin-section-state"><div class="admin-load-error"><span aria-hidden="true">!</span><h2>当前栏目加载失败</h2><p>${escapeHtml(runtime.error || "请稍后重试")}</p><button class="button button-primary button-small" type="button" data-action="admin-retry">重新加载</button></div></section>`;
+  if (!hasData) return `<section class="card admin-section admin-section-state">${loadingMarkup(`正在加载${ADMIN_TAB_META[state.adminTab]?.label || "管理数据"}`)}</section>`;
   const { dashboard, settings, users, comments, forum, feedback } = state.adminData;
-  if (state.adminTab === "catalog") return renderCatalogManagement(dashboard.catalog, state.adminData.imports || []);
-  if (state.adminTab === "users") return renderUsers(users);
-  if (state.adminTab === "comments") return renderAdminComments(comments);
-  if (state.adminTab === "forum") return renderAdminForum(forum);
-  if (state.adminTab === "feedback") return renderAdminFeedback(feedback);
-  if (state.adminTab === "models") return renderModelSettings(settings);
-  if (state.adminTab === "site") return renderSiteSettings(settings);
+  let content = "";
+  if (state.adminTab === "catalog") content = renderCatalogManagement(dashboard.catalog, state.adminData.imports || []);
+  else if (state.adminTab === "users") content = renderUsers(users, state.adminData.userMeta || {});
+  else if (state.adminTab === "comments") content = renderAdminComments(comments);
+  else if (state.adminTab === "forum") content = renderAdminForum(forum);
+  else if (state.adminTab === "feedback") content = renderAdminFeedback(feedback);
+  else if (state.adminTab === "models") content = renderModelSettings(settings);
+  else if (state.adminTab === "site") content = renderSiteSettings(settings);
+  if (content) return `${renderAdminRuntimeNotice(runtime)}${content}`;
   const vector = dashboard.vector_index || {};
   const vectorReady = vector.status === "ready";
-  return `<section class="card admin-section">
+  content = `<section class="card admin-section">
     <div class="section-heading"><div><h2>运行概览</h2><p>题库、用户、学习数据与检索服务状态。</p></div></div>
     <div class="admin-status-banner ${vectorReady ? "ready" : "pending"}">
       <span class="status-dot" aria-hidden="true"></span>
@@ -3502,6 +4005,13 @@ function renderAdminTab() {
       <div class="settings-group"><h3>向量索引</h3><div class="solution-row"><strong>状态</strong><span>${escapeHtml(vector.status || "unavailable")}</span></div><div class="solution-row"><strong>模型</strong><span>${escapeHtml(vector.model || "尚未构建")}</span></div><div class="solution-row"><strong>向量数</strong><span>${formatNumber(vector.count || 0)}</span></div></div>
     </div>
   </section>`;
+  return `${renderAdminRuntimeNotice(runtime)}${content}`;
+}
+
+function renderAdminRuntimeNotice(runtime = {}) {
+  if (runtime.status === "loading") return `<div class="admin-runtime-notice"><span class="loading-spinner" aria-hidden="true"></span><strong>正在刷新当前栏目</strong><small>现有内容可继续查看，刷新完成后会自动更新。</small></div>`;
+  if (runtime.status === "stale") return `<div class="admin-runtime-notice error"><span aria-hidden="true">!</span><strong>刷新失败，当前显示上次成功数据</strong><small>${escapeHtml(runtime.error || "请稍后重试")}</small><button class="text-button" type="button" data-action="admin-retry">重试</button></div>`;
+  return "";
 }
 
 function renderCatalogManagement(catalog, imports) {
@@ -3633,41 +4143,114 @@ async function deleteCatalogImport(id) {
   } catch (error) { showToast(error.message, "error"); }
 }
 
-function renderUsers(users) {
-  const admins = users.filter((user) => user.role === "admin" && user.status === "active").length;
-  const disabled = users.filter((user) => user.status === "disabled").length;
+function clearAdminSelections(kind = "") {
+  if (kind) {
+    state.adminSelections[kind]?.clear();
+    return;
+  }
+  Object.values(state.adminSelections).forEach((selection) => selection.clear());
+}
+
+function adminForumSelectionKey(item) {
+  return `${item.target_type}:${item.target_id}`;
+}
+
+function adminVisibleSelectionIds(kind) {
+  if (!state.adminData) return [];
+  if (kind === "users") {
+    return (state.adminData.users || [])
+      .filter((item) => item.user_id !== state.user.user_id)
+      .map((item) => item.user_id);
+  }
+  if (kind === "comments") {
+    return (state.adminData.comments?.items || []).map((item) => item.comment_id);
+  }
+  if (kind === "forum") {
+    return (state.adminData.forum?.items || []).map(adminForumSelectionKey);
+  }
+  return [];
+}
+
+function adminSelectionCheckbox(kind, id, label, { disabled = false } = {}) {
+  const checked = state.adminSelections[kind]?.has(id);
+  return `<label class="admin-select-control" title="${escapeAttr(label)}"><input type="checkbox" data-admin-selection="${kind}" data-selection-id="${escapeAttr(id)}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}><span aria-hidden="true"></span><small>${escapeHtml(label)}</small></label>`;
+}
+
+function renderAdminBulkBar(kind, actionMarkup) {
+  const selection = state.adminSelections[kind];
+  const visibleIds = adminVisibleSelectionIds(kind);
+  const selectedCount = visibleIds.filter((id) => selection.has(id)).length;
+  return `<div class="admin-bulk-bar ${selectedCount ? "active" : ""}" data-admin-bulk-kind="${kind}">
+    <div class="admin-bulk-selection">${adminSelectionCheckbox(kind, "__all__", "选择当前页", { disabled: !visibleIds.length })}<strong>已选 ${formatNumber(selectedCount)} 项</strong><button class="text-button" type="button" data-action="admin-select-visible" data-selection-kind="${kind}" ${visibleIds.length ? "" : "disabled"}>全选当前页</button><button class="text-button" type="button" data-action="admin-clear-selection" data-selection-kind="${kind}" ${selectedCount ? "" : "disabled"}>清空</button></div>
+    <div class="admin-bulk-actions">${actionMarkup}</div>
+  </div>`;
+}
+
+function syncAdminSelectionControls() {
+  const kind = state.adminTab === "users" ? "users" : state.adminTab === "comments" ? "comments" : state.adminTab === "forum" ? "forum" : "";
+  if (!kind) return;
+  const all = $(`[data-admin-selection="${kind}"][data-selection-id="__all__"]`);
+  if (!all) return;
+  const ids = adminVisibleSelectionIds(kind);
+  const count = ids.filter((id) => state.adminSelections[kind].has(id)).length;
+  all.checked = Boolean(ids.length) && count === ids.length;
+  all.indeterminate = count > 0 && count < ids.length;
+}
+
+function renderAdminPagination(kind, payload = {}) {
+  const total = Number(payload.total || 0);
+  const limit = Math.max(1, Number(payload.limit || 100));
+  const offset = Math.max(0, Number(payload.offset || 0));
+  if (total <= limit && offset === 0) return "";
+  const previous = offset > 0 ? `<button class="button button-secondary button-small" type="button" data-action="admin-list-page" data-list-kind="${kind}" data-offset="${Math.max(0, offset - limit)}">上一页</button>` : "";
+  const next = offset + limit < total ? `<button class="button button-secondary button-small" type="button" data-action="admin-list-page" data-list-kind="${kind}" data-offset="${offset + limit}">下一页</button>` : "";
+  const start = total ? Math.min(offset + 1, total) : 0;
+  return `<div class="admin-list-pagination"><span>${formatNumber(start)}-${formatNumber(Math.min(total, offset + limit))} / ${formatNumber(total)}</span><div>${previous}${next}</div></div>`;
+}
+
+function renderUsers(users, payload = {}) {
+  const stats = payload.stats || {};
+  const selectedCount = adminVisibleSelectionIds("users").filter((id) => state.adminSelections.users.has(id)).length;
+  const bulkActions = `<button class="button button-secondary button-small" type="button" data-action="admin-users-bulk" data-bulk-action="enable" ${selectedCount ? "" : "disabled"}>批量启用</button><button class="button button-secondary button-small" type="button" data-action="admin-users-bulk" data-bulk-action="set_role" data-role="admin" ${selectedCount ? "" : "disabled"}>设为管理员</button><button class="button button-secondary button-small" type="button" data-action="admin-users-bulk" data-bulk-action="set_role" data-role="user" ${selectedCount ? "" : "disabled"}>设为普通用户</button><button class="button button-secondary button-small" type="button" data-action="admin-users-bulk" data-bulk-action="disable" ${selectedCount ? "" : "disabled"}>批量停用</button><span class="admin-bulk-divider" aria-hidden="true"></span><button class="button button-danger button-small" type="button" data-action="admin-users-purge-bulk" ${selectedCount ? "" : "disabled"}>永久删除</button>`;
   return `<section class="card admin-section">
-    <div class="section-heading"><div><h2>账号管理</h2><p>创建账号、调整角色、重置密码或停用访问权限。</p></div></div>
-    <div class="admin-mini-stats"><span><strong>${users.length}</strong>全部账号</span><span><strong>${admins}</strong>有效管理员</span><span><strong>${disabled}</strong>已停用</span></div>
-    <form id="create-user-form" class="settings-group create-user-box">
-      <h3>创建账号</h3><div class="inline-fields"><label class="field"><span>用户名</span><input name="username" required minlength="3" maxlength="32"></label><label class="field"><span>角色</span><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label></div>
+    <div class="section-heading admin-section-heading"><div><h2>账号管理</h2><p>维护访问权限与账号生命周期。永久删除会同步清除该账号的全部个人数据与发布内容。</p></div><button class="button button-secondary button-small" type="button" data-action="admin-refresh">刷新列表</button></div>
+    <div class="admin-mini-stats"><span><strong>${formatNumber(stats.total || users.length)}</strong>全部账号</span><span><strong>${formatNumber(stats.active_admins || 0)}</strong>有效管理员</span><span><strong>${formatNumber(stats.disabled || 0)}</strong>已停用</span></div>
+    <details class="settings-group create-user-box admin-create-panel"><summary><span><strong>创建账号</strong><small>为新成员分配初始角色与登录凭据</small></span><b aria-hidden="true">＋</b></summary><form id="create-user-form">
+      <div class="inline-fields"><label class="field"><span>用户名</span><input name="username" required minlength="3" maxlength="32"></label><label class="field"><span>角色</span><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label></div>
       <label class="field field-spaced"><span>初始密码</span><input name="password" type="password" required minlength="10"></label>
       <div class="question-actions"><button class="button button-primary button-small" type="submit">创建账号</button></div>
-    </form>
-    <div class="table-wrap user-table-wrap"><table class="data-table user-table"><thead><tr><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody>${users.map((user) => `<tr>
-       <td data-label="用户"><div class="user-identity"><span>${avatarVisual(user, user.username)}</span><strong>${escapeHtml(user.username)}</strong></div></td>
+    </form></details>
+    <form id="admin-user-search" class="admin-user-search"><label class="field"><span>搜索账号</span><input name="query" value="${escapeAttr(payload.query || "")}" maxlength="100" placeholder="输入用户名"></label><label class="field"><span>角色</span><select name="role"><option value="">全部</option><option value="admin" ${payload.role === "admin" ? "selected" : ""}>管理员</option><option value="user" ${payload.role === "user" ? "selected" : ""}>普通用户</option></select></label><label class="field"><span>状态</span><select name="status"><option value="">全部</option><option value="active" ${payload.status === "active" ? "selected" : ""}>正常</option><option value="disabled" ${payload.status === "disabled" ? "selected" : ""}>已停用</option></select></label><button class="button button-secondary" type="submit">筛选</button></form>
+    <div class="admin-list-summary">当前显示 ${formatNumber(users.length)} / ${formatNumber(payload.total || users.length)}</div>
+    ${renderAdminBulkBar("users", bulkActions)}
+    <div class="table-wrap user-table-wrap"><table class="data-table user-table"><thead><tr><th class="admin-select-column">选择</th><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody>${users.map((user) => `<tr class="${state.adminSelections.users.has(user.user_id) ? "selected" : ""}">
+      <td class="admin-select-column" data-label="选择">${adminSelectionCheckbox("users", user.user_id, `选择 ${user.username}`, { disabled: user.user_id === state.user.user_id })}</td>
+      <td data-label="用户"><div class="user-identity"><span>${avatarVisual(user, user.username)}</span><strong>${escapeHtml(user.username)}</strong></div></td>
       <td data-label="角色"><select class="compact-select" data-user-role="${escapeAttr(user.user_id)}" ${user.user_id === state.user.user_id ? "disabled" : ""}><option value="user" ${user.role === "user" ? "selected" : ""}>普通用户</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>管理员</option></select></td>
       <td data-label="状态"><span class="status-pill ${user.status}">${user.status === "active" ? "正常" : "已停用"}</span></td>
       <td data-label="最近登录">${formatDate(user.last_login_at)}</td>
-      <td data-label="操作"><div class="table-actions">${user.user_id === state.user.user_id ? `<span class="current-user-label">当前账号</span><button class="button button-secondary button-small" type="button" data-action="reset-user-password" data-id="${escapeAttr(user.user_id)}" data-name="${escapeAttr(user.username)}">修改密码</button>` : `<button class="button button-secondary button-small" type="button" data-action="update-user-role" data-id="${escapeAttr(user.user_id)}">保存角色</button><button class="button button-secondary button-small" type="button" data-action="reset-user-password" data-id="${escapeAttr(user.user_id)}" data-name="${escapeAttr(user.username)}">重置密码</button><button class="button ${user.status === "active" ? "button-danger" : "button-quiet"} button-small" type="button" data-action="toggle-user-status" data-id="${escapeAttr(user.user_id)}" data-status="${user.status === "active" ? "disabled" : "active"}">${user.status === "active" ? "停用" : "启用"}</button>`}</div></td>
-    </tr>`).join("")}</tbody></table></div>
+      <td data-label="操作"><div class="table-actions">${user.user_id === state.user.user_id ? `<span class="current-user-label">当前账号</span><button class="button button-secondary button-small" type="button" data-action="reset-user-password" data-id="${escapeAttr(user.user_id)}" data-name="${escapeAttr(user.username)}">修改密码</button>` : `<button class="button button-secondary button-small" type="button" data-action="update-user-role" data-id="${escapeAttr(user.user_id)}">保存角色</button><button class="button button-secondary button-small" type="button" data-action="reset-user-password" data-id="${escapeAttr(user.user_id)}" data-name="${escapeAttr(user.username)}">重置密码</button><button class="button button-secondary button-small" type="button" data-action="toggle-user-status" data-id="${escapeAttr(user.user_id)}" data-status="${user.status === "active" ? "disabled" : "active"}">${user.status === "active" ? "停用" : "启用"}</button><button class="button button-danger button-small" type="button" data-action="admin-user-purge" data-id="${escapeAttr(user.user_id)}" data-name="${escapeAttr(user.username)}">删除账号</button>`}</div></td>
+    </tr>`).join("")}</tbody></table></div>${renderAdminPagination("users", payload)}
   </section>`;
 }
 
 function renderAdminComments(payload = {}) {
   const items = payload.items || [];
+  const selectedCount = adminVisibleSelectionIds("comments").filter((id) => state.adminSelections.comments.has(id)).length;
+  const bulkActions = `<button class="button button-danger button-small" type="button" data-action="admin-comments-bulk-delete" ${selectedCount ? "" : "disabled"}>永久删除所选</button>`;
   return `<section class="card admin-section">
-    <div class="section-heading"><div><h2>评论管理</h2><p>查看全站讨论，按用户或内容筛选，并处理不适当评论。</p></div></div>
-    <div class="admin-mini-stats"><span><strong>${formatNumber(payload.total || 0)}</strong>全部评论</span><span><strong>${formatNumber(items.length)}</strong>当前显示</span></div>
+    <div class="section-heading admin-section-heading"><div><h2>评论管理</h2><p>查看并筛选题目评论。删除会同步清理反应、通知与子评论引用，无法恢复。</p></div><button class="button button-secondary button-small" type="button" data-action="admin-refresh">刷新列表</button></div>
+    <div class="admin-mini-stats"><span><strong>${formatNumber(payload.total || 0)}</strong>${payload.query ? "匹配评论" : "全部评论"}</span><span><strong>${formatNumber(items.length)}</strong>当前显示</span></div>
     <form id="admin-comment-search" class="admin-comment-search"><label class="field"><span>筛选评论</span><input name="query" value="${escapeAttr(payload.query || "")}" placeholder="输入用户名或评论内容"></label><button class="button button-secondary" type="submit">筛选</button></form>
-    ${items.length ? `<div class="admin-comment-list">${items.map((item) => {
+    ${items.length ? `${renderAdminBulkBar("comments", bulkActions)}<div class="admin-comment-list">${items.map((item) => {
       const question = item.question || {};
-      return `<article class="admin-comment-item">
+      return `<article class="admin-comment-item ${state.adminSelections.comments.has(item.comment_id) ? "selected" : ""}">
+        ${adminSelectionCheckbox("comments", item.comment_id, `选择 ${item.author_name || "用户"} 的评论`)}
         <div class="comment-avatar">${avatarVisual(item, item.author_name)}</div>
         <div class="admin-comment-main"><div class="comment-meta"><strong>${escapeHtml(item.author_name || "用户")}</strong><time>${escapeHtml(formatDate(item.updated_at))}${item.edited ? " · 已编辑" : ""}</time></div><p>${escapeHtml(item.body)}</p><div class="admin-comment-source"><span>${escapeHtml(question.stem || "原题已不可用")}</span><small>${escapeHtml(displaySourcePath(question.relative_path || ""))}</small></div></div>
-        <button class="button button-danger button-small" type="button" data-action="admin-delete-comment" data-comment-id="${escapeAttr(item.comment_id)}">删除</button>
+        <button class="button button-danger button-small" type="button" data-action="admin-delete-comment" data-comment-id="${escapeAttr(item.comment_id)}">永久删除</button>
       </article>`;
-    }).join("")}</div>` : emptyMarkup("没有匹配的评论", "调整筛选条件后重试。", "◌")}
+    }).join("")}</div>${renderAdminPagination("comments", payload)}` : emptyMarkup("没有匹配的评论", "调整筛选条件后重试。", "◌")}
   </section>`;
 }
 
@@ -3678,12 +4261,13 @@ function forumModerationStatus(item) {
 }
 
 function forumModerationActions(item) {
-  if (item.raw_status === "deleted" || item.topic_status === "deleted" && item.target_type === "reply") return "";
   const buttons = [];
   const liveStatus = item.target_type === "topic" ? "open" : "visible";
-  if (item.raw_status === liveStatus) buttons.push(`<button class="button button-secondary button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="hide">隐藏</button>`);
+  const parentDeleted = item.target_type === "reply" && item.topic_status === "deleted";
+  if (!parentDeleted && item.raw_status === liveStatus) buttons.push(`<button class="button button-secondary button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="hide">隐藏</button>`);
   if (item.can_restore) buttons.push(`<button class="button button-secondary button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="restore">恢复</button>`);
-  buttons.push(`<button class="button button-danger button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="delete">删除</button>`);
+  if (item.raw_status !== "deleted" && !parentDeleted) buttons.push(`<button class="button button-secondary button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="delete">软删除</button>`);
+  buttons.push(`<button class="button button-danger button-small" type="button" data-action="admin-forum-moderate" data-target-type="${item.target_type}" data-target-id="${escapeAttr(item.target_id)}" data-moderation-action="purge">永久删除</button>`);
   return buttons.join("");
 }
 
@@ -3691,17 +4275,24 @@ function renderAdminForum(payload = {}) {
   const items = payload.items || [];
   const audit = payload.audit || [];
   const stats = payload.stats || {};
-  const actionLabels = { edit: "编辑", hide: "隐藏", restore: "恢复", delete: "删除" };
+  const actionLabels = { edit: "编辑", hide: "隐藏", restore: "恢复", delete: "软删除", purge: "永久删除" };
+  const selectedItems = items.filter((item) => state.adminSelections.forum.has(adminForumSelectionKey(item)));
+  const selectedTopicIds = new Set(selectedItems.filter((item) => item.target_type === "topic").map((item) => item.target_id));
+  const canHide = selectedItems.length && selectedItems.every((item) => item.raw_status === (item.target_type === "topic" ? "open" : "visible"));
+  const canRestore = selectedItems.length && selectedItems.every((item) => item.can_restore || (item.target_type === "reply" && item.raw_status === "hidden" && selectedTopicIds.has(item.topic_id)));
+  const canDelete = selectedItems.length && selectedItems.every((item) => item.raw_status !== "deleted");
+  const bulkActions = `<button class="button button-secondary button-small" type="button" data-action="admin-forum-bulk" data-moderation-action="hide" ${canHide ? "" : "disabled"}>批量隐藏</button><button class="button button-secondary button-small" type="button" data-action="admin-forum-bulk" data-moderation-action="restore" ${canRestore ? "" : "disabled"}>批量恢复</button><button class="button button-secondary button-small" type="button" data-action="admin-forum-bulk" data-moderation-action="delete" ${canDelete ? "" : "disabled"}>批量软删除</button><span class="admin-bulk-divider" aria-hidden="true"></span><button class="button button-danger button-small" type="button" data-action="admin-forum-bulk" data-moderation-action="purge" ${selectedItems.length ? "" : "disabled"}>永久删除</button>`;
   return `<section class="card admin-section">
-    <div class="section-heading"><div><h2>论坛管理</h2><p>筛选主题与回复，执行隐藏、恢复或软删除，并保留管理员审计记录。</p></div></div>
+    <div class="section-heading admin-section-heading"><div><h2>论坛管理</h2><p>隐藏与软删除可用于日常审核；永久删除会物理清除内容、反应和相关通知。</p></div><button class="button button-secondary button-small" type="button" data-action="admin-refresh">刷新列表</button></div>
     <div class="admin-mini-stats"><span><strong>${formatNumber(stats.total || 0)}</strong>全部内容</span><span><strong>${formatNumber(stats.visible || 0)}</strong>公开</span><span><strong>${formatNumber(stats.hidden || 0)}</strong>隐藏</span><span><strong>${formatNumber(stats.deleted || 0)}</strong>删除</span></div>
     <form id="admin-forum-search" class="admin-forum-search"><label class="field"><span>关键词</span><input name="query" value="${escapeAttr(payload.query || "")}" maxlength="200" placeholder="主题、正文或作者"></label><label class="field"><span>内容类型</span><select name="target_type"><option value="">全部</option><option value="topic" ${payload.target_type === "topic" ? "selected" : ""}>主题</option><option value="reply" ${payload.target_type === "reply" ? "selected" : ""}>回复</option></select></label><label class="field"><span>状态</span><select name="status"><option value="">全部</option><option value="visible" ${payload.status === "visible" ? "selected" : ""}>公开</option><option value="hidden" ${payload.status === "hidden" ? "selected" : ""}>隐藏</option><option value="deleted" ${payload.status === "deleted" ? "selected" : ""}>删除</option></select></label><button class="button button-secondary" type="submit">筛选</button></form>
     <div class="admin-forum-summary">当前显示 ${formatNumber(items.length)} / ${formatNumber(payload.total || 0)}</div>
-    ${items.length ? `<div class="admin-forum-list">${items.map((item) => {
+    ${items.length ? `${renderAdminBulkBar("forum", bulkActions)}<div class="admin-forum-list">${items.map((item) => {
       const [statusLabel, statusClass] = forumModerationStatus(item);
-      return `<article class="admin-forum-item"><div class="admin-forum-item-head"><div><span class="status-pill ${statusClass}">${statusLabel}</span><strong>${item.target_type === "topic" ? "论坛主题" : "论坛回复"}</strong><time>${escapeHtml(formatDate(item.updated_at))}</time></div><button class="text-button" type="button" data-action="open-forum-dynamic" data-topic="${escapeAttr(item.topic_id)}">查看主题</button></div><h3>${escapeHtml(item.topic_title)}</h3><p>${escapeHtml(item.preview || "")}</p><div class="admin-forum-item-foot"><span>${escapeHtml(item.author_name || "用户")} · ${escapeHtml(item.section_name || "论坛")}</span><div class="table-actions">${forumModerationActions(item)}</div></div></article>`;
-    }).join("")}</div>` : emptyMarkup("没有匹配的论坛内容", "调整关键词、类型或状态后重试。", "◌")}
-    <div class="admin-forum-audit"><div class="section-heading"><div><h3>审核记录</h3><p>最近 ${formatNumber(audit.length)} 条管理员操作，仅记录目标、状态、原因与操作者。</p></div></div>${audit.length ? `<div class="admin-forum-audit-list">${audit.map((item) => `<article><div><strong>${escapeHtml(item.moderator_name || "管理员")} · ${actionLabels[item.action] || escapeHtml(item.action)}</strong><time>${escapeHtml(formatDate(item.created_at))}</time></div><p>${escapeHtml(item.reason)}</p><small>${item.target_type === "topic" ? "主题" : "回复"} · ${escapeHtml(item.previous_status)} → ${escapeHtml(item.new_status)} · ${escapeHtml(item.target_id)}</small></article>`).join("")}</div>` : `<p class="message-empty">暂无审核记录</p>`}</div>
+      const key = adminForumSelectionKey(item);
+      return `<article class="admin-forum-item ${state.adminSelections.forum.has(key) ? "selected" : ""}"><div class="admin-forum-select-row">${adminSelectionCheckbox("forum", key, `选择${item.target_type === "topic" ? "主题" : "回复"}`)}</div><div class="admin-forum-item-head"><div><span class="status-pill ${statusClass}">${statusLabel}</span><strong>${item.target_type === "topic" ? "论坛主题" : "论坛回复"}</strong><time>${escapeHtml(formatDate(item.updated_at))}</time></div><button class="text-button" type="button" data-action="open-forum-dynamic" data-topic="${escapeAttr(item.topic_id)}">查看主题</button></div><h3>${escapeHtml(item.topic_title)}</h3><p>${escapeHtml(item.preview || "")}</p><div class="admin-forum-item-foot"><span>${escapeHtml(item.author_name || "用户")} · ${escapeHtml(item.section_name || "论坛")}</span><div class="table-actions">${forumModerationActions(item)}</div></div></article>`;
+    }).join("")}</div>${renderAdminPagination("forum", payload)}` : emptyMarkup("没有匹配的论坛内容", "调整关键词、类型或状态后重试。", "◌")}
+    <div class="admin-forum-audit"><div class="section-heading"><div><h3>审核记录</h3><p>最近 ${formatNumber(audit.length)} 条管理员操作。内容永久删除后仍保留不含正文的审计元数据。</p></div></div>${audit.length ? `<div class="admin-forum-audit-list">${audit.map((item) => `<article><div><strong>${escapeHtml(item.moderator_name || "管理员")} · ${actionLabels[item.action] || escapeHtml(item.action)}</strong><time>${escapeHtml(formatDate(item.created_at))}</time></div><p>${escapeHtml(item.reason)}</p><small>${item.target_type === "topic" ? "主题" : "回复"} · ${escapeHtml(item.previous_status)} → ${escapeHtml(item.new_status)} · ${escapeHtml(item.target_id)}</small></article>`).join("")}</div>` : `<p class="message-empty">暂无审核记录</p>`}</div>
   </section>`;
 }
 
@@ -3843,7 +4434,144 @@ function renderVectorManagement(vector, operation) {
 }
 
 function renderSiteSettings(settings) {
-  return `<section class="card admin-section"><div class="section-heading"><div><h2>网站设置</h2><p>设置站点名称、注册策略和默认结果数量。</p></div></div><form id="site-settings-form" class="stack-form"><label class="field"><span>站点名称</span><input name="site_name" value="${escapeAttr(settings.site_name || "医考知库")}" minlength="2" maxlength="30" required></label><label class="field"><span>默认搜索结果数</span><input name="search_result_limit" type="number" min="1" max="50" value="${settings.search_result_limit || 10}" required></label><div class="settings-group"><div class="switch-row"><div class="switch-copy"><strong>开放用户注册</strong><small>关闭后仅管理员可在账号管理中创建用户</small></div><label class="switch"><input name="allow_registration" type="checkbox" ${settings.allow_registration ? "checked" : ""}><span></span></label></div></div><div class="question-actions"><button class="button button-primary" type="submit">保存网站设置</button></div></form></section>`;
+  const site = normalizeSiteAppearance({
+    ...(settings.site || {}),
+    allow_registration: settings.allow_registration,
+  });
+  const backgroundUrl = siteBackgroundUrl(site);
+  return `<section class="card admin-section site-settings-section">
+    <div class="section-heading"><div><h2>网站设置</h2><p>统一配置站点品牌、登录页内容、背景图片和基础访问策略。</p></div></div>
+    <div class="site-settings-layout">
+      <div class="site-settings-editor">
+        <form id="site-settings-form" class="stack-form">
+          <section class="settings-group site-settings-group"><div class="site-settings-group-head"><div><h3>品牌信息</h3><p>同步用于浏览器标题、登录页和站内顶栏。</p></div></div>
+            <div class="site-field-grid">${siteSettingField("site_name", "站点名称", site.site_name, { min: 2, max: 30, required: true })}${siteSettingField("site_mark", "品牌短字", site.site_mark, { min: 1, max: 4, required: true })}</div>
+            ${siteSettingField("site_subtitle", "品牌副标题", site.site_subtitle, { max: 60, help: "可使用英文或其他简短品牌说明；留空后不显示。" })}
+            ${siteSettingField("site_description", "网页说明", site.site_description, { min: 2, max: 160, required: true, multiline: true, help: "用于浏览器页面描述，不支持 HTML。" })}
+          </section>
+          <section class="settings-group site-settings-group"><div class="site-settings-group-head"><div><h3>登录页内容</h3><p>下面的修改会立即显示在右侧预览中，保存后对所有访客生效。</p></div></div>
+            ${siteSettingField("login_eyebrow", "眉题", site.login_eyebrow, { max: 40 })}
+            ${siteSettingField("login_title", "主标题", site.login_title, { min: 2, max: 90, required: true, multiline: true })}
+            ${siteSettingField("login_description", "介绍文字", site.login_description, { max: 240, multiline: true })}
+            <div class="site-feature-fields"><span>三条能力介绍</span>${site.login_features.map((value, index) => siteSettingField(`login_feature_${index + 1}`, `能力 ${index + 1}`, value, { max: 60, compact: true })).join("")}</div>
+          </section>
+          <section class="settings-group site-settings-group"><div class="site-settings-group-head"><div><h3>站点行为</h3><p>这些设置不影响现有账号和题库数据。</p></div></div>
+            <label class="field"><span>默认搜索结果数</span><input name="search_result_limit" type="number" min="1" max="50" value="${Number(settings.search_result_limit || 10)}" required></label>
+            <div class="switch-row"><div class="switch-copy"><strong>开放用户注册</strong><small>关闭后仅管理员可在账号管理中创建用户，登录页同步隐藏注册入口。</small></div><label class="switch"><input name="allow_registration" type="checkbox" ${settings.allow_registration ? "checked" : ""}><span></span></label></div>
+          </section>
+          <p id="site-settings-save-status" class="site-settings-save-status">当前显示的是已保存配置</p>
+          <div class="site-settings-actions"><button class="button button-secondary" type="button" data-action="restore-site-defaults">恢复默认文案</button><button class="button button-primary" type="submit">保存并应用</button></div>
+        </form>
+        <form id="site-background-form" class="settings-group site-background-form">
+          <div class="site-settings-group-head"><div><h3>登录页背景</h3><p>仅支持 JPG、PNG、WebP，最大 8 MB；服务端会移除元数据并统一转码。</p></div><span class="status-pill ${site.login_background.configured ? "complete" : "disabled"}">${site.login_background.configured ? "已自定义" : "默认渐变"}</span></div>
+          <label class="site-background-picker" for="site-background-input"><strong>选择背景图片</strong><span id="site-background-file-name">建议使用横向高清图片，最小 640×320</span><input id="site-background-input" name="background" type="file" accept="image/jpeg,image/png,image/webp" required></label>
+          <div class="site-background-actions"><button class="button button-primary button-small" type="submit">上传并应用</button><button class="button button-secondary button-small" type="button" data-action="clear-site-background-file">清除选择</button>${site.login_background.configured ? `<button class="button button-danger button-small" type="button" data-action="delete-site-background">恢复默认背景</button>` : ""}</div>
+          ${site.login_background.configured ? `<small class="site-background-meta">当前图片 ${formatNumber(site.login_background.width)} × ${formatNumber(site.login_background.height)}，已安全转码为 WebP。</small>` : ""}
+        </form>
+      </div>
+      <aside class="site-preview-panel"><div class="site-preview-heading"><strong>登录页实时预览</strong><span>内容预览，不会自动保存</span></div><article id="site-login-preview" class="site-login-preview ${backgroundUrl ? "has-background" : ""}">${backgroundUrl ? `<img id="site-preview-background" src="${escapeAttr(backgroundUrl)}" alt="">` : `<img id="site-preview-background" alt="" hidden>`}<div class="site-preview-content"><div class="site-preview-brand"><b id="site-preview-mark" class="${[...site.site_mark].length > 2 ? "compact" : ""}">${escapeHtml(site.site_mark)}</b><span><strong id="site-preview-name">${escapeHtml(site.site_name)}</strong><small id="site-preview-subtitle" ${site.site_subtitle ? "" : "hidden"}>${escapeHtml(site.site_subtitle)}</small></span></div><div class="site-preview-copy"><span id="site-preview-eyebrow" ${site.login_eyebrow ? "" : "hidden"}>${escapeHtml(site.login_eyebrow)}</span><h3 id="site-preview-title">${escapeHtml(site.login_title)}</h3><p id="site-preview-description" ${site.login_description ? "" : "hidden"}>${escapeHtml(site.login_description)}</p></div><ol id="site-preview-features">${site.login_features.filter(Boolean).map((value, index) => `<li><span>${String(index + 1).padStart(2, "0")}</span>${escapeHtml(value)}</li>`).join("")}</ol></div></article></aside>
+    </div>
+  </section>`;
+}
+
+function siteSettingField(name, label, value, { min = 0, max = 60, required = false, multiline = false, help = "", compact = false } = {}) {
+  const attributes = `name="${name}" data-site-field="${name}" minlength="${min}" maxlength="${max}" ${required ? "required" : ""}`;
+  const control = multiline
+    ? `<textarea ${attributes} rows="${compact ? 2 : 3}">${escapeHtml(value || "")}</textarea>`
+    : `<input ${attributes} value="${escapeAttr(value || "")}">`;
+  return `<label class="field site-setting-field ${compact ? "compact" : ""}"><span>${escapeHtml(label)}<small data-site-count-for="${name}">${String(value || "").length} / ${max}</small></span>${control}${help ? `<em>${escapeHtml(help)}</em>` : ""}</label>`;
+}
+
+function siteAppearanceFromForm(form) {
+  const values = Object.fromEntries(new FormData(form));
+  return normalizeSiteAppearance({
+    ...state.site,
+    site_name: String(values.site_name || ""),
+    site_mark: String(values.site_mark || ""),
+    site_subtitle: String(values.site_subtitle || ""),
+    site_description: String(values.site_description || ""),
+    login_eyebrow: String(values.login_eyebrow || ""),
+    login_title: String(values.login_title || ""),
+    login_description: String(values.login_description || ""),
+    login_features: [1, 2, 3].map((index) => String(values[`login_feature_${index}`] || "")),
+    allow_registration: form.elements.allow_registration.checked,
+  });
+}
+
+function updateSiteSettingsPreview(form = $("#site-settings-form")) {
+  if (!form) return;
+  const site = siteAppearanceFromForm(form);
+  const pairs = {
+    "site-preview-mark": site.site_mark,
+    "site-preview-name": site.site_name,
+    "site-preview-subtitle": site.site_subtitle,
+    "site-preview-eyebrow": site.login_eyebrow,
+    "site-preview-title": site.login_title,
+    "site-preview-description": site.login_description,
+  };
+  Object.entries(pairs).forEach(([id, value]) => {
+    const node = $(`#${id}`);
+    if (!node) return;
+    node.textContent = value;
+    if (["site-preview-subtitle", "site-preview-eyebrow", "site-preview-description"].includes(id)) node.hidden = !value;
+  });
+  $("#site-preview-mark")?.classList.toggle("compact", [...site.site_mark].length > 2);
+  const features = $("#site-preview-features");
+  if (features) {
+    features.replaceChildren(...site.login_features.filter(Boolean).map((value, index) => {
+      const item = document.createElement("li");
+      const number = document.createElement("span");
+      number.textContent = String(index + 1).padStart(2, "0");
+      item.append(number, document.createTextNode(value));
+      return item;
+    }));
+  }
+  $$('[data-site-field]', form).forEach((field) => {
+    const count = $(`[data-site-count-for="${field.dataset.siteField}"]`, form);
+    if (count) count.textContent = `${field.value.length} / ${field.maxLength}`;
+  });
+  markSiteSettingsUnsaved();
+}
+
+function markSiteSettingsUnsaved() {
+  state.siteSettingsDirty = true;
+  const status = $("#site-settings-save-status");
+  if (status) {
+    status.textContent = "有尚未保存的修改";
+    status.classList.add("unsaved");
+  }
+}
+
+async function confirmDiscardSiteSettings() {
+  if (!state.siteSettingsDirty && !state.siteBackgroundPending) return true;
+  return confirmModal(
+    "放弃未保存修改",
+    "网站设置中还有未保存的文字、站点行为或尚未上传的背景图片。确认离开并放弃这些修改？",
+    "放弃修改"
+  );
+}
+
+function captureSiteSettingsDraft() {
+  const form = $("#site-settings-form");
+  if (!form) return null;
+  return {
+    values: Object.fromEntries(new FormData(form)),
+    allowRegistration: form.elements.allow_registration.checked,
+    unsaved: $("#site-settings-save-status")?.classList.contains("unsaved") || false,
+  };
+}
+
+function restoreSiteSettingsDraft(draft) {
+  if (!draft?.unsaved) return;
+  const form = $("#site-settings-form");
+  if (!form) return;
+  Object.entries(draft.values || {}).forEach(([name, value]) => {
+    if (form.elements[name] && form.elements[name].type !== "checkbox") {
+      form.elements[name].value = value;
+    }
+  });
+  form.elements.allow_registration.checked = draft.allowRegistration;
+  updateSiteSettingsPreview(form);
 }
 
 async function handleClick(event) {
@@ -3931,7 +4659,12 @@ async function handleClick(event) {
     if (!location.hash.startsWith("#admin")) state.adminReturnHash = location.hash || "#library";
     return navigateHash("#admin");
   }
-  if (action === "return-from-admin") return navigateHash(state.adminReturnHash || "#library");
+  if (action === "return-from-admin") {
+    if (state.adminTab === "site" && !(await confirmDiscardSiteSettings())) return;
+    state.siteSettingsDirty = false;
+    state.siteBackgroundPending = false;
+    return navigateHash(state.adminReturnHash || "#library");
+  }
   if (action === "library-home") {
     event.preventDefault();
     state.libraryPath.library = "";
@@ -3991,20 +4724,29 @@ async function handleClick(event) {
   }
   if (action === "outline-order-key") {
     const key = target.dataset.orderKey;
-    state.outlineOrderMode = key === "position"
-      ? "sequential"
-      : key === "year" ? "year_desc" : key === "random" ? "random" : "type";
-    savePreferences();
-    renderOutline();
-    return;
-  }
-  if (action === "outline-order-direction") {
-    const mode = normalizeOutlineOrderMode(state.outlineOrderMode, "type");
-    if (mode === "sequential") state.outlineOrderMode = "position_desc";
-    else if (mode === "position_desc") state.outlineOrderMode = "sequential";
-    else if (mode === "year_desc") state.outlineOrderMode = "year_asc";
-    else if (mode === "year_asc") state.outlineOrderMode = "year_desc";
-    else return;
+    const current = normalizeOutlineOrderMode(state.outlineOrderMode, "type");
+    if (key === "position") {
+      state.outlineOrderMode = current === "sequential"
+        ? "position_desc"
+        : "sequential";
+    } else if (key === "type") {
+      state.outlineOrderMode = current === "type"
+        ? "type_desc"
+        : "type";
+    } else if (key === "year") {
+      state.outlineOrderMode = current === "year_desc"
+        ? "year_asc"
+        : "year_desc";
+    } else if (key === "random") {
+      state.outlineOrderMode = "random";
+      const outlineItems = state.outline?.payload?.items || [];
+      state.outlineRandomOccurrenceOrder = shuffledOccurrenceOrder(
+        outlineItems,
+        state.outlineRandomOccurrenceOrder
+      );
+    } else {
+      return;
+    }
     savePreferences();
     renderOutline();
     return;
@@ -4087,7 +4829,36 @@ async function handleClick(event) {
   if (action === "select-provider-model") return selectProviderModel(target.dataset.provider, target.dataset.model);
   if (action === "build-vectors") return buildVectors();
   if (action === "delete-vectors") return deleteVectors();
-  if (action === "admin-delete-comment") return adminDeleteComment(target.dataset.commentId);
+  if (action === "restore-site-defaults") return restoreSiteDefaults();
+  if (action === "clear-site-background-file") return clearSiteBackgroundFile();
+  if (action === "delete-site-background") return deleteSiteBackground(target);
+  if (action === "admin-refresh") {
+    if (state.adminTab === "site" && !(await confirmDiscardSiteSettings())) return;
+    state.siteSettingsDirty = false;
+    state.siteBackgroundPending = false;
+    return loadAdminTab(state.adminTab, { force: true });
+  }
+  if (action === "admin-retry") return loadAdminTab(state.adminTab, { force: true });
+  if (action === "admin-select-visible") {
+    const kind = target.dataset.selectionKind;
+    const selection = state.adminSelections[kind];
+    if (!selection) return;
+    adminVisibleSelectionIds(kind).forEach((id) => selection.add(id));
+    renderAdminContent();
+    return;
+  }
+  if (action === "admin-clear-selection") {
+    clearAdminSelections(target.dataset.selectionKind);
+    renderAdminContent();
+    return;
+  }
+  if (action === "admin-users-bulk") return updateAdminUsersBulk(target);
+  if (action === "admin-user-purge") return deleteAdminUser(target);
+  if (action === "admin-users-purge-bulk") return deleteAdminUsersBulk(target);
+  if (action === "admin-comments-bulk-delete") return deleteAdminCommentsBulk(target);
+  if (action === "admin-forum-bulk") return moderateAdminForumBulk(target);
+  if (action === "admin-list-page") return loadAdminListPage(target.dataset.listKind, Number(target.dataset.offset || 0));
+  if (action === "admin-delete-comment") return adminDeleteComment(target);
   if (action === "admin-forum-moderate") return moderateAdminForum(target);
   if (action === "admin-feedback-status") return updateAdminFeedback(target);
   if (action === "admin-feedback-page") return loadAdminFeedbackPage(Number(target.dataset.offset || 0));
@@ -4099,9 +4870,14 @@ async function handleClick(event) {
   }
   if (action === "catalog-import-delete") return deleteCatalogImport(target.dataset.importId);
   if (action === "admin-tab") {
+    if (state.adminTab === target.dataset.tab) return;
+    if (state.adminTab === "site" && target.dataset.tab !== "site" && !(await confirmDiscardSiteSettings())) return;
+    state.siteSettingsDirty = false;
+    state.siteBackgroundPending = false;
+    clearAdminSelections();
     state.adminTab = target.dataset.tab;
     renderAdminContent();
-    return;
+    return loadAdminTab(state.adminTab);
   }
   if (action === "toggle-user-status") return toggleUserStatus(target.dataset.id, target.dataset.status);
   if (action === "update-user-role") return updateUserRole(target.dataset.id);
@@ -4113,6 +4889,8 @@ async function handleClick(event) {
   if (action === "ai-delete") return deleteAIConversation();
   if (action === "ai-retry") return renderAIPage({ force: true });
   if (action === "ai-stop") return stopAIMessage();
+  if (action === "ai-starter") return useAIStarter(target);
+  if (action === "ai-dismiss-error") { state.ai.error = ""; renderAIViews(); return; }
   if (action === "ai-copy") return copyAIMessage(target.dataset.messageId || "");
   if (action === "ai-continue") return continueAIMessage(target.dataset.messageId || "");
   if (action === "ai-regenerate") return regenerateAIMessage(target.dataset.messageId || "");
@@ -4127,9 +4905,25 @@ async function handleClick(event) {
   if (action === "ai-current-question") {
     return openPracticeAIDrawer(target);
   }
-  if (action === "forum-toggle-composer") { state.forum.composerOpen = !state.forum.composerOpen; renderForumListing(parseRouteHash()); return; }
-  if (action === "forum-section") return navigateHash(forumRouteHash({ section: target.dataset.section || "" }));
-  if (action === "forum-open-topic") return navigateHash(forumRouteHash({ topic: target.dataset.topic || "" }));
+  if (action === "forum-toggle-composer") {
+    state.forum.composerOpen = !state.forum.composerOpen;
+    renderForumListing(parseRouteHash());
+    if (state.forum.composerOpen) window.requestAnimationFrame(() => $("#forum-topic-form input[name=title]")?.focus());
+    return;
+  }
+  if (action === "forum-section") {
+    const descriptor = parseRouteHash();
+    return navigateHash(forumRouteHash({ section: target.dataset.section || "", query: descriptor.query, sort: descriptor.sort }));
+  }
+  if (action === "forum-sort") {
+    const descriptor = parseRouteHash();
+    return navigateHash(forumRouteHash({ section: descriptor.sectionId, query: descriptor.query, sort: target.dataset.sort }));
+  }
+  if (action === "forum-clear-search") {
+    const descriptor = parseRouteHash();
+    return navigateHash(forumRouteHash({ section: descriptor.sectionId, sort: descriptor.sort }));
+  }
+  if (action === "forum-open-topic") return navigateHash(forumRouteHash({ topic: target.dataset.topic || "", returnHash: target.dataset.return || "#forum" }));
   if (action === "forum-back") return navigateHash(target.dataset.return || "#forum");
   if (action === "forum-load-more") return loadMoreForumTopics(target);
   if (action === "forum-react") return reactForumContent(target);
@@ -4164,11 +4958,13 @@ async function handleSubmit(event) {
   if (event.target.id === "settings-password-form") return saveProfilePassword(event.target);
   if (event.target.id === "semantic-settings-form") return saveSemanticSettings(event.target);
   if (event.target.id === "site-settings-form") return saveSiteSettings(event.target);
+  if (event.target.id === "site-background-form") return saveSiteBackground(event.target);
   if (event.target.id === "create-user-form") return createUser(event.target);
   if (event.target.id === "admin-catalog-export") return exportAdminCatalog(event.target);
   if (event.target.id === "admin-catalog-import") return submitCatalogImport(event.target);
   if (event.target.id === "admin-catalog-import-mapping") return analyzeCatalogImport(event.target);
   if (event.target.id === "admin-comment-search") return searchAdminComments(event.target);
+  if (event.target.id === "admin-user-search") return searchAdminUsers(event.target);
   if (event.target.id === "admin-forum-search") return searchAdminForum(event.target);
   if (event.target.id === "admin-feedback-search") return searchAdminFeedback(event.target);
   if (event.target.dataset.providerForm) return saveProviderSettings(event.target);
@@ -4179,18 +4975,27 @@ async function handleSubmit(event) {
   if (event.target.dataset.form === "forum-reply") return submitForumReply(event.target);
   if (event.target.dataset.form === "forum-search") {
     const query = String(new FormData(event.target).get("query") || "").trim();
-    return navigateHash(forumRouteHash({ section: parseRouteHash().sectionId, query }));
+    const descriptor = parseRouteHash();
+    return navigateHash(forumRouteHash({ section: descriptor.sectionId, query, sort: descriptor.sort }));
   }
 }
 
 document.addEventListener("keydown", (event) => {
-  if (event.target.closest?.("#ai-chat-form") && event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+  if (event.target.closest?.('[data-form="ai-chat"]') && event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
     event.preventDefault();
     event.target.closest("form")?.requestSubmit();
   }
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.matches?.("[data-site-field]")) {
+    updateSiteSettingsPreview(event.target.form);
+    return;
+  }
+  if (event.target.closest?.("#site-settings-form")) {
+    markSiteSettingsUnsaved();
+    return;
+  }
   if (event.target.dataset.providerKey) {
     scheduleProviderDiscovery(event.target.dataset.providerKey);
     return;
@@ -4202,6 +5007,7 @@ document.addEventListener("input", (event) => {
   if (event.target.closest?.('[data-form="ai-chat"]') && event.target.name === "content") {
     state.ai.draft = event.target.value;
     if (state.ai.activeId) state.ai.drafts[state.ai.activeId] = event.target.value;
+    $$(".ai-draft-count").forEach((node) => { node.textContent = `${formatNumber(event.target.value.length)} / 8000`; });
     return;
   }
   if (event.target.dataset.action !== "subjective-draft" || !state.session) return;
@@ -4212,6 +5018,29 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (event.target.dataset.adminSelection) {
+    const kind = event.target.dataset.adminSelection;
+    const selection = state.adminSelections[kind];
+    if (!selection) return;
+    const id = event.target.dataset.selectionId;
+    if (id === "__all__") {
+      adminVisibleSelectionIds(kind).forEach((value) => {
+        if (event.target.checked) selection.add(value);
+        else selection.delete(value);
+      });
+    } else if (event.target.checked) selection.add(id);
+    else selection.delete(id);
+    renderAdminContent();
+    return;
+  }
+  if (event.target.id === "site-background-input") {
+    previewSiteBackgroundFile(event.target.files?.[0]);
+    return;
+  }
+  if (event.target.closest?.("#site-settings-form")) {
+    markSiteSettingsUnsaved();
+    return;
+  }
   const preferenceForm = event.target.closest?.("[data-preference-form]");
   if (preferenceForm && event.target.matches('input[type="checkbox"]')) {
     scheduleAccountPreferences(preferenceForm);
@@ -4528,10 +5357,10 @@ async function toggleUserStatus(userId, status) {
   const confirmed = await confirmModal(`${verb}账号`, `确认${verb}该账号？停用会立即撤销其全部登录会话。`, `确认${verb}`);
   if (!confirmed) return;
   try {
-    const updated = await api(`/admin/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: { status } });
-    const index = state.adminData.users.findIndex((user) => user.user_id === userId);
-    if (index >= 0) state.adminData.users[index] = updated;
-    renderAdminContent();
+    await api(`/admin/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: { status } });
+    invalidateAdminTabs("overview");
+    clearAdminSelections("users");
+    await refreshAdminUsers();
   } catch (error) {
     showToast(error.message, "error");
   }
@@ -4554,10 +5383,10 @@ async function updateUserRole(userId) {
     }
   }
   try {
-    const updated = await api(`/admin/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: { role } });
-    const index = state.adminData.users.findIndex((user) => user.user_id === userId);
-    if (index >= 0) state.adminData.users[index] = updated;
-    renderAdminContent();
+    await api(`/admin/users/${encodeURIComponent(userId)}`, { method: "PATCH", body: { role } });
+    invalidateAdminTabs("overview");
+    clearAdminSelections("users");
+    await refreshAdminUsers();
     showToast("账号角色已更新");
   } catch (error) {
     select.value = current.role;
@@ -4589,9 +5418,10 @@ async function createUser(form) {
   setButtonBusy(button, true, "创建中");
   try {
     const body = Object.fromEntries(new FormData(form));
-    const user = await api("/admin/users", { method: "POST", body });
-    state.adminData.users.push(user);
-    renderAdminContent();
+    await api("/admin/users", { method: "POST", body });
+    invalidateAdminTabs("overview");
+    clearAdminSelections("users");
+    await refreshAdminUsers();
     showToast("账号已创建");
   } catch (error) {
     showToast(error.message, "error");
@@ -4726,24 +5556,165 @@ async function testProvider(provider, button) {
 }
 
 async function saveSiteSettings(form) {
+  if (state.siteBackgroundPending) {
+    showToast("请先上传并应用已选择的背景图片，或清除图片选择", "error");
+    return;
+  }
   const values = Object.fromEntries(new FormData(form));
+  const site = siteAppearanceFromForm(form);
+  const button = $('button[type="submit"]', form);
+  setButtonBusy(button, true, "保存中");
   try {
     state.adminData.settings = await api("/admin/settings", {
       method: "PUT",
       body: {
         app: {
-          site_name: values.site_name,
+          site_name: site.site_name,
+          site_mark: site.site_mark,
+          site_subtitle: site.site_subtitle,
+          site_description: site.site_description,
+          login_eyebrow: site.login_eyebrow,
+          login_title: site.login_title,
+          login_description: site.login_description,
+          login_features: site.login_features,
           search_result_limit: Number(values.search_result_limit),
           allow_registration: form.elements.allow_registration.checked,
         },
       },
     });
     state.settings = state.adminData.settings;
-    $("#site-brand-name").textContent = state.settings.site_name;
+    state.siteSettingsDirty = false;
+    applySiteAppearance({
+      ...(state.settings.site || site),
+      allow_registration: state.settings.allow_registration,
+    });
     renderAdminContent();
     showToast("网站设置已保存");
   } catch (error) {
     showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+function restoreSiteDefaults() {
+  const form = $("#site-settings-form");
+  if (!form) return;
+  const defaults = state.adminData?.settings?.site_defaults || DEFAULT_SITE_APPEARANCE;
+  ["site_name", "site_mark", "site_subtitle", "site_description", "login_eyebrow", "login_title", "login_description"].forEach((name) => {
+    if (form.elements[name]) form.elements[name].value = defaults[name] || "";
+  });
+  (defaults.login_features || DEFAULT_SITE_APPEARANCE.login_features).forEach((value, index) => {
+    const field = form.elements[`login_feature_${index + 1}`];
+    if (field) field.value = value || "";
+  });
+  updateSiteSettingsPreview(form);
+  showToast("默认文案已填入，点击保存后生效");
+}
+
+function previewSiteBackgroundFile(file) {
+  const label = $("#site-background-file-name");
+  if (!file) return clearSiteBackgroundFile();
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+    showToast("背景图片仅支持 JPG、PNG 或 WebP", "error");
+    clearSiteBackgroundFile();
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    showToast("背景图片不能超过 8 MB", "error");
+    clearSiteBackgroundFile();
+    return;
+  }
+  state.siteBackgroundPending = true;
+  if (label) label.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.siteBackgroundPreviewUrl = String(reader.result || "");
+    const preview = $("#site-preview-background");
+    const card = $("#site-login-preview");
+    if (preview && state.siteBackgroundPreviewUrl) {
+      preview.src = state.siteBackgroundPreviewUrl;
+      preview.hidden = false;
+      card?.classList.add("has-background");
+    }
+  };
+  reader.onerror = () => showToast("背景图片预览失败", "error");
+  reader.readAsDataURL(file);
+}
+
+function clearSiteBackgroundFile() {
+  const input = $("#site-background-input");
+  const label = $("#site-background-file-name");
+  if (input) input.value = "";
+  if (label) label.textContent = "建议使用横向高清图片，最小 640×320";
+  state.siteBackgroundPreviewUrl = "";
+  state.siteBackgroundPending = false;
+  const preview = $("#site-preview-background");
+  const card = $("#site-login-preview");
+  const currentUrl = siteBackgroundUrl(state.site);
+  if (preview) {
+    preview.hidden = !currentUrl;
+    if (currentUrl) preview.src = currentUrl;
+    else preview.removeAttribute("src");
+  }
+  card?.classList.toggle("has-background", Boolean(currentUrl));
+}
+
+function updateStoredSiteAppearance(site) {
+  if (state.adminData?.settings) {
+    state.adminData.settings.site = site;
+    state.adminData.settings.site_name = site.site_name;
+  }
+  if (state.settings) {
+    state.settings.site = site;
+    state.settings.site_name = site.site_name;
+  }
+  applySiteAppearance({
+    ...site,
+    allow_registration: state.adminData?.settings?.allow_registration ?? state.site.allow_registration,
+  });
+}
+
+async function saveSiteBackground(form) {
+  const file = form.elements.background.files?.[0];
+  if (!file) return showToast("请先选择背景图片", "error");
+  const button = $('button[type="submit"]', form);
+  const siteDraft = captureSiteSettingsDraft();
+  setButtonBusy(button, true, "上传中");
+  try {
+    const body = new FormData(form);
+    const result = await api("/admin/settings/login-background", { method: "POST", body });
+    updateStoredSiteAppearance(result.site);
+    state.siteBackgroundPreviewUrl = "";
+    state.siteBackgroundPending = false;
+    renderAdminContent();
+    restoreSiteSettingsDraft(siteDraft);
+    showToast("登录页背景已更新");
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function deleteSiteBackground(button) {
+  const confirmed = await confirmModal(
+    "恢复默认背景",
+    "确认移除当前自定义背景并恢复系统默认渐变？站点文字配置不会改变。",
+    "恢复默认背景"
+  );
+  if (!confirmed) return;
+  const siteDraft = captureSiteSettingsDraft();
+  setButtonBusy(button, true, "处理中");
+  try {
+    const result = await api("/admin/settings/login-background", { method: "DELETE", body: {} });
+    updateStoredSiteAppearance(result.site);
+    state.siteBackgroundPreviewUrl = "";
+    state.siteBackgroundPending = false;
+    renderAdminContent();
+    restoreSiteSettingsDraft(siteDraft);
+    showToast("已恢复默认登录背景");
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
   }
 }
 
@@ -4752,8 +5723,9 @@ async function refreshVectorOperation({ render = true } = {}) {
   try {
     state.adminData.vectors = await api("/admin/vectors");
     const vector = state.adminData.vectors.vector_index || {};
-    state.adminData.settings.vector_index = vector;
-    state.adminData.dashboard.vector_index = vector;
+    if (state.adminData.settings) state.adminData.settings.vector_index = vector;
+    if (state.adminData.dashboard) state.adminData.dashboard.vector_index = vector;
+    markAdminTabReady("models");
     if (render && state.adminTab === "models" && location.hash.startsWith("#admin")) {
       const current = $("#vector-management-card");
       if (current) {
@@ -4808,39 +5780,145 @@ async function deleteVectors() {
   }
 }
 
+function adminUserQuery(payload = state.adminData?.userMeta || {}) {
+  const params = new URLSearchParams({
+    limit: String(payload.limit || 100),
+    offset: String(payload.offset || 0),
+  });
+  if (payload.query) params.set("query", payload.query);
+  if (payload.role) params.set("role", payload.role);
+  if (payload.status) params.set("status", payload.status);
+  return params;
+}
+
+function markAdminTabReady(tab) {
+  const runtime = state.adminRuntime[tab];
+  if (!runtime) return;
+  runtime.status = "ready";
+  runtime.error = "";
+  runtime.loadedAt = Date.now();
+}
+
+function previousAvailableAdminOffset(payload, itemCount) {
+  const offset = Math.max(0, Number(payload.offset || 0));
+  if (itemCount || offset === 0) return null;
+  const total = Math.max(0, Number(payload.total || 0));
+  const limit = Math.max(1, Number(payload.limit || 100));
+  return total ? Math.floor((total - 1) / limit) * limit : 0;
+}
+
+async function refreshAdminUsers(payload = state.adminData?.userMeta || {}) {
+  let result = await api(`/admin/users?${adminUserQuery(payload)}`);
+  const fallbackOffset = previousAvailableAdminOffset(result, (result.users || []).length);
+  if (fallbackOffset !== null && fallbackOffset !== Number(result.offset || 0)) {
+    result = await api(`/admin/users?${adminUserQuery({ ...result, offset: fallbackOffset })}`);
+  }
+  state.adminData.userMeta = result;
+  state.adminData.users = result.users || [];
+  markAdminTabReady("users");
+  renderAdminContent();
+  return result;
+}
+
+async function searchAdminUsers(form) {
+  const values = Object.fromEntries(new FormData(form));
+  clearAdminSelections("users");
+  try {
+    await refreshAdminUsers({
+      query: String(values.query || "").trim(),
+      role: String(values.role || ""),
+      status: String(values.status || ""),
+      limit: 100,
+      offset: 0,
+    });
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+function adminCommentsQuery(payload = state.adminData?.comments || {}) {
+  const params = new URLSearchParams({
+    limit: String(payload.limit || 100),
+    offset: String(payload.offset || 0),
+  });
+  if (payload.query) params.set("query", payload.query);
+  return params;
+}
+
+async function refreshAdminComments(payload = state.adminData?.comments || {}) {
+  let result = await api(`/admin/comments?${adminCommentsQuery(payload)}`);
+  const fallbackOffset = previousAvailableAdminOffset(result, (result.items || []).length);
+  if (fallbackOffset !== null && fallbackOffset !== Number(result.offset || 0)) {
+    result = await api(`/admin/comments?${adminCommentsQuery({ ...result, offset: fallbackOffset })}`);
+  }
+  state.adminData.comments = result;
+  markAdminTabReady("comments");
+  renderAdminContent();
+  return result;
+}
+
 async function searchAdminComments(form) {
   const query = String(new FormData(form).get("query") || "").trim();
+  clearAdminSelections("comments");
   try {
-    state.adminData.comments = await api(`/admin/comments?limit=100&query=${encodeURIComponent(query)}`);
-    renderAdminContent();
+    await refreshAdminComments({ query, limit: 100, offset: 0 });
   } catch (error) {
     showToast(error.message, "error");
   }
 }
 
 function adminForumQuery(payload = state.adminData?.forum || {}) {
-  const params = new URLSearchParams({ limit: "100", offset: "0" });
+  const params = new URLSearchParams({ limit: String(payload.limit || 100), offset: String(payload.offset || 0) });
   if (payload.query) params.set("query", payload.query);
   if (payload.target_type) params.set("target_type", payload.target_type);
   if (payload.status) params.set("status", payload.status);
   return params;
 }
 
-async function refreshAdminForum() {
-  state.adminData.forum = await api(`/admin/forum/content?${adminForumQuery()}`);
+async function refreshAdminForum(payload = state.adminData?.forum || {}) {
+  let result = await api(`/admin/forum/content?${adminForumQuery(payload)}`);
+  const fallbackOffset = previousAvailableAdminOffset(result, (result.items || []).length);
+  if (fallbackOffset !== null && fallbackOffset !== Number(result.offset || 0)) {
+    result = await api(`/admin/forum/content?${adminForumQuery({ ...result, offset: fallbackOffset })}`);
+  }
+  state.adminData.forum = result;
+  markAdminTabReady("forum");
   renderAdminContent();
+  return result;
 }
 
 async function searchAdminForum(form) {
   const values = Object.fromEntries(new FormData(form));
-  const params = adminForumQuery({
+  clearAdminSelections("forum");
+  const payload = {
     query: String(values.query || "").trim(),
     target_type: String(values.target_type || ""),
     status: String(values.status || ""),
-  });
+    limit: 100,
+    offset: 0,
+  };
   try {
-    state.adminData.forum = await api(`/admin/forum/content?${params}`);
-    renderAdminContent();
+    await refreshAdminForum(payload);
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+}
+
+async function loadAdminListPage(kind, offset) {
+  clearAdminSelections(kind);
+  try {
+    if (kind === "users") {
+      await refreshAdminUsers({ ...(state.adminData.userMeta || {}), offset: Math.max(0, offset) });
+      return;
+    }
+    if (kind === "comments") {
+      await refreshAdminComments({ ...(state.adminData.comments || {}), offset: Math.max(0, offset) });
+      return;
+    }
+    if (kind === "forum") {
+      const payload = state.adminData.forum || {};
+      await refreshAdminForum({ ...payload, offset: Math.max(0, offset) });
+    }
   } catch (error) {
     showToast(error.message, "error");
   }
@@ -4855,6 +5933,7 @@ function adminFeedbackQuery(payload = state.adminData?.feedback || {}) {
 
 async function refreshAdminFeedback() {
   state.adminData.feedback = await api(`/admin/feedback?${adminFeedbackQuery()}`);
+  markAdminTabReady("feedback");
   renderAdminContent();
 }
 
@@ -4895,22 +5974,42 @@ async function updateAdminFeedback(button) {
 
 async function moderateAdminForum(button) {
   const action = button.dataset.moderationAction;
-  const labels = { hide: "隐藏", restore: "恢复", delete: "删除" };
+  const labels = { hide: "隐藏", restore: "恢复", delete: "软删除", purge: "永久删除" };
   if (!labels[action]) return;
-  const reason = await textEditorModal(
-    `${labels[action]}论坛${button.dataset.targetType === "topic" ? "主题" : "回复"}`,
-    "",
-    500,
-    `确认${labels[action]}`
-  );
-  if (reason === null) return;
-  if (reason.length < 2) return showToast("请填写至少 2 个字符的审核原因", "error");
+  const targetLabel = button.dataset.targetType === "topic" ? "主题" : "回复";
+  let reason = "";
+  if (action === "purge") {
+    const confirmation = await destructiveConfirmModal({
+      title: `永久删除论坛${targetLabel}`,
+      message: button.dataset.targetType === "topic"
+        ? "主题正文、全部回复、相关反应与通知会被物理清除。审核元数据仍会保留。"
+        : "回复正文、相关反应与通知会被物理清除，子回复将解除父级引用。",
+      phrase: `永久删除${targetLabel}`,
+      confirmLabel: "永久删除",
+      reasonLabel: "删除原因",
+      reasonPlaceholder: "说明执行永久删除的原因（2–500 字）",
+    });
+    if (!confirmation) return;
+    reason = confirmation.reason;
+  } else {
+    reason = await textEditorModal(
+      `${labels[action]}论坛${targetLabel}`,
+      "",
+      500,
+      `确认${labels[action]}`
+    );
+    if (reason === null) return;
+    if (reason.length < 2) return showToast("请填写至少 2 个字符的审核原因", "error");
+  }
   setButtonBusy(button, true, "处理中");
   try {
     await api(`/admin/forum/content/${encodeURIComponent(button.dataset.targetType)}/${encodeURIComponent(button.dataset.targetId)}`, {
-      method: "PATCH",
-      body: { action, reason },
+      method: action === "purge" ? "DELETE" : "PATCH",
+      body: action === "purge"
+        ? { reason, confirmation: "PURGE_FORUM_CONTENT" }
+        : { action, reason },
     });
+    clearAdminSelections("forum");
     await refreshAdminForum();
     state.forum.sections = null;
     state.forum.topics = null;
@@ -4922,22 +6021,230 @@ async function moderateAdminForum(button) {
   }
 }
 
-async function adminDeleteComment(commentId) {
-  const confirmed = await confirmModal("删除评论", "确认删除这条用户评论？此操作不可恢复。", "确认删除");
+async function updateAdminUsersBulk(button) {
+  const userIds = adminVisibleSelectionIds("users").filter((id) => state.adminSelections.users.has(id));
+  if (!userIds.length) return;
+  const action = button.dataset.bulkAction;
+  const role = button.dataset.role || "";
+  const label = action === "enable" ? "启用" : action === "disable" ? "停用" : role === "admin" ? "设为管理员" : "设为普通用户";
+  const names = (state.adminData.users || []).filter((item) => userIds.includes(item.user_id)).map((item) => item.username);
+  const preview = names.slice(0, 5).join("、") + (names.length > 5 ? ` 等 ${names.length} 个账号` : "");
+  const confirmed = await confirmModal(
+    `批量${label}`,
+    `确认将所选 ${userIds.length} 个账号批量${label}？${preview ? `\n${preview}` : ""}${action === "disable" ? "\n停用后会立即撤销这些账号的全部登录会话。" : ""}`,
+    `确认${label}`
+  );
   if (!confirmed) return;
+  setButtonBusy(button, true, "处理中");
   try {
-    await api(`/study/comments/${encodeURIComponent(commentId)}`, { method: "DELETE", body: {} });
-    const payload = state.adminData.comments;
-    payload.items = (payload.items || []).filter((item) => item.comment_id !== commentId);
-    payload.total = Math.max(0, Number(payload.total || 0) - 1);
-    if (state.adminData.dashboard.activity) state.adminData.dashboard.activity.comments = Math.max(0, Number(state.adminData.dashboard.activity.comments || 0) - 1);
+    await api("/admin/users/bulk", {
+      method: "PATCH",
+      body: { user_ids: userIds, action, role: role || undefined },
+    });
+    invalidateAdminTabs("overview");
+    clearAdminSelections("users");
+    await refreshAdminUsers();
+    showToast(`已批量${label} ${userIds.length} 个账号`);
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+function invalidateAdminTabs(...tabs) {
+  tabs.forEach((tab) => {
+    const runtime = state.adminRuntime[tab];
+    if (!runtime || runtime.status === "idle") return;
+    runtime.status = adminTabHasData(tab) ? "stale" : "idle";
+    runtime.error = "其他管理操作已改变相关数据";
+  });
+}
+
+function invalidateDeletedAccountCaches() {
+  state.publicProfile = null;
+  state.profileConnections = null;
+  state.myComments = null;
+  state.myNotes = null;
+  state.myLikes = null;
+  state.messageData = null;
+  state.notificationBaselineReady = false;
+  state.forum.sections = null;
+  state.forum.topics = null;
+  state.forum.topic = null;
+  invalidateStudySummary();
+  invalidateAdminTabs("overview", "comments", "forum", "feedback");
+}
+
+async function deleteAdminUser(button) {
+  const userId = button.dataset.id;
+  const username = button.dataset.name || "";
+  if (!userId || !username) return;
+  const confirmation = await destructiveConfirmModal({
+    title: "永久删除账号",
+    message: `将彻底删除 ${username} 的账号、练习数据、评论、AI 会话、论坛内容、私信与其他个人状态。此操作不可恢复。`,
+    phrase: username,
+    confirmLabel: "删除账号",
+  });
+  if (!confirmation) return;
+  setButtonBusy(button, true, "删除中");
+  try {
+    await api(`/admin/users/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+      body: { confirmation: confirmation.confirmation },
+    });
+    clearAdminSelections("users");
+    invalidateDeletedAccountCaches();
+    await refreshAdminUsers();
+    showToast(`账号 ${username} 已永久删除`);
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function deleteAdminUsersBulk(button) {
+  const userIds = adminVisibleSelectionIds("users").filter((id) => state.adminSelections.users.has(id));
+  if (!userIds.length) return;
+  const users = (state.adminData.users || []).filter((item) => userIds.includes(item.user_id));
+  const preview = users.slice(0, 4).map((item) => item.username).join("、");
+  const confirmation = await destructiveConfirmModal({
+    title: `永久删除 ${userIds.length} 个账号`,
+    message: `${preview}${users.length > 4 ? " 等账号" : ""}的登录凭据、学习记录、社区内容和全部个人状态将被物理清除。整批操作失败时不会删除任何账号。`,
+    phrase: `永久删除 ${userIds.length} 个账号`,
+    confirmLabel: "永久删除",
+  });
+  if (!confirmation) return;
+  setButtonBusy(button, true, "删除中");
+  try {
+    await api("/admin/users/bulk", {
+      method: "DELETE",
+      body: { user_ids: userIds, confirmation: "DELETE_SELECTED_USERS" },
+    });
+    clearAdminSelections("users");
+    invalidateDeletedAccountCaches();
+    await refreshAdminUsers();
+    showToast(`已永久删除 ${userIds.length} 个账号`);
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function deleteAdminCommentsBulk(button) {
+  const commentIds = adminVisibleSelectionIds("comments").filter((id) => state.adminSelections.comments.has(id));
+  if (!commentIds.length) return;
+  const confirmation = await destructiveConfirmModal({
+    title: `永久删除 ${commentIds.length} 条评论`,
+    message: "评论正文、相关赞同/反对、通知和父级引用会在同一事务中清理，删除后无法恢复。",
+    phrase: `永久删除 ${commentIds.length} 条评论`,
+    confirmLabel: "永久删除",
+  });
+  if (!confirmation) return;
+  setButtonBusy(button, true, "删除中");
+  try {
+    await api("/admin/comments/bulk", {
+      method: "DELETE",
+      body: { comment_ids: commentIds, confirmation: "DELETE_SELECTED_COMMENTS" },
+    });
+    clearAdminSelections("comments");
     state.myComments = null;
     state.myLikes = null;
     invalidateStudySummary();
-    renderAdminContent();
+    if (state.adminData.dashboard?.activity) {
+      state.adminData.dashboard.activity.comments = Math.max(0, Number(state.adminData.dashboard.activity.comments || 0) - commentIds.length);
+    }
+    invalidateAdminTabs("overview");
+    await refreshAdminComments();
+    showToast(`已删除 ${commentIds.length} 条评论`);
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function moderateAdminForumBulk(button) {
+  const selectedKeys = state.adminSelections.forum;
+  const items = (state.adminData.forum?.items || []).filter((item) => selectedKeys.has(adminForumSelectionKey(item)));
+  if (!items.length) return;
+  const action = button.dataset.moderationAction;
+  const labels = { hide: "隐藏", restore: "恢复", delete: "软删除", purge: "永久删除" };
+  if (!labels[action]) return;
+  let reason = "";
+  if (action === "purge") {
+    const confirmation = await destructiveConfirmModal({
+      title: `永久删除 ${items.length} 项论坛内容`,
+      message: "所选主题会连同全部回复一起清除；所选回复会清理反应、通知和父级引用。整批操作失败时不会删除任何内容。",
+      phrase: `永久删除 ${items.length} 项内容`,
+      confirmLabel: "永久删除",
+      reasonLabel: "删除原因",
+      reasonPlaceholder: "说明执行批量永久删除的原因（2–500 字）",
+    });
+    if (!confirmation) return;
+    reason = confirmation.reason;
+  } else {
+    reason = await textEditorModal(
+      `批量${labels[action]}论坛内容`,
+      "",
+      500,
+      `确认${labels[action]}`
+    );
+    if (reason === null) return;
+    if (reason.length < 2) return showToast("请填写至少 2 个字符的审核原因", "error");
+  }
+  setButtonBusy(button, true, "处理中");
+  try {
+    await api("/admin/forum/content/bulk", {
+      method: action === "purge" ? "DELETE" : "PATCH",
+      body: {
+        targets: items.map((item) => ({ target_type: item.target_type, target_id: item.target_id })),
+        reason,
+        action: action === "purge" ? undefined : action,
+        confirmation: action === "purge"
+          ? "PURGE_SELECTED_FORUM_CONTENT"
+          : action === "delete"
+            ? "DELETE_SELECTED_FORUM_CONTENT"
+            : undefined,
+      },
+    });
+    clearAdminSelections("forum");
+    await refreshAdminForum();
+    state.forum.sections = null;
+    state.forum.topics = null;
+    state.forum.topic = null;
+    showToast(`已批量${labels[action]} ${items.length} 项论坛内容`);
+  } catch (error) {
+    showToast(error.message, "error");
+    setButtonBusy(button, false);
+  }
+}
+
+async function adminDeleteComment(button) {
+  const commentId = button.dataset.commentId;
+  if (!commentId) return;
+  const confirmation = await destructiveConfirmModal({
+    title: "永久删除评论",
+    message: "评论正文、相关反应、通知和子评论的父级引用会一并清理，删除后无法恢复。",
+    phrase: "永久删除",
+    confirmLabel: "永久删除",
+  });
+  if (!confirmation) return;
+  setButtonBusy(button, true, "删除中");
+  try {
+    await api(`/admin/comments/${encodeURIComponent(commentId)}`, {
+      method: "DELETE",
+      body: { confirmation: "DELETE_COMMENT" },
+    });
+    clearAdminSelections("comments");
+    if (state.adminData.dashboard?.activity) state.adminData.dashboard.activity.comments = Math.max(0, Number(state.adminData.dashboard.activity.comments || 0) - 1);
+    invalidateAdminTabs("overview");
+    state.myComments = null;
+    state.myLikes = null;
+    invalidateStudySummary();
+    await refreshAdminComments();
     showToast("评论已删除");
   } catch (error) {
     showToast(error.message, "error");
+    setButtonBusy(button, false);
   }
 }
 
@@ -5131,6 +6438,59 @@ function confirmModal(title, message, confirmLabel = "确认", danger = false) {
   });
 }
 
+function destructiveConfirmModal({
+  title,
+  message,
+  phrase,
+  confirmLabel = "永久删除",
+  reasonLabel = "",
+  reasonPlaceholder = "",
+}) {
+  return new Promise((resolve) => {
+    const root = $("#modal-root");
+    const reasonField = reasonLabel
+      ? `<label class="field destructive-reason"><span>${escapeHtml(reasonLabel)}</span><textarea name="reason" rows="4" minlength="2" maxlength="500" required placeholder="${escapeAttr(reasonPlaceholder)}"></textarea></label>`
+      : "";
+    root.innerHTML = `<div class="modal-backdrop" role="presentation"><section class="modal destructive-modal" role="alertdialog" aria-modal="true" aria-labelledby="destructive-modal-title" aria-describedby="destructive-modal-message"><div class="destructive-modal-heading"><span aria-hidden="true">!</span><div><h2 id="destructive-modal-title">${escapeHtml(title)}</h2><small>不可恢复操作</small></div></div><p id="destructive-modal-message">${escapeHtml(message)}</p><form id="destructive-confirm-form" class="stack-form">${reasonField}<label class="field destructive-confirm-field"><span>输入 <code>${escapeHtml(phrase)}</code> 以确认</span><input name="confirmation" autocomplete="off" autocapitalize="off" spellcheck="false" required></label><div class="modal-actions"><button class="button button-secondary" type="button" data-modal="cancel">取消</button><button class="button button-danger" type="submit" disabled>${escapeHtml(confirmLabel)}</button></div></form></section></div>`;
+    const form = $("#destructive-confirm-form", root);
+    const confirmationInput = form.elements.confirmation;
+    const reasonInput = form.elements.reason || null;
+    const submit = $('button[type="submit"]', form);
+    let finished = false;
+    const sync = () => {
+      const reasonValid = !reasonInput || String(reasonInput.value || "").trim().length >= 2;
+      submit.disabled = confirmationInput.value !== phrase || !reasonValid;
+    };
+    const onKeydown = (event) => {
+      if (event.key === "Escape") finish(null);
+    };
+    const finish = (value) => {
+      if (finished) return;
+      finished = true;
+      document.removeEventListener("keydown", onKeydown);
+      root.innerHTML = "";
+      resolve(value);
+    };
+    form.addEventListener("input", sync);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      sync();
+      if (submit.disabled) return;
+      finish({
+        confirmation: confirmationInput.value,
+        reason: String(reasonInput?.value || "").trim(),
+      });
+    });
+    $('[data-modal="cancel"]', root).addEventListener("click", () => finish(null));
+    $(".modal-backdrop", root).addEventListener("click", (event) => {
+      if (event.target.classList.contains("modal-backdrop")) finish(null);
+    });
+    document.addEventListener("keydown", onKeydown);
+    (reasonInput || confirmationInput).focus();
+    sync();
+  });
+}
+
 function passwordModal(username) {
   return new Promise((resolve) => {
     const root = $("#modal-root");
@@ -5230,7 +6590,7 @@ try {
   if (preferences.searchMode) state.searchMode = preferences.searchMode;
   if (["light", "dark"].includes(preferences.theme)) state.theme = preferences.theme;
   if (["folders", "guided"].includes(preferences.libraryViewMode)) state.libraryViewMode = preferences.libraryViewMode;
-  if (["sequential", "position_desc", "type", "year_desc", "year_asc", "random"].includes(preferences.outlineOrderMode)) {
+  if (["sequential", "position_desc", "type", "type_desc", "year_desc", "year_asc", "random"].includes(preferences.outlineOrderMode)) {
     state.outlineOrderMode = preferences.outlineOrderMode;
   }
   if (Array.isArray(preferences.searchQuestionTypes)) {

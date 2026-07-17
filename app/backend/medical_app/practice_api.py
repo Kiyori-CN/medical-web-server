@@ -67,6 +67,7 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
             start_position=data.get("start_position", 1),
             start_exact=data.get("start_exact", False),
             saved_kind=_saved_kind(data.get("saved_kind", "")),
+            occurrence_order=data.get("occurrence_order"),
         )
         return jsonify(session), 201
 
@@ -220,6 +221,26 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
                 limit=request.args.get("limit", 100),
                 offset=request.args.get("offset", 0),
             )
+        )
+
+    @blueprint.delete("/admin/comments/bulk")
+    @admin_required
+    @csrf_required
+    def delete_admin_comments_bulk():
+        data = _json_object()
+        if data.get("confirmation") != "DELETE_SELECTED_COMMENTS":
+            raise ValueError("批量删除评论需要明确确认")
+        return jsonify(store().delete_comments_bulk(data.get("comment_ids")))
+
+    @blueprint.delete("/admin/comments/<comment_id>")
+    @admin_required
+    @csrf_required
+    def delete_admin_comment(comment_id: str):
+        data = _json_object()
+        if data.get("confirmation") != "DELETE_COMMENT":
+            raise ValueError("永久删除评论需要明确确认")
+        return jsonify(
+            {"removed": store().delete_comment(comment_id, is_admin=True)}
         )
 
     @blueprint.get("/study/notes")

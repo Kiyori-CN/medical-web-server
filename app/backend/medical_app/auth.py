@@ -596,19 +596,469 @@ class AuthStore:
             connection.commit()
 
     def list_users(self, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.admin_users(limit=limit, offset=offset)["users"]
+
+    def admin_users(
+        self,
+        *,
+        query: object = "",
+        role: object = "",
+        status: object = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        query = str(query or "").strip()[:100]
+        role = str(role or "").strip().lower()
+        status = str(status or "").strip().lower()
+        if role not in {"", "admin", "user"}:
+            raise ValueError("账号角色筛选无效")
+        if status not in {"", "active", "disabled"}:
+            raise ValueError("账号状态筛选无效")
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("username LIKE ? ESCAPE '\\'")
+            parameters.append(f"%{escaped}%")
+        if role:
+            clauses.append("role = ?")
+            parameters.append(role)
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM users {where}", parameters
+            ).fetchone()[0]
             rows = connection.execute(
-                """
+                f"""
                 SELECT user_id, username, avatar, role, status, created_at, updated_at, last_login_at
-                FROM users
+                FROM users {where}
                 ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, created_at, username
                 LIMIT ? OFFSET ?
                 """,
-                (max(1, min(int(limit), 500)), max(0, int(offset))),
+                (*parameters, limit, offset),
             ).fetchall()
-        return [self._public_user(row) for row in rows]
+            stats = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN role = 'admin' AND status = 'active' THEN 1 ELSE 0 END) AS active_admins,
+                       SUM(CASE WHEN status = 'disabled' THEN 1 ELSE 0 END) AS disabled
+                FROM users
+                """
+            ).fetchone()
+        return {
+            "count": len(rows),
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+            "query": query,
+            "role": role,
+            "status": status,
+            "stats": {
+                "total": int(stats["total"] or 0),
+                "active_admins": int(stats["active_admins"] or 0),
+                "disabled": int(stats["disabled"] or 0),
+            },
+            "users": [self._public_user(row) for row in rows],
+        }
 
-    def update_user(self, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def update_users_bulk(
+        self,
+        user_ids: object,
+        *,
+        action: object,
+        actor_user_id: str,
+        role: object = "",
+    ) -> dict[str, Any]:
+        if not isinstance(user_ids, list) or not 1 <= len(user_ids) <= 100:
+            raise ValueError("批量账号必须包含 1 到 100 个账号")
+        normalized_ids = [str(value or "").strip() for value in user_ids]
+        if (
+            any(not value or len(value) > 128 for value in normalized_ids)
+            or len(set(normalized_ids)) != len(normalized_ids)
+        ):
+            raise ValueError("批量账号 ID 必须有效且不能重复")
+        action = str(action or "").strip().lower()
+        if action not in {"enable", "disable", "set_role"}:
+            raise ValueError("批量账号操作无效")
+        role = str(role or "").strip().lower()
+        if action == "set_role" and role not in {"admin", "user"}:
+            raise ValueError("批量账号角色无效")
+        if actor_user_id in normalized_ids:
+            raise AuthorizationError("批量操作不能包含当前登录管理员")
+
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(
+                    f"SELECT * FROM users WHERE user_id IN ({placeholders})",
+                    normalized_ids,
+                ).fetchall()
+                if len(rows) != len(normalized_ids):
+                    raise LookupError("部分账号不存在，请刷新列表后重试")
+                row_by_id = {row["user_id"]: row for row in rows}
+                changes: list[tuple[str, str, str]] = []
+                removed_active_admins = 0
+                for user_id in normalized_ids:
+                    row = row_by_id[user_id]
+                    next_role = role if action == "set_role" else row["role"]
+                    next_status = (
+                        "active"
+                        if action == "enable"
+                        else "disabled"
+                        if action == "disable"
+                        else row["status"]
+                    )
+                    if (
+                        row["role"] == "admin"
+                        and row["status"] == "active"
+                        and (next_role != "admin" or next_status != "active")
+                    ):
+                        removed_active_admins += 1
+                    changes.append((user_id, next_role, next_status))
+                active_admins = connection.execute(
+                    "SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'"
+                ).fetchone()[0]
+                if active_admins - removed_active_admins < 1:
+                    raise AuthorizationError("批量操作不能停用或降级最后一个可用管理员")
+
+                now = _utc_now()
+                for user_id, next_role, next_status in changes:
+                    connection.execute(
+                        "UPDATE users SET role = ?, status = ?, updated_at = ? WHERE user_id = ?",
+                        (next_role, next_status, now, user_id),
+                    )
+                    if next_status != "active":
+                        connection.execute(
+                            "DELETE FROM auth_sessions WHERE user_id = ?", (user_id,)
+                        )
+                updated_rows = connection.execute(
+                    f"SELECT * FROM users WHERE user_id IN ({placeholders})",
+                    normalized_ids,
+                ).fetchall()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        updated_by_id = {row["user_id"]: self._public_user(row) for row in updated_rows}
+        return {
+            "action": action,
+            "count": len(normalized_ids),
+            "users": [updated_by_id[user_id] for user_id in normalized_ids],
+        }
+
+    def delete_user_permanently(
+        self,
+        user_id: object,
+        *,
+        actor_user_id: str,
+        confirmation: object,
+    ) -> dict[str, Any]:
+        normalized_ids = self._admin_user_ids([user_id])
+        user_id_value = normalized_ids[0]
+        with self.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT user_id, username, role, status FROM users WHERE user_id = ?",
+                    (user_id_value,),
+                ).fetchone()
+                if row is None:
+                    raise LookupError("用户不存在")
+                confirmation_value = unicodedata.normalize(
+                    "NFKC", str(confirmation or "")
+                ).strip()
+                if confirmation_value != row["username"]:
+                    raise ValueError("永久删除账号需要输入完整用户名确认")
+                result = self._delete_users_in_transaction(
+                    connection,
+                    normalized_ids,
+                    actor_user_id=actor_user_id,
+                    rows=[row],
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return result
+
+    def delete_users_bulk_permanently(
+        self,
+        user_ids: object,
+        *,
+        actor_user_id: str,
+        confirmation: object,
+    ) -> dict[str, Any]:
+        normalized_ids = self._admin_user_ids(user_ids)
+        if confirmation != "DELETE_SELECTED_USERS":
+            raise ValueError("批量永久删除账号需要明确确认")
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(
+                    f"SELECT user_id, username, role, status FROM users WHERE user_id IN ({placeholders})",
+                    normalized_ids,
+                ).fetchall()
+                if len(rows) != len(normalized_ids):
+                    raise LookupError("部分账号不存在，请刷新列表后重试")
+                result = self._delete_users_in_transaction(
+                    connection,
+                    normalized_ids,
+                    actor_user_id=actor_user_id,
+                    rows=rows,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return result
+
+    @staticmethod
+    def _admin_user_ids(user_ids: object) -> list[str]:
+        if not isinstance(user_ids, list) or not 1 <= len(user_ids) <= 100:
+            raise ValueError("永久删除必须包含 1 到 100 个账号")
+        normalized_ids = [str(value or "").strip() for value in user_ids]
+        if (
+            any(not value or len(value) > 128 for value in normalized_ids)
+            or len(set(normalized_ids)) != len(normalized_ids)
+        ):
+            raise ValueError("账号 ID 必须有效且不能重复")
+        return normalized_ids
+
+    def _delete_users_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        user_ids: list[str],
+        *,
+        actor_user_id: str,
+        rows: list[sqlite3.Row],
+    ) -> dict[str, Any]:
+        if actor_user_id in user_ids:
+            raise AuthorizationError("不能永久删除当前登录管理员")
+        row_by_id = {row["user_id"]: row for row in rows}
+        if len(row_by_id) != len(user_ids):
+            raise LookupError("部分账号不存在，请刷新列表后重试")
+        removed_active_admins = sum(
+            1
+            for user_id in user_ids
+            if row_by_id[user_id]["role"] == "admin"
+            and row_by_id[user_id]["status"] == "active"
+        )
+        active_admins = connection.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'"
+        ).fetchone()[0]
+        if active_admins - removed_active_admins < 1:
+            raise AuthorizationError("不能永久删除最后一个可用管理员")
+
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        cleanup = self._delete_user_dependencies(connection, tables, user_ids)
+        deleted = self._delete_values(connection, tables, "users", "user_id", user_ids)
+        if deleted != len(user_ids):
+            raise AuthenticationError("账号永久删除发生并发变化，请刷新后重试")
+        return {
+            "count": len(user_ids),
+            "user_ids": list(user_ids),
+            "usernames": [row_by_id[user_id]["username"] for user_id in user_ids],
+            "removed_content": cleanup,
+        }
+
+    def _delete_user_dependencies(
+        self,
+        connection: sqlite3.Connection,
+        tables: set[str],
+        user_ids: list[str],
+    ) -> dict[str, int]:
+        placeholders = ",".join("?" for _ in user_ids)
+        topic_ids: list[str] = []
+        reply_ids: list[str] = []
+        comment_ids: list[str] = []
+        if "forum_topics" in tables:
+            topic_ids = [
+                row[0]
+                for row in connection.execute(
+                    f"SELECT topic_id FROM forum_topics WHERE author_id IN ({placeholders})",
+                    user_ids,
+                )
+            ]
+        if "forum_replies" in tables:
+            reply_id_set = {
+                row[0]
+                for row in connection.execute(
+                    f"SELECT reply_id FROM forum_replies WHERE author_id IN ({placeholders})",
+                    user_ids,
+                )
+            }
+            for chunk in self._value_chunks(topic_ids):
+                topic_placeholders = ",".join("?" for _ in chunk)
+                reply_id_set.update(
+                    row[0]
+                    for row in connection.execute(
+                        f"SELECT reply_id FROM forum_replies WHERE topic_id IN ({topic_placeholders})",
+                        chunk,
+                    )
+                )
+            reply_ids = sorted(reply_id_set)
+        if "question_comments" in tables:
+            comment_ids = [
+                row[0]
+                for row in connection.execute(
+                    f"SELECT comment_id FROM question_comments WHERE author_id IN ({placeholders})",
+                    user_ids,
+                )
+            ]
+
+        self._delete_values(connection, tables, "auth_sessions", "user_id", user_ids)
+        self._delete_values(connection, tables, "user_avatars", "user_id", user_ids)
+        self._delete_values(connection, tables, "practice_sessions", "profile_id", user_ids)
+        for table in (
+            "study_goals",
+            "question_progress",
+            "collection_question_progress",
+            "study_items",
+            "question_notes",
+            "user_feedback",
+        ):
+            self._delete_values(connection, tables, table, "profile_id", user_ids)
+
+        self._delete_values(connection, tables, "comment_reactions", "profile_id", user_ids)
+        self._delete_values(connection, tables, "comment_reactions", "comment_id", comment_ids)
+        self._update_values_to_null(
+            connection,
+            tables,
+            "question_comments",
+            "parent_comment_id",
+            comment_ids,
+        )
+
+        for column in ("follower_id", "following_id"):
+            self._delete_values(connection, tables, "user_follows", column, user_ids)
+        for column in ("profile_id", "friend_id"):
+            self._delete_values(connection, tables, "friendships", column, user_ids)
+        for column in ("sender_id", "receiver_id"):
+            self._delete_values(connection, tables, "direct_messages", column, user_ids)
+
+        for column in ("profile_id", "actor_id"):
+            self._delete_values(connection, tables, "notifications", column, user_ids)
+        for target_ids in (comment_ids, topic_ids, reply_ids):
+            self._delete_values(
+                connection, tables, "notifications", "comment_id", target_ids
+            )
+
+        self._delete_values(connection, tables, "ai_messages", "profile_id", user_ids)
+        self._delete_values(connection, tables, "ai_conversations", "profile_id", user_ids)
+
+        self._delete_values(connection, tables, "forum_reactions", "profile_id", user_ids)
+        self._delete_forum_target_reactions(
+            connection, tables, "topic", topic_ids
+        )
+        self._delete_forum_target_reactions(
+            connection, tables, "reply", reply_ids
+        )
+        self._update_values_to_null(
+            connection, tables, "forum_replies", "parent_reply_id", reply_ids
+        )
+        self._delete_values(connection, tables, "forum_replies", "reply_id", reply_ids)
+        self._delete_values(connection, tables, "forum_topics", "topic_id", topic_ids)
+
+        if "forum_moderation_log" in tables:
+            for chunk in self._value_chunks(user_ids):
+                chunk_placeholders = ",".join("?" for _ in chunk)
+                connection.execute(
+                    f"""
+                    UPDATE forum_moderation_log
+                    SET moderator_id = '', moderator_name = '已注销管理员'
+                    WHERE moderator_id IN ({chunk_placeholders})
+                    """,
+                    chunk,
+                )
+
+        self._delete_values(
+            connection, tables, "question_comments", "comment_id", comment_ids
+        )
+        return {
+            "question_comments": len(comment_ids),
+            "forum_topics": len(topic_ids),
+            "forum_replies": len(reply_ids),
+        }
+
+    @staticmethod
+    def _value_chunks(values: list[str], size: int = 400):
+        for index in range(0, len(values), size):
+            yield values[index : index + size]
+
+    @classmethod
+    def _delete_values(
+        cls,
+        connection: sqlite3.Connection,
+        tables: set[str],
+        table: str,
+        column: str,
+        values: list[str],
+    ) -> int:
+        if table not in tables or not values:
+            return 0
+        deleted = 0
+        for chunk in cls._value_chunks(values):
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = connection.execute(
+                f"DELETE FROM {table} WHERE {column} IN ({placeholders})", chunk
+            )
+            deleted += max(0, cursor.rowcount)
+        return deleted
+
+    @classmethod
+    def _update_values_to_null(
+        cls,
+        connection: sqlite3.Connection,
+        tables: set[str],
+        table: str,
+        column: str,
+        values: list[str],
+    ) -> None:
+        if table not in tables or not values:
+            return
+        for chunk in cls._value_chunks(values):
+            placeholders = ",".join("?" for _ in chunk)
+            connection.execute(
+                f"UPDATE {table} SET {column} = NULL WHERE {column} IN ({placeholders})",
+                chunk,
+            )
+
+    @classmethod
+    def _delete_forum_target_reactions(
+        cls,
+        connection: sqlite3.Connection,
+        tables: set[str],
+        target_type: str,
+        target_ids: list[str],
+    ) -> None:
+        if "forum_reactions" not in tables or not target_ids:
+            return
+        for chunk in cls._value_chunks(target_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            connection.execute(
+                f"DELETE FROM forum_reactions WHERE target_type = ? AND target_id IN ({placeholders})",
+                [target_type, *chunk],
+            )
+
+    def update_user(
+        self,
+        user_id: str,
+        payload: dict[str, Any],
+        *,
+        actor_user_id: str = "",
+    ) -> dict[str, Any]:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -620,6 +1070,11 @@ class AuthStore:
             if role not in {"admin", "user"} or status not in {"active", "disabled"}:
                 connection.rollback()
                 raise ValueError("role or status is invalid")
+            if actor_user_id == user_id and (
+                role != row["role"] or status != row["status"]
+            ):
+                connection.rollback()
+                raise AuthorizationError("不能在账号管理中修改当前登录管理员的角色或状态")
             removing_active_admin = (
                 row["role"] == "admin"
                 and row["status"] == "active"
@@ -923,10 +1378,15 @@ def create_user_admin_blueprint(store: AuthStore) -> Blueprint:
     @blueprint.get("")
     @admin_required
     def users():
-        rows = store.list_users(
-            limit=request.args.get("limit", 100), offset=request.args.get("offset", 0)
+        return jsonify(
+            store.admin_users(
+                query=request.args.get("query", ""),
+                role=request.args.get("role", ""),
+                status=request.args.get("status", ""),
+                limit=request.args.get("limit", 100),
+                offset=request.args.get("offset", 0),
+            )
         )
-        return jsonify({"count": len(rows), "users": rows})
 
     @blueprint.post("")
     @admin_required
@@ -938,11 +1398,57 @@ def create_user_admin_blueprint(store: AuthStore) -> Blueprint:
         )
         return jsonify(user), 201
 
+    @blueprint.patch("/bulk")
+    @admin_required
+    @csrf_required
+    def update_users_bulk():
+        data = _json_object()
+        return jsonify(
+            store.update_users_bulk(
+                data.get("user_ids"),
+                action=data.get("action", ""),
+                role=data.get("role", ""),
+                actor_user_id=g.current_user["user_id"],
+            )
+        )
+
+    @blueprint.delete("/bulk")
+    @admin_required
+    @csrf_required
+    def delete_users_bulk_permanently():
+        data = _json_object()
+        return jsonify(
+            store.delete_users_bulk_permanently(
+                data.get("user_ids"),
+                actor_user_id=g.current_user["user_id"],
+                confirmation=data.get("confirmation", ""),
+            )
+        )
+
     @blueprint.patch("/<user_id>")
     @admin_required
     @csrf_required
     def update_user(user_id: str):
-        return jsonify(store.update_user(user_id, _json_object()))
+        return jsonify(
+            store.update_user(
+                user_id,
+                _json_object(),
+                actor_user_id=g.current_user["user_id"],
+            )
+        )
+
+    @blueprint.delete("/<user_id>")
+    @admin_required
+    @csrf_required
+    def delete_user_permanently(user_id: str):
+        data = _json_object()
+        return jsonify(
+            store.delete_user_permanently(
+                user_id,
+                actor_user_id=g.current_user["user_id"],
+                confirmation=data.get("confirmation", ""),
+            )
+        )
 
     return blueprint
 

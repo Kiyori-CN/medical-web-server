@@ -652,6 +652,7 @@ class Catalog:
         start_exact: bool = False,
         order_mode: str = "sequential",
         canonical_type: str = "",
+        occurrence_order: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         collection_id = display_text(collection_id)
         if not collection_id:
@@ -667,13 +668,32 @@ class Catalog:
             if not display_text(canonical_type)
             or item["question_type"] == display_text(canonical_type)
         ]
+        explicit_random_positions: dict[int, int] | None = None
+        if occurrence_order is not None:
+            expected_occurrences = [int(item["occurrence_id"]) for item in items]
+            if (
+                len(occurrence_order) != len(expected_occurrences)
+                or len(set(occurrence_order)) != len(occurrence_order)
+                or set(occurrence_order) != set(expected_occurrences)
+            ):
+                raise ValueError(
+                    "occurrence_order must be an exact permutation of the selected collection"
+                )
+            explicit_random_positions = {
+                occurrence_id: position
+                for position, occurrence_id in enumerate(occurrence_order)
+            }
         if not start_exact:
             items = [
                 item
                 for item in items
                 if item["collection_position"] >= start_position
             ]
-        if order_mode == "random":
+        if order_mode == "random" and explicit_random_positions is not None:
+            items.sort(
+                key=lambda item: explicit_random_positions[int(item["occurrence_id"])]
+            )
+        elif order_mode == "random":
             with self.connect() as connection:
                 rows = connection.execute(
                     """

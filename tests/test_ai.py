@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from medical_app.ai import AIAccessDenied, AIConflict, AIStore
+from medical_app.ai import AIAccessDenied, AIConflict, AIStore, AIUnavailable
 from medical_app.builder import build_catalog
 from medical_app.catalog import Catalog
+from medical_app.providers import ProviderError
 
 
 class FakeSettings:
@@ -123,6 +124,112 @@ def test_ai_regenerate_replaces_last_answer_and_preserves_account_scope(
     empty = store.create_conversation("没有回答")
     with pytest.raises(AIConflict):
         store.regenerate_last(empty["conversation_id"])
+
+
+def test_ai_stream_persists_only_after_provider_completion_and_regenerates_in_place(
+    sample_source_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, _ = _store(sample_source_tree, tmp_path)
+    conversation = store.create_conversation()
+    chunks = iter(["第一段", "，第二段。"])
+    monkeypatch.setattr(
+        "medical_app.ai.stream_chat_provider",
+        lambda config, messages, **kwargs: chunks,
+    )
+
+    plan = store.prepare_stream_message(
+        conversation["conversation_id"],
+        "请解释膜转运。",
+        context={"scope": "catalog"},
+    )
+    events = list(store.stream_prepared_message(plan))
+    assert [event for event, _ in events] == ["start", "delta", "delta", "complete"]
+    complete = events[-1][1]
+    assert complete["assistant"]["content"] == "第一段，第二段。"
+    assert complete["assistant"]["citations"]
+    assert store.list_conversations()[0]["preview"] == "第一段，第二段。"
+    stored = store.list_messages(conversation["conversation_id"])["messages"]
+    assert [message["role"] for message in stored] == ["user", "assistant"]
+
+    monkeypatch.setattr(
+        "medical_app.ai.stream_chat_provider",
+        lambda config, messages, **kwargs: iter(["重新", "生成"]),
+    )
+    regenerate_plan = store.prepare_stream_regeneration(conversation["conversation_id"])
+    regenerated = list(store.stream_prepared_regeneration(regenerate_plan))[-1][1]
+    after = store.list_messages(conversation["conversation_id"])["messages"]
+    assert len(after) == 2
+    assert after[-1]["message_id"] == complete["assistant"]["message_id"]
+    assert after[-1]["content"] == "重新生成"
+    assert regenerated["assistant"]["message_id"] == complete["assistant"]["message_id"]
+
+
+def test_ai_stream_failure_never_persists_partial_messages(
+    sample_source_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, _ = _store(sample_source_tree, tmp_path)
+    conversation = store.create_conversation()
+
+    def failing_provider(config, messages, **kwargs):
+        yield "未完成片段"
+        raise ProviderError("Large-model provider stream failed: ReadTimeout")
+
+    monkeypatch.setattr("medical_app.ai.stream_chat_provider", failing_provider)
+    plan = store.prepare_stream_message(conversation["conversation_id"], "请回答。")
+    stream = store.stream_prepared_message(plan)
+    assert next(stream)[0] == "start"
+    assert next(stream) == ("delta", {"delta": "未完成片段"})
+    with pytest.raises(AIUnavailable, match="连接中断"):
+        next(stream)
+    assert store.list_messages(conversation["conversation_id"])["messages"] == []
+
+
+def test_ai_stream_commit_rejects_a_concurrent_conversation_update(
+    sample_source_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, _ = _store(sample_source_tree, tmp_path)
+    conversation = store.create_conversation()
+    plan = store.prepare_stream_message(conversation["conversation_id"], "第一条请求")
+    monkeypatch.setattr(
+        "medical_app.ai.complete_chat_provider",
+        lambda config, messages, **kwargs: "并发完成的回答",
+    )
+    store.send_message(conversation["conversation_id"], "后提交的请求")
+    monkeypatch.setattr(
+        "medical_app.ai.stream_chat_provider",
+        lambda config, messages, **kwargs: iter(["旧请求回答"]),
+    )
+    with pytest.raises(AIConflict):
+        list(store.stream_prepared_message(plan))
+    stored = store.list_messages(conversation["conversation_id"])["messages"]
+    assert len(stored) == 2
+    assert stored[-1]["content"] == "并发完成的回答"
+
+
+def test_ai_stream_regeneration_rejects_when_a_new_turn_becomes_latest(
+    sample_source_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store, _ = _store(sample_source_tree, tmp_path)
+    conversation = store.create_conversation()
+    monkeypatch.setattr(
+        "medical_app.ai.complete_chat_provider",
+        lambda config, messages, **kwargs: "原回答",
+    )
+    first = store.send_message(conversation["conversation_id"], "第一问")
+    plan = store.prepare_stream_regeneration(conversation["conversation_id"])
+    store.send_message(conversation["conversation_id"], "并发的新问题")
+    monkeypatch.setattr(
+        "medical_app.ai.stream_chat_provider",
+        lambda config, messages, **kwargs: iter(["不应覆盖旧回答"]),
+    )
+
+    with pytest.raises(AIConflict):
+        list(store.stream_prepared_regeneration(plan))
+
+    stored = store.list_messages(conversation["conversation_id"])["messages"]
+    assert len(stored) == 4
+    assert stored[1]["message_id"] == first["assistant"]["message_id"]
+    assert stored[1]["content"] == "原回答"
 
 
 def test_ai_initialize_migrates_existing_messages_context_column(

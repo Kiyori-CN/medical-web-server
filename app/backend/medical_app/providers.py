@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, Iterator
 from urllib.parse import urlparse, urlunparse
 
 import numpy as np
@@ -222,6 +223,150 @@ def complete_chat_provider(
     helper deliberately returns only model content and replaces provider errors
     with safe, non-secret diagnostics so credentials never reach the API layer.
     """
+    api_url, headers, payload = _chat_request(
+        config, messages, max_tokens=max_tokens, stream=False
+    )
+    try:
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=max(10, min(int(timeout), 180)),
+        )
+    except requests.RequestException as error:
+        raise ProviderError(f"Large-model provider request failed: {type(error).__name__}") from error
+    if response.status_code >= 400:
+        raise ProviderError(f"Large-model provider returned HTTP {response.status_code}")
+    try:
+        body = response.json()
+        content = _chat_content(body["choices"][0]["message"]["content"], strip=True)
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise ProviderError("Large-model provider returned an invalid response") from error
+    if not content:
+        raise ProviderError("Large-model provider returned an empty response")
+    return content[:30000]
+
+
+def stream_chat_provider(
+    config: dict[str, Any],
+    messages: list[dict[str, str]],
+    *,
+    timeout: int = 90,
+    max_tokens: int = 1200,
+) -> Iterator[str]:
+    """Yield text deltas from an OpenAI-compatible chat completion stream.
+
+    Provider bodies and credentials never escape this helper. A provider that
+    ignores ``stream=true`` and returns a normal JSON completion is accepted as
+    a single delta so compatible gateways continue to work.
+    """
+
+    api_url, headers, payload = _chat_request(
+        config, messages, max_tokens=max_tokens, stream=True
+    )
+    try:
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=(10, max(10, min(int(timeout), 180))),
+        )
+    except requests.RequestException as error:
+        raise ProviderError(
+            f"Large-model provider request failed: {type(error).__name__}"
+        ) from error
+
+    try:
+        if response.status_code >= 400:
+            raise ProviderError(
+                f"Large-model provider returned HTTP {response.status_code}"
+            )
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "application/json" in content_type and "text/event-stream" not in content_type:
+            try:
+                body = response.json()
+                content = _chat_content(
+                    body["choices"][0]["message"]["content"], strip=True
+                )
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise ProviderError(
+                    "Large-model provider returned an invalid response"
+                ) from error
+            if not content:
+                raise ProviderError("Large-model provider returned an empty response")
+            if len(content) > 30000:
+                raise ProviderError("Large-model provider response exceeded the size limit")
+            yield content
+            return
+
+        received = False
+        total = 0
+        for raw_line in response.iter_lines(chunk_size=1):
+            if not raw_line:
+                continue
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", errors="replace").strip()
+            else:
+                line = str(raw_line).strip()
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                event = json.loads(data)
+                if isinstance(event, dict) and event.get("error"):
+                    raise ProviderError("Large-model provider returned a stream error")
+                choices = event.get("choices") if isinstance(event, dict) else None
+                if choices == []:
+                    continue
+                if not isinstance(choices, list):
+                    raise TypeError("stream choices must be a list")
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    raise TypeError("stream choice must be an object")
+                delta = choice.get("delta")
+                if delta is None and isinstance(choice.get("message"), dict):
+                    delta = choice["message"]
+                if delta is None:
+                    delta = {}
+                if not isinstance(delta, dict):
+                    raise TypeError("stream delta must be an object")
+                content = _chat_content(
+                    delta.get("content"),
+                    strip=False,
+                )
+            except ProviderError:
+                raise
+            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ProviderError(
+                    "Large-model provider returned an invalid stream"
+                ) from error
+            if not content:
+                continue
+            total += len(content)
+            if total > 30000:
+                raise ProviderError("Large-model provider response exceeded the size limit")
+            received = True
+            yield content
+        if not received:
+            raise ProviderError("Large-model provider returned an empty response")
+    except requests.RequestException as error:
+        raise ProviderError(
+            f"Large-model provider stream failed: {type(error).__name__}"
+        ) from error
+    finally:
+        response.close()
+
+
+def _chat_request(
+    config: dict[str, Any],
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int,
+    stream: bool,
+) -> tuple[str, dict[str, str], dict[str, Any]]:
     api_key = str(config.get("api_key") or "").strip()
     if len(api_key) < 8:
         raise ProviderError("Large-model API key is not configured")
@@ -236,38 +381,34 @@ def complete_chat_provider(
         if role not in {"system", "user", "assistant"} or not content:
             raise ValueError("messages contain an invalid role or content")
         safe_messages.append({"role": role, "content": content[:12000]})
+    api_url = str(config.get("api_url") or "").strip()
+    try:
+        validate_provider_url(api_url)
+    except ValueError as error:
+        raise ProviderError("Large-model API URL is not configured") from error
     payload = {
         "model": str(config.get("model") or ""),
         "messages": safe_messages,
         "max_tokens": max(64, min(int(max_tokens), 4000)),
         "temperature": 0.2,
-        "stream": False,
+        "stream": bool(stream),
     }
-    try:
-        response = requests.post(
-            str(config.get("api_url") or ""),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=max(10, min(int(timeout), 180)),
+    return (
+        api_url,
+        {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if stream else "application/json",
+        },
+        payload,
+    )
+
+
+def _chat_content(value: object, *, strip: bool) -> str:
+    if isinstance(value, list):
+        value = "".join(
+            str(part.get("text") or "") if isinstance(part, dict) else str(part)
+            for part in value
         )
-    except requests.RequestException as error:
-        raise ProviderError(f"Large-model provider request failed: {type(error).__name__}") from error
-    if response.status_code >= 400:
-        raise ProviderError(f"Large-model provider returned HTTP {response.status_code}")
-    try:
-        body = response.json()
-        content = body["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(
-                str(part.get("text") or "") if isinstance(part, dict) else str(part)
-                for part in content
-            )
-        content = str(content or "").strip()
-    except (KeyError, IndexError, TypeError, ValueError) as error:
-        raise ProviderError("Large-model provider returned an invalid response") from error
-    if not content:
-        raise ProviderError("Large-model provider returned an empty response")
-    return content[:30000]
+    content = str(value or "")
+    return content.strip() if strip else content

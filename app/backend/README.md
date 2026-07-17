@@ -7,11 +7,11 @@
 | `main.py` | Flask 应用、健康检查、blueprint 与静态文件 |
 | `config.py` | catalog、状态、设置、Cookie 和端口配置 |
 | `gunicorn_config.py` | 生产 worker、preload、超时和日志 |
-| `medical_app/auth.py` | 本地账号、密码修改/重置、会话、角色与 CSRF |
+| `medical_app/auth.py` | 本地账号、密码修改/重置、会话、角色、CSRF 与管理员账号永久删除事务 |
 | `medical_app/catalog.py` | 只读 SQLite/FTS 访问 |
 | `medical_app/catalog_export.py` | 管理员 JSONL/CSV occurrence 流式导出 |
 | `medical_app/catalog_import.py` | 管理员 CSV/JSONL/JSON 隔离导入预检与字段映射 |
-| `medical_app/forum.py` | 本地论坛主题/回复、权限、软删除与回复通知 |
+| `medical_app/forum.py` | 本地论坛主题/回复、权限、软删除、管理员物理清除、审核与回复通知 |
 | `medical_app/practice.py` | 会话、四种刷题模式、文件进度重置、收藏、错题和评论 |
 | `medical_app/settings.py` | 网站/模型设置与秘密加密 |
 | `medical_app/semantic.py` | keyword、semantic、hybrid 编排 |
@@ -31,7 +31,9 @@
 - 管理写接口要求管理员会话和 CSRF。
 - 用户修改密码验证当前密码；任何密码修改都会撤销该用户的既有会话。
 - 文件进度重置只清空当前账号和当前 collection 的题号状态投影，不删除历史试卷、收藏、错题或评论。
-- 评论绑定 occurrence；登录用户可发表，作者本人和管理员可删除。
+- 评论绑定 occurrence；登录用户可发表，作者本人和管理员可物理删除。管理员单项/批量删除分别要求固定确认，并清理反应、通知和父引用。
+- 账号永久删除只允许管理员，单项确认完整用户名、批量确认 `DELETE_SELECTED_USERS`；当前管理员和最后有效管理员受保护，同一事务清理所有已知账号关联 state 后才删除 `users`。
+- 论坛 PATCH 只执行隐藏、恢复和软删除；管理员 DELETE 要求原因与固定确认，物理删除主题/回复、反应和相关通知，并保留不含正文的 `purge` 审计元数据。
 - `/api/admin/catalog/export` 只允许管理员，以只读连接逐行输出当前 catalog；CSV 单元格中和公式前缀，响应不缓存且不读取用户 state。
 - `/api/admin/catalog/imports` 只允许管理员把最多 16 MB/50,000 行的 CSV/JSONL/JSON 放入 `state/import-staging/` 预检；分析与删除要求 CSRF，预检不调用 builder 或激活 catalog。
 

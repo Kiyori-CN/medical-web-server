@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS forum_moderation_log (
     topic_id TEXT NOT NULL,
     moderator_id TEXT NOT NULL,
     moderator_name TEXT NOT NULL,
-    action TEXT NOT NULL CHECK (action IN ('edit', 'hide', 'restore', 'delete')),
+    action TEXT NOT NULL CHECK (action IN ('edit', 'hide', 'restore', 'delete', 'purge')),
     previous_status TEXT NOT NULL,
     new_status TEXT NOT NULL,
     reason TEXT NOT NULL,
@@ -129,11 +129,58 @@ class ForumStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript(FORUM_SCHEMA_SQL)
+            self._ensure_purge_audit_action(connection)
             connection.executemany(
                 "INSERT OR IGNORE INTO forum_sections(section_id, name, description, position) VALUES (?, ?, ?, ?)",
                 DEFAULT_SECTIONS,
             )
             connection.commit()
+
+    @staticmethod
+    def _ensure_purge_audit_action(connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'forum_moderation_log'"
+        ).fetchone()
+        if row is None or "'purge'" in str(row[0] or ""):
+            return
+        connection.execute(
+            "ALTER TABLE forum_moderation_log RENAME TO forum_moderation_log_legacy"
+        )
+        connection.execute(
+            """
+            CREATE TABLE forum_moderation_log (
+                audit_id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL CHECK (target_type IN ('topic', 'reply')),
+                target_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                moderator_id TEXT NOT NULL,
+                moderator_name TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('edit', 'hide', 'restore', 'delete', 'purge')),
+                previous_status TEXT NOT NULL,
+                new_status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO forum_moderation_log(
+                audit_id, target_type, target_id, topic_id, moderator_id,
+                moderator_name, action, previous_status, new_status, reason, created_at
+            )
+            SELECT audit_id, target_type, target_id, topic_id, moderator_id,
+                   moderator_name, action, previous_status, new_status, reason, created_at
+            FROM forum_moderation_log_legacy
+            """
+        )
+        connection.execute("DROP TABLE forum_moderation_log_legacy")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forum_moderation_created ON forum_moderation_log(created_at DESC, audit_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forum_moderation_target ON forum_moderation_log(target_type, target_id, created_at DESC)"
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=10)
@@ -681,72 +728,372 @@ class ForumStore:
         )
         now = _utc_now()
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if target_type == "topic":
-                row = self._topic_row(connection, target_id)
-                topic_id = target_id
-                current = row["status"]
-                transitions = {
-                    "hide": ("open", "hidden"),
-                    "restore": ("hidden", "open"),
-                }
-                if action == "delete":
-                    if current == "deleted":
-                        raise ForumForbidden("该主题已经删除")
-                    new_status = "deleted"
-                else:
-                    expected, new_status = transitions[action]
-                    if current != expected:
-                        raise ForumForbidden("当前主题状态不允许执行该操作")
-                connection.execute(
-                    "UPDATE forum_topics SET status = ?, updated_at = ? WHERE topic_id = ?",
-                    (new_status, now, target_id),
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                result = self._moderate_content_in_transaction(
+                    connection,
+                    target_type=target_type,
+                    target_id=target_id,
+                    action=action,
+                    reason=reason,
+                    moderator_name=moderator_name,
+                    now=now,
                 )
-            else:
-                row = connection.execute(
-                    """
-                    SELECT r.*, t.status AS topic_status
-                    FROM forum_replies r
-                    JOIN forum_topics t ON t.topic_id = r.topic_id
-                    WHERE r.reply_id = ?
-                    """,
-                    (target_id,),
-                ).fetchone()
-                if row is None:
-                    raise ForumNotFound("论坛回复不存在")
-                topic_id = row["topic_id"]
-                current = row["status"]
-                if action == "delete":
-                    if current == "deleted":
-                        raise ForumForbidden("该回复已经删除")
-                    new_status = "deleted"
-                elif action == "hide":
-                    if current != "visible":
-                        raise ForumForbidden("当前回复状态不允许隐藏")
-                    new_status = "hidden"
-                else:
-                    if current != "hidden":
-                        raise ForumForbidden("当前回复状态不允许恢复")
-                    if row["topic_status"] != "open":
-                        raise ForumForbidden("请先恢复所属主题")
-                    new_status = "visible"
-                connection.execute(
-                    "UPDATE forum_replies SET status = ?, updated_at = ? WHERE reply_id = ?",
-                    (new_status, now, target_id),
-                )
-            audit_id = self._record_moderation(
-                connection,
-                target_type=target_type,
-                target_id=target_id,
-                topic_id=topic_id,
-                moderator_name=moderator_name,
-                action=action,
-                previous_status=current,
-                new_status=new_status,
-                reason=reason,
-                created_at=now,
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return result
+
+    def moderate_content_bulk(
+        self,
+        targets: object,
+        *,
+        action: object,
+        reason: object,
+        moderator_name: object,
+    ) -> dict[str, Any]:
+        if not isinstance(targets, list) or not 1 <= len(targets) <= 100:
+            raise ValueError("批量论坛内容必须包含 1 到 100 项")
+        normalized_targets: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for value in targets:
+            if not isinstance(value, dict):
+                raise ValueError("批量论坛目标格式无效")
+            target_type = _reaction_target(value.get("target_type"))
+            target_id = display_text(value.get("target_id"))
+            if not target_id or len(target_id) > 128:
+                raise ValueError("批量论坛目标 ID 无效")
+            key = (target_type, target_id)
+            if key in seen:
+                raise ValueError("批量论坛目标不能重复")
+            seen.add(key)
+            normalized_targets.append(
+                {"target_type": target_type, "target_id": target_id}
             )
-            connection.commit()
+        action = display_text(action).lower()
+        if action not in {"hide", "restore", "delete"}:
+            raise ValueError("论坛审核操作无效")
+        reason = _text(reason, field="审核原因", minimum=2, maximum=500)
+        moderator_name = _text(
+            moderator_name, field="管理员用户名", minimum=1, maximum=32
+        )
+        if action == "restore":
+            normalized_targets.sort(key=lambda item: item["target_type"] != "topic")
+        elif action == "delete":
+            normalized_targets.sort(key=lambda item: item["target_type"] == "topic")
+
+        now = _utc_now()
+        with self._connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                results = [
+                    self._moderate_content_in_transaction(
+                        connection,
+                        target_type=item["target_type"],
+                        target_id=item["target_id"],
+                        action=action,
+                        reason=reason,
+                        moderator_name=moderator_name,
+                        now=now,
+                    )
+                    for item in normalized_targets
+                ]
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {
+            "action": action,
+            "count": len(results),
+            "reason": reason,
+            "items": results,
+        }
+
+    def purge_content(
+        self,
+        target_type: object,
+        target_id: object,
+        *,
+        reason: object,
+        moderator_name: object,
+    ) -> dict[str, Any]:
+        target_type = _reaction_target(target_type)
+        target_id = display_text(target_id)
+        if not target_id or len(target_id) > 128:
+            raise ValueError("论坛内容 ID 无效")
+        reason = _text(reason, field="永久删除原因", minimum=2, maximum=500)
+        moderator_name = _text(
+            moderator_name, field="管理员用户名", minimum=1, maximum=32
+        )
+        now = _utc_now()
+        with self._connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                result = self._purge_content_in_transaction(
+                    connection,
+                    target_type=target_type,
+                    target_id=target_id,
+                    reason=reason,
+                    moderator_name=moderator_name,
+                    now=now,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return result
+
+    def purge_content_bulk(
+        self,
+        targets: object,
+        *,
+        reason: object,
+        moderator_name: object,
+    ) -> dict[str, Any]:
+        if not isinstance(targets, list) or not 1 <= len(targets) <= 100:
+            raise ValueError("批量永久删除必须包含 1 到 100 项论坛内容")
+        normalized_targets: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for value in targets:
+            if not isinstance(value, dict):
+                raise ValueError("批量论坛目标格式无效")
+            target_type = _reaction_target(value.get("target_type"))
+            target_id = display_text(value.get("target_id"))
+            if not target_id or len(target_id) > 128:
+                raise ValueError("批量论坛目标 ID 无效")
+            key = (target_type, target_id)
+            if key in seen:
+                raise ValueError("批量论坛目标不能重复")
+            seen.add(key)
+            normalized_targets.append(
+                {"target_type": target_type, "target_id": target_id}
+            )
+        reason = _text(reason, field="永久删除原因", minimum=2, maximum=500)
+        moderator_name = _text(
+            moderator_name, field="管理员用户名", minimum=1, maximum=32
+        )
+        normalized_targets.sort(key=lambda item: item["target_type"] != "reply")
+        now = _utc_now()
+        with self._connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                results = [
+                    self._purge_content_in_transaction(
+                        connection,
+                        target_type=item["target_type"],
+                        target_id=item["target_id"],
+                        reason=reason,
+                        moderator_name=moderator_name,
+                        now=now,
+                    )
+                    for item in normalized_targets
+                ]
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {
+            "action": "purge",
+            "count": len(results),
+            "reason": reason,
+            "items": results,
+        }
+
+    def _purge_content_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        target_type: str,
+        target_id: str,
+        reason: str,
+        moderator_name: str,
+        now: str,
+    ) -> dict[str, Any]:
+        removed_replies = 0
+        if target_type == "topic":
+            row = self._topic_row(connection, target_id)
+            topic_id = target_id
+            current = row["status"]
+            reply_ids = [
+                item[0]
+                for item in connection.execute(
+                    "SELECT reply_id FROM forum_replies WHERE topic_id = ?",
+                    (target_id,),
+                )
+            ]
+            removed_replies = len(reply_ids)
+            connection.execute(
+                "DELETE FROM forum_reactions WHERE target_type = 'topic' AND target_id = ?",
+                (target_id,),
+            )
+            self._delete_target_rows(
+                connection,
+                table="forum_reactions",
+                column="target_id",
+                values=reply_ids,
+                prefix="target_type = 'reply' AND ",
+            )
+            notifications_available = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notifications'"
+            ).fetchone()
+            if notifications_available:
+                connection.execute(
+                    "DELETE FROM notifications WHERE comment_id = ?", (target_id,)
+                )
+                self._delete_target_rows(
+                    connection,
+                    table="notifications",
+                    column="comment_id",
+                    values=reply_ids,
+                )
+            cursor = connection.execute(
+                "DELETE FROM forum_topics WHERE topic_id = ?", (target_id,)
+            )
+            if cursor.rowcount != 1:
+                raise ForumNotFound("论坛主题不存在")
+        else:
+            row = self._reply_row(connection, target_id)
+            topic_id = row["topic_id"]
+            current = row["status"]
+            connection.execute(
+                "DELETE FROM forum_reactions WHERE target_type = 'reply' AND target_id = ?",
+                (target_id,),
+            )
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notifications'"
+            ).fetchone():
+                connection.execute(
+                    "DELETE FROM notifications WHERE comment_id = ?", (target_id,)
+                )
+            connection.execute(
+                "UPDATE forum_replies SET parent_reply_id = NULL WHERE parent_reply_id = ?",
+                (target_id,),
+            )
+            cursor = connection.execute(
+                "DELETE FROM forum_replies WHERE reply_id = ?", (target_id,)
+            )
+            if cursor.rowcount != 1:
+                raise ForumNotFound("论坛回复不存在")
+        audit_id = self._record_moderation(
+            connection,
+            target_type=target_type,
+            target_id=target_id,
+            topic_id=topic_id,
+            moderator_name=moderator_name,
+            action="purge",
+            previous_status=current,
+            new_status="purged",
+            reason=reason,
+            created_at=now,
+        )
+        return {
+            "audit_id": audit_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "topic_id": topic_id,
+            "action": "purge",
+            "previous_status": current,
+            "new_status": "purged",
+            "reason": reason,
+            "removed_replies": removed_replies,
+            "created_at": now,
+        }
+
+    @staticmethod
+    def _delete_target_rows(
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        column: str,
+        values: list[str],
+        prefix: str = "",
+    ) -> None:
+        if not values:
+            return
+        for index in range(0, len(values), 400):
+            chunk = values[index : index + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            connection.execute(
+                f"DELETE FROM {table} WHERE {prefix}{column} IN ({placeholders})",
+                chunk,
+            )
+
+    def _moderate_content_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        target_type: str,
+        target_id: str,
+        action: str,
+        reason: str,
+        moderator_name: str,
+        now: str,
+    ) -> dict[str, Any]:
+        if target_type == "topic":
+            row = self._topic_row(connection, target_id)
+            topic_id = target_id
+            current = row["status"]
+            transitions = {
+                "hide": ("open", "hidden"),
+                "restore": ("hidden", "open"),
+            }
+            if action == "delete":
+                if current == "deleted":
+                    raise ForumForbidden("该主题已经删除")
+                new_status = "deleted"
+            else:
+                expected, new_status = transitions[action]
+                if current != expected:
+                    raise ForumForbidden("当前主题状态不允许执行该操作")
+            connection.execute(
+                "UPDATE forum_topics SET status = ?, updated_at = ? WHERE topic_id = ?",
+                (new_status, now, target_id),
+            )
+        else:
+            row = connection.execute(
+                """
+                SELECT r.*, t.status AS topic_status
+                FROM forum_replies r
+                JOIN forum_topics t ON t.topic_id = r.topic_id
+                WHERE r.reply_id = ?
+                """,
+                (target_id,),
+            ).fetchone()
+            if row is None:
+                raise ForumNotFound("论坛回复不存在")
+            topic_id = row["topic_id"]
+            current = row["status"]
+            if action == "delete":
+                if current == "deleted":
+                    raise ForumForbidden("该回复已经删除")
+                new_status = "deleted"
+            elif action == "hide":
+                if current != "visible":
+                    raise ForumForbidden("当前回复状态不允许隐藏")
+                new_status = "hidden"
+            else:
+                if current != "hidden":
+                    raise ForumForbidden("当前回复状态不允许恢复")
+                if row["topic_status"] != "open":
+                    raise ForumForbidden("请先恢复所属主题")
+                new_status = "visible"
+            connection.execute(
+                "UPDATE forum_replies SET status = ?, updated_at = ? WHERE reply_id = ?",
+                (new_status, now, target_id),
+            )
+        audit_id = self._record_moderation(
+            connection,
+            target_type=target_type,
+            target_id=target_id,
+            topic_id=topic_id,
+            moderator_name=moderator_name,
+            action=action,
+            previous_status=current,
+            new_status=new_status,
+            reason=reason,
+            created_at=now,
+        )
         return {
             "audit_id": audit_id,
             "target_type": target_type,

@@ -47,7 +47,25 @@ def test_main_auth_roles_health_assets_and_practice(
     html = index.get_data(as_text=True)
     assert "把检索、练习与复习" in html
     assert "找到原题，沿原题库路径练会它" not in html
-    assert client.get("/app.js").status_code == 200
+    app_js_response = client.get("/app.js")
+    assert app_js_response.status_code == 200
+    app_js = app_js_response.get_data(as_text=True)
+    assert "把题库变成可追问的学习助手" not in app_js
+    assert "回答会绑定当前账号" not in app_js
+    assert "围绕题目、知识点和复习方法持续讨论" not in app_js
+    assert "对话与智能学习功能将在后续接入" not in app_js
+    assert "主题讨论功能将在后续开放" not in app_js
+    assert "/messages/stream" in app_js
+    assert "forum-sort" in app_js
+    assert "刷题导航与题号抽屉沿用此顺序" not in app_js
+    assert "逐题作答，提交后立即查看正确答案与解析。" not in app_js
+    assert "outline-order-direction" not in app_js
+    assert "outline-order-arrow" in app_js
+    assert 'key !== "random"' in app_js
+    assert "重置练习" in app_js
+    assert "outline-reset" not in app_js
+    assert "type_desc" in app_js
+    assert "occurrence_order" in app_js
     assert "frame-ancestors 'none'" in index.headers["Content-Security-Policy"]
 
     setup = client.post(
@@ -129,6 +147,67 @@ def test_main_auth_roles_health_assets_and_practice(
     )
     assert ai_regenerated.status_code == 200
     assert ai_regenerated.get_json()["assistant"]["message_id"] == ai_message_id
+    assert client.post(
+        f"/api/ai/conversations/{ai_conversation_id}/messages/stream",
+        json={"content": "缺少 CSRF"},
+    ).status_code == 403
+    monkeypatch.setattr(
+        "medical_app.ai.AIStore._completion_request",
+        lambda self, prompt, context, history: (
+            {
+                "api_url": "https://example.invalid/v1/chat/completions",
+                "model": "test-stream",
+                "api_key": "test-key-123456",
+            },
+            [{"role": "user", "content": prompt}],
+            [],
+        ),
+    )
+    stream_answers = iter([
+        ["真实", "流式回答"],
+        ["重新", "流式生成"],
+    ])
+    monkeypatch.setattr(
+        "medical_app.ai.stream_chat_provider",
+        lambda config, messages, **kwargs: iter(next(stream_answers)),
+    )
+
+    def parse_sse(response):
+        events = []
+        for block in response.get_data(as_text=True).strip().split("\n\n"):
+            lines = block.splitlines()
+            event = next(line[7:] for line in lines if line.startswith("event: "))
+            data = json.loads(next(line[6:] for line in lines if line.startswith("data: ")))
+            events.append((event, data))
+        return events
+
+    streamed = client.post(
+        f"/api/ai/conversations/{ai_conversation_id}/messages/stream",
+        headers={**_csrf(client), "Accept": "text/event-stream"},
+        json={"content": "请流式回答。", "context": {"scope": "catalog"}},
+    )
+    assert streamed.status_code == 200
+    assert streamed.mimetype == "text/event-stream"
+    assert streamed.headers["Cache-Control"] == "private, no-store"
+    assert streamed.headers["X-Accel-Buffering"] == "no"
+    stream_events = parse_sse(streamed)
+    assert [event for event, _ in stream_events] == ["start", "delta", "delta", "complete"]
+    assert stream_events[-1][1]["assistant"]["content"] == "真实流式回答"
+    streamed_message_id = stream_events[-1][1]["assistant"]["message_id"]
+
+    regenerated_stream = client.post(
+        f"/api/ai/conversations/{ai_conversation_id}/regenerate/stream",
+        headers={**_csrf(client), "Accept": "text/event-stream"},
+        json={},
+    )
+    regenerated_events = parse_sse(regenerated_stream)
+    assert [event for event, _ in regenerated_events] == ["start", "delta", "delta", "complete"]
+    assert regenerated_events[-1][1]["assistant"]["message_id"] == streamed_message_id
+    assert regenerated_events[-1][1]["assistant"]["content"] == "重新流式生成"
+    streamed_messages = client.get(
+        f"/api/ai/conversations/{ai_conversation_id}/messages"
+    ).get_json()["messages"]
+    assert len(streamed_messages) == 4
     stats = client.get("/api/stats").get_json()
     assert stats["questions"] == 5
     jsonl_export = client.get("/api/admin/catalog/export?format=jsonl")

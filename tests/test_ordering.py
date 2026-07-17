@@ -51,6 +51,7 @@ def test_practice_ordering_uses_original_position_type_and_year_metadata():
     assert positions("sequential") == [1, 2, 3, 4]
     assert positions("position_desc") == [4, 3, 2, 1]
     assert positions("type") == [1, 3, 4, 2]
+    assert positions("type_desc") == [2, 3, 4, 1]
     assert positions("year_desc") == [1, 3, 4, 2]
     assert positions("year_asc") == [3, 4, 1, 2]
 
@@ -61,6 +62,7 @@ def test_practice_ordering_uses_original_position_type_and_year_metadata():
         "填空题", "填空题"
     )
     assert normalize_practice_order_mode("YEAR_DESC") == "year_desc"
+    assert normalize_practice_order_mode("TYPE_DESC") == "type_desc"
 
     missing_type_order = [
         {"collection_position": 1, "occurrence_id": 1},

@@ -214,6 +214,57 @@ def create_forum_admin_blueprint(database_path) -> Blueprint:
             )
         )
 
+    @blueprint.patch("/content/bulk")
+    @admin_required
+    @csrf_required
+    def moderate_content_bulk():
+        data = _json_object()
+        action = str(data.get("action", "")).strip().lower()
+        if (
+            action == "delete"
+            and data.get("confirmation") != "DELETE_SELECTED_FORUM_CONTENT"
+        ):
+            raise ValueError("批量删除论坛内容需要明确确认")
+        return jsonify(
+            store().moderate_content_bulk(
+                data.get("targets"),
+                action=action,
+                reason=data.get("reason", ""),
+                moderator_name=g.current_user.get("username", "管理员"),
+            )
+        )
+
+    @blueprint.delete("/content/bulk")
+    @admin_required
+    @csrf_required
+    def purge_content_bulk():
+        data = _json_object()
+        if data.get("confirmation") != "PURGE_SELECTED_FORUM_CONTENT":
+            raise ValueError("批量永久删除论坛内容需要明确确认")
+        return jsonify(
+            store().purge_content_bulk(
+                data.get("targets"),
+                reason=data.get("reason", ""),
+                moderator_name=g.current_user.get("username", "管理员"),
+            )
+        )
+
+    @blueprint.delete("/content/<target_type>/<target_id>")
+    @admin_required
+    @csrf_required
+    def purge_content(target_type: str, target_id: str):
+        data = _json_object()
+        if data.get("confirmation") != "PURGE_FORUM_CONTENT":
+            raise ValueError("永久删除论坛内容需要明确确认")
+        return jsonify(
+            store().purge_content(
+                target_type,
+                target_id,
+                reason=data.get("reason", ""),
+                moderator_name=g.current_user.get("username", "管理员"),
+            )
+        )
+
     return blueprint
 
 

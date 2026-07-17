@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -8,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .normalize import display_text
 from .providers import (
@@ -17,12 +20,38 @@ from .providers import (
 )
 
 
-SETTINGS_SCHEMA_REVISION = 1
+SETTINGS_SCHEMA_REVISION = 2
 DEFAULT_EMBEDDING_API_URL = "https://api.siliconflow.cn/v1/embeddings"
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
 DEFAULT_LLM_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 DEFAULT_LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_SITE_APPEARANCE = {
+    "site_name": "知库",
+    "site_mark": "知",
+    "site_subtitle": "Question Bank Workspace",
+    "site_description": "知库：可私有部署的通用题库检索、练习与复习平台。",
+    "login_eyebrow": "通用题库学习工作台",
+    "login_title": "把检索、练习与复习，放在同一条学习路径。",
+    "login_description": "保留题库目录、来源文件和原题号，支持精确搜题、智能检索与跨设备练习。",
+    "login_features": [
+        "按来源文件精确刷题",
+        "收藏与错题自动归档",
+        "账号数据完全本地保存",
+    ],
+}
+SITE_TEXT_LIMITS = {
+    "site_name": (2, 30),
+    "site_mark": (1, 4),
+    "site_subtitle": (0, 60),
+    "site_description": (2, 160),
+    "login_eyebrow": (0, 40),
+    "login_title": (2, 90),
+    "login_description": (0, 240),
+}
+LOGIN_BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
+LOGIN_BACKGROUND_MAX_PIXELS = 32_000_000
+LOGIN_BACKGROUND_MAX_EDGE = 2560
 
 
 class SettingsUnavailable(RuntimeError):
@@ -67,6 +96,15 @@ class SettingsStore:
                     api_key_encrypted BLOB,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS site_assets (
+                    asset_name TEXT PRIMARY KEY,
+                    media_type TEXT NOT NULL,
+                    content BLOB NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             connection.execute(
@@ -78,7 +116,7 @@ class SettingsStore:
                 "default_search_mode": "keyword",
                 "search_result_limit": 10,
                 "allow_registration": True,
-                "site_name": "医考知库",
+                **DEFAULT_SITE_APPEARANCE,
             }
             for key, value in defaults.items():
                 connection.execute(
@@ -123,18 +161,124 @@ class SettingsStore:
         app = self._app_settings()
         embedding = self.provider_config("embedding", include_secret=False)
         llm = self.provider_config("llm", include_secret=False)
+        site = self._site_settings_from_app(app)
         return {
             "semantic_enabled": bool(app["semantic_enabled"]),
             "default_search_mode": app["default_search_mode"],
             "search_result_limit": int(app["search_result_limit"]),
             "allow_registration": bool(app["allow_registration"]),
-            "site_name": str(app["site_name"]),
+            "site_name": site["site_name"],
+            "site": site,
             "embedding": embedding,
             "llm": llm,
         }
 
     def admin_settings(self) -> dict[str, Any]:
-        return self.public_settings()
+        payload = self.public_settings()
+        payload["site_defaults"] = {
+            **DEFAULT_SITE_APPEARANCE,
+            "login_features": list(DEFAULT_SITE_APPEARANCE["login_features"]),
+        }
+        return payload
+
+    def site_settings(self) -> dict[str, Any]:
+        return self._site_settings_from_app(self._app_settings())
+
+    def public_site_settings(self) -> dict[str, Any]:
+        app = self._app_settings()
+        return {
+            **self._site_settings_from_app(app),
+            "allow_registration": bool(app["allow_registration"]),
+        }
+
+    def login_background(self, *, include_content: bool = True) -> dict[str, Any] | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                (
+                    "SELECT * FROM site_assets WHERE asset_name = 'login_background'"
+                    if include_content
+                    else """
+                        SELECT asset_name, media_type, width, height, sha256, updated_at
+                        FROM site_assets WHERE asset_name = 'login_background'
+                    """
+                )
+            ).fetchone()
+        finally:
+            connection.close()
+        return dict(row) if row is not None else None
+
+    def set_login_background(self, payload: bytes) -> dict[str, Any]:
+        if not payload or len(payload) > LOGIN_BACKGROUND_MAX_BYTES:
+            raise ValueError("登录背景图片必须小于 8 MB")
+        try:
+            with Image.open(io.BytesIO(payload)) as source:
+                if source.format not in {"JPEG", "PNG", "WEBP"}:
+                    raise ValueError("登录背景仅支持 JPG、PNG 或 WebP")
+                if int(getattr(source, "n_frames", 1)) != 1:
+                    raise ValueError("登录背景不支持动态图片")
+                width, height = source.size
+                if width * height > LOGIN_BACKGROUND_MAX_PIXELS:
+                    raise ValueError("登录背景图片像素尺寸过大")
+                if min(width, height) < 320 or max(width, height) < 640:
+                    raise ValueError("登录背景图片至少需要 640×320 像素")
+                source.load()
+                image = ImageOps.exif_transpose(source).convert("RGBA")
+        except Image.DecompressionBombError as error:
+            raise ValueError("登录背景图片像素尺寸过大") from error
+        except ValueError:
+            raise
+        except (OSError, UnidentifiedImageError) as error:
+            raise ValueError("登录背景图片无法读取") from error
+
+        image.thumbnail(
+            (LOGIN_BACKGROUND_MAX_EDGE, LOGIN_BACKGROUND_MAX_EDGE),
+            Image.Resampling.LANCZOS,
+        )
+        canvas = Image.new("RGBA", image.size, (31, 37, 48, 255))
+        canvas.alpha_composite(image)
+        output = io.BytesIO()
+        canvas.convert("RGB").save(
+            output,
+            format="WEBP",
+            quality=88,
+            method=6,
+        )
+        content = output.getvalue()
+        digest = hashlib.sha256(content).hexdigest()
+        now = _utc_now()
+        connection = self.connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO site_assets(
+                        asset_name, media_type, content, width, height, sha256, updated_at
+                    ) VALUES ('login_background', 'image/webp', ?, ?, ?, ?, ?)
+                    ON CONFLICT(asset_name) DO UPDATE SET
+                        media_type = excluded.media_type,
+                        content = excluded.content,
+                        width = excluded.width,
+                        height = excluded.height,
+                        sha256 = excluded.sha256,
+                        updated_at = excluded.updated_at
+                    """,
+                    (content, canvas.width, canvas.height, digest, now),
+                )
+        finally:
+            connection.close()
+        return self.site_settings()
+
+    def delete_login_background(self) -> bool:
+        connection = self.connect()
+        try:
+            with connection:
+                cursor = connection.execute(
+                    "DELETE FROM site_assets WHERE asset_name = 'login_background'"
+                )
+        finally:
+            connection.close()
+        return cursor.rowcount == 1
 
     def provider_config(self, provider: str, *, include_secret: bool = False) -> dict[str, Any]:
         provider = display_text(provider).lower()
@@ -196,10 +340,34 @@ class SettingsStore:
                         connection, "allow_registration", app_payload["allow_registration"]
                     )
                 if "site_name" in app_payload:
-                    site_name = display_text(app_payload["site_name"])
-                    if not 2 <= len(site_name) <= 30:
-                        raise ValueError("site_name must be between 2 and 30 characters")
-                    self._set_app(connection, "site_name", site_name)
+                    self._set_app(
+                        connection,
+                        "site_name",
+                        self._site_text("site_name", app_payload["site_name"]),
+                    )
+                for field in (
+                    "site_mark",
+                    "site_subtitle",
+                    "site_description",
+                    "login_eyebrow",
+                    "login_title",
+                    "login_description",
+                ):
+                    if field in app_payload:
+                        self._set_app(
+                            connection, field, self._site_text(field, app_payload[field])
+                        )
+                if "login_features" in app_payload:
+                    features = app_payload["login_features"]
+                    if not isinstance(features, list) or len(features) != 3:
+                        raise ValueError("login_features must contain exactly three items")
+                    normalized_features = []
+                    for value in features:
+                        text = display_text(value)
+                        if len(text) > 60:
+                            raise ValueError("login feature must not exceed 60 characters")
+                        normalized_features.append(text)
+                    self._set_app(connection, "login_features", normalized_features)
                 for provider in ("embedding", "llm"):
                     if provider in providers_payload:
                         value = providers_payload[provider]
@@ -256,6 +424,35 @@ class SettingsStore:
         finally:
             connection.close()
         return {row["key"]: json.loads(row["value_json"]) for row in rows}
+
+    def _site_settings_from_app(self, app: dict[str, Any]) -> dict[str, Any]:
+        background = self.login_background(include_content=False)
+        features = app.get("login_features", DEFAULT_SITE_APPEARANCE["login_features"])
+        if not isinstance(features, list) or len(features) != 3:
+            features = DEFAULT_SITE_APPEARANCE["login_features"]
+        return {
+            field: str(app.get(field, default))
+            for field, default in DEFAULT_SITE_APPEARANCE.items()
+            if field != "login_features"
+        } | {
+            "login_features": [display_text(value)[:60] for value in features],
+            "login_background": {
+                "configured": background is not None,
+                "version": background["sha256"][:20] if background else "",
+                "width": int(background["width"]) if background else 0,
+                "height": int(background["height"]) if background else 0,
+            },
+        }
+
+    @staticmethod
+    def _site_text(field: str, value: object) -> str:
+        minimum, maximum = SITE_TEXT_LIMITS[field]
+        text = display_text(value)
+        if not minimum <= len(text) <= maximum:
+            raise ValueError(
+                f"{field} must be between {minimum} and {maximum} characters"
+            )
+        return text
 
     @staticmethod
     def _set_app(connection: sqlite3.Connection, key: str, value: Any) -> None:

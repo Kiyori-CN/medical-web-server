@@ -5,11 +5,11 @@ import secrets
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .catalog import Catalog
 from .normalize import display_text
-from .providers import ProviderError, complete_chat_provider
+from .providers import ProviderError, complete_chat_provider, stream_chat_provider
 from .settings import SettingsStore, SettingsUnavailable
 
 
@@ -66,6 +66,25 @@ class AIConflict(RuntimeError):
 
 def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def _public_ai_unavailable(error: Exception) -> AIUnavailable:
+    message = str(error).lower()
+    if any(
+        marker in message
+        for marker in ("api key", "api url", "configured", "decrypt", "settings")
+    ):
+        return AIUnavailable("管理员尚未完成大语言模型配置，请在系统管理中检查模型设置")
+    if "size limit" in message or "exceeded" in message:
+        return AIUnavailable("AI 回答超过长度限制，请缩小问题范围后重试")
+    if any(
+        marker in message
+        for marker in ("timeout", "request failed", "stream failed", "connection")
+    ):
+        return AIUnavailable("AI 模型连接中断，请稍后重试")
+    if "http" in message:
+        return AIUnavailable("AI 模型服务暂时不可用，请稍后重试")
+    return AIUnavailable("AI 模型返回异常，请稍后重试")
 
 
 def _clean_text(value: object, *, limit: int = MAX_MESSAGE_LENGTH) -> str:
@@ -134,7 +153,7 @@ class AIStore:
                        c.context_collection_id, c.created_at, c.updated_at,
                        (SELECT content FROM ai_messages m
                         WHERE m.conversation_id = c.conversation_id
-                        ORDER BY m.created_at DESC, m.message_id DESC LIMIT 1) AS preview,
+                        ORDER BY m.rowid DESC LIMIT 1) AS preview,
                        (SELECT COUNT(*) FROM ai_messages m
                         WHERE m.conversation_id = c.conversation_id) AS message_count
                 FROM ai_conversations c
@@ -247,7 +266,7 @@ class AIStore:
         prompt = _clean_text(content)
         if not prompt:
             raise ValueError("请输入问题")
-        context_payload = context if isinstance(context, dict) else {}
+        context_payload = self._message_context(context)
         with self._connect() as connection:
             conversation = self._owned_conversation(connection, conversation_id)
             history_rows = connection.execute(
@@ -308,6 +327,149 @@ class AIStore:
             connection.commit()
         return {"conversation": {**dict(conversation), "title": title, "updated_at": now}, "user": user_message, "assistant": assistant_message}
 
+    def prepare_stream_message(
+        self,
+        conversation_id: str,
+        content: object,
+        *,
+        context: object = None,
+    ) -> dict[str, Any]:
+        """Validate a streamed turn before response headers are committed."""
+
+        conversation_id = display_text(conversation_id)
+        prompt = _clean_text(content)
+        if not prompt:
+            raise ValueError("请输入问题")
+        context_payload = self._message_context(context)
+        with self._connect() as connection:
+            conversation = self._owned_conversation(connection, conversation_id)
+            history_rows = connection.execute(
+                "SELECT role, content FROM ai_messages WHERE conversation_id = ? AND profile_id = ? ORDER BY rowid DESC LIMIT 12",
+                (conversation_id, self.profile_id),
+            ).fetchall()
+            latest = connection.execute(
+                "SELECT message_id FROM ai_messages WHERE conversation_id = ? AND profile_id = ? ORDER BY rowid DESC LIMIT 1",
+                (conversation_id, self.profile_id),
+            ).fetchone()
+        config, provider_messages, citations = self._completion_request(
+            prompt, context_payload, history_rows
+        )
+        return {
+            "kind": "message",
+            "conversation_id": conversation_id,
+            "conversation": dict(conversation),
+            "prompt": prompt,
+            "context": context_payload,
+            "provider_config": config,
+            "provider_messages": provider_messages,
+            "citations": citations,
+            "expected_last_message_id": latest["message_id"] if latest else None,
+        }
+
+    def stream_prepared_message(
+        self, plan: dict[str, Any]
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        yield "start", {
+            "conversation_id": plan["conversation_id"],
+            "mode": "message",
+            "citations": plan["citations"],
+        }
+        parts: list[str] = []
+        try:
+            for delta in stream_chat_provider(
+                plan["provider_config"],
+                plan["provider_messages"],
+                timeout=self.provider_timeout,
+            ):
+                parts.append(delta)
+                yield "delta", {"delta": delta}
+        except (ProviderError, SettingsUnavailable) as error:
+            raise _public_ai_unavailable(error) from error
+        answer = "".join(parts).strip()
+        if not answer:
+            raise AIUnavailable("AI 模型没有返回有效内容，请重新提问")
+        result = self._commit_stream_message(plan, answer)
+        yield "complete", result
+
+    def prepare_stream_regeneration(self, conversation_id: str) -> dict[str, Any]:
+        """Capture the final exchange and its optimistic replacement snapshot."""
+
+        conversation_id = display_text(conversation_id)
+        with self._connect() as connection:
+            conversation = self._owned_conversation(connection, conversation_id)
+            latest = connection.execute(
+                """
+                SELECT rowid, message_id, role, content, citations_json,
+                       context_json, created_at
+                FROM ai_messages
+                WHERE conversation_id = ? AND profile_id = ?
+                ORDER BY rowid DESC LIMIT 2
+                """,
+                (conversation_id, self.profile_id),
+            ).fetchall()
+            if (
+                len(latest) != 2
+                or latest[0]["role"] != "assistant"
+                or latest[1]["role"] != "user"
+            ):
+                raise AIConflict("当前会话没有可重新生成的回答")
+            assistant_row, user_row = latest
+            history_rows = connection.execute(
+                """
+                SELECT role, content FROM ai_messages
+                WHERE conversation_id = ? AND profile_id = ? AND rowid < ?
+                ORDER BY rowid DESC LIMIT 12
+                """,
+                (conversation_id, self.profile_id, user_row["rowid"]),
+            ).fetchall()
+        try:
+            context_payload = json.loads(user_row["context_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            context_payload = {}
+        if not isinstance(context_payload, dict):
+            context_payload = {}
+        prompt = _clean_text(user_row["content"])
+        config, provider_messages, citations = self._completion_request(
+            prompt, context_payload, history_rows
+        )
+        return {
+            "kind": "regenerate",
+            "conversation_id": conversation_id,
+            "conversation": dict(conversation),
+            "provider_config": config,
+            "provider_messages": provider_messages,
+            "citations": citations,
+            "assistant_message_id": assistant_row["message_id"],
+            "expected_content": assistant_row["content"],
+            "expected_citations_json": assistant_row["citations_json"],
+        }
+
+    def stream_prepared_regeneration(
+        self, plan: dict[str, Any]
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        yield "start", {
+            "conversation_id": plan["conversation_id"],
+            "message_id": plan["assistant_message_id"],
+            "mode": "regenerate",
+            "citations": plan["citations"],
+        }
+        parts: list[str] = []
+        try:
+            for delta in stream_chat_provider(
+                plan["provider_config"],
+                plan["provider_messages"],
+                timeout=self.provider_timeout,
+            ):
+                parts.append(delta)
+                yield "delta", {"delta": delta}
+        except (ProviderError, SettingsUnavailable) as error:
+            raise _public_ai_unavailable(error) from error
+        answer = "".join(parts).strip()
+        if not answer:
+            raise AIUnavailable("AI 模型没有返回有效内容，请重新提问")
+        result = self._commit_stream_regeneration(plan, answer)
+        yield "complete", result
+
     def regenerate_last(self, conversation_id: str) -> dict[str, Any]:
         conversation_id = display_text(conversation_id)
         with self._connect() as connection:
@@ -350,8 +512,18 @@ class AIStore:
         now = _utc_now()
         citations_json = json.dumps(citations, ensure_ascii=False)
         with self._connect() as connection:
-            self._owned_conversation(connection, conversation_id)
             connection.execute("BEGIN IMMEDIATE")
+            self._owned_conversation(connection, conversation_id)
+            latest_now = connection.execute(
+                "SELECT message_id FROM ai_messages WHERE conversation_id = ? AND profile_id = ? ORDER BY rowid DESC LIMIT 1",
+                (conversation_id, self.profile_id),
+            ).fetchone()
+            if (
+                latest_now is None
+                or latest_now["message_id"] != assistant_row["message_id"]
+            ):
+                connection.rollback()
+                raise AIConflict("会话已更新，请刷新后重试")
             cursor = connection.execute(
                 """
                 UPDATE ai_messages
@@ -399,7 +571,26 @@ class AIStore:
         context_payload: dict[str, Any],
         history_rows: list[sqlite3.Row],
     ) -> tuple[str, list[dict[str, Any]]]:
-        history = []
+        config, provider_messages, citations = self._completion_request(
+            prompt, context_payload, history_rows
+        )
+        try:
+            answer = complete_chat_provider(
+                config,
+                provider_messages,
+                timeout=self.provider_timeout,
+            )
+        except (ProviderError, SettingsUnavailable, ValueError) as error:
+            raise _public_ai_unavailable(error) from error
+        return answer, citations
+
+    def _completion_request(
+        self,
+        prompt: str,
+        context_payload: dict[str, Any],
+        history_rows: list[sqlite3.Row],
+    ) -> tuple[dict[str, Any], list[dict[str, str]], list[dict[str, Any]]]:
+        history: list[dict[str, str]] = []
         history_budget = 24000
         for row in reversed(history_rows):
             history_content = str(row["content"] or "")[:4000]
@@ -418,18 +609,141 @@ class AIStore:
             system += "\n\n可用题库材料：\n" + rag_text
         try:
             config = self.settings.provider_config("llm", include_secret=True)
-            answer = complete_chat_provider(
-                config,
-                [
-                    {"role": "system", "content": system},
-                    *history,
-                    {"role": "user", "content": prompt},
-                ],
-                timeout=self.provider_timeout,
+        except (SettingsUnavailable, ValueError) as error:
+            raise _public_ai_unavailable(error) from error
+        return (
+            config,
+            [
+                {"role": "system", "content": system},
+                *history,
+                {"role": "user", "content": prompt},
+            ],
+            citations,
+        )
+
+    def _commit_stream_message(
+        self, plan: dict[str, Any], answer: str
+    ) -> dict[str, Any]:
+        conversation_id = plan["conversation_id"]
+        now = _utc_now()
+        user_message = {
+            "message_id": secrets.token_urlsafe(18),
+            "role": "user",
+            "content": plan["prompt"],
+            "citations": [],
+            "created_at": now,
+        }
+        assistant_message = {
+            "message_id": secrets.token_urlsafe(18),
+            "role": "assistant",
+            "content": answer,
+            "citations": plan["citations"],
+            "created_at": now,
+        }
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation = self._owned_conversation(connection, conversation_id)
+            latest = connection.execute(
+                "SELECT message_id FROM ai_messages WHERE conversation_id = ? AND profile_id = ? ORDER BY rowid DESC LIMIT 1",
+                (conversation_id, self.profile_id),
+            ).fetchone()
+            latest_id = latest["message_id"] if latest else None
+            if latest_id != plan["expected_last_message_id"]:
+                connection.rollback()
+                raise AIConflict("会话已更新，请刷新后重试")
+            title = str(conversation["title"] or "新对话")
+            if title == "新对话":
+                title = plan["prompt"].replace("\n", " ").strip()[:32] or title
+            connection.execute(
+                "INSERT INTO ai_messages(message_id, conversation_id, profile_id, role, content, citations_json, context_json, created_at) VALUES (?, ?, ?, 'user', ?, '[]', ?, ?)",
+                (
+                    user_message["message_id"],
+                    conversation_id,
+                    self.profile_id,
+                    plan["prompt"],
+                    json.dumps(plan["context"], ensure_ascii=False),
+                    now,
+                ),
             )
-        except (ProviderError, SettingsUnavailable, ValueError) as error:
-            raise AIUnavailable(str(error)) from error
-        return answer, citations
+            connection.execute(
+                "INSERT INTO ai_messages(message_id, conversation_id, profile_id, role, content, citations_json, context_json, created_at) VALUES (?, ?, ?, 'assistant', ?, ?, '{}', ?)",
+                (
+                    assistant_message["message_id"],
+                    conversation_id,
+                    self.profile_id,
+                    answer,
+                    json.dumps(plan["citations"], ensure_ascii=False),
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE ai_conversations SET title = ?, updated_at = ? WHERE conversation_id = ? AND profile_id = ?",
+                (title, now, conversation_id, self.profile_id),
+            )
+            connection.commit()
+        return {
+            "conversation": {**dict(conversation), "title": title, "updated_at": now},
+            "user": user_message,
+            "assistant": assistant_message,
+        }
+
+    def _commit_stream_regeneration(
+        self, plan: dict[str, Any], answer: str
+    ) -> dict[str, Any]:
+        now = _utc_now()
+        citations_json = json.dumps(plan["citations"], ensure_ascii=False)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation = self._owned_conversation(
+                connection, plan["conversation_id"]
+            )
+            latest_now = connection.execute(
+                "SELECT message_id FROM ai_messages WHERE conversation_id = ? AND profile_id = ? ORDER BY rowid DESC LIMIT 1",
+                (plan["conversation_id"], self.profile_id),
+            ).fetchone()
+            if (
+                latest_now is None
+                or latest_now["message_id"] != plan["assistant_message_id"]
+            ):
+                connection.rollback()
+                raise AIConflict("会话已更新，请刷新后重试")
+            cursor = connection.execute(
+                """
+                UPDATE ai_messages
+                SET content = ?, citations_json = ?, created_at = ?
+                WHERE message_id = ? AND conversation_id = ? AND profile_id = ?
+                  AND role = 'assistant' AND content = ? AND citations_json = ?
+                """,
+                (
+                    answer,
+                    citations_json,
+                    now,
+                    plan["assistant_message_id"],
+                    plan["conversation_id"],
+                    self.profile_id,
+                    plan["expected_content"],
+                    plan["expected_citations_json"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise AIConflict("会话已更新，请刷新后重试")
+            connection.execute(
+                "UPDATE ai_conversations SET updated_at = ? WHERE conversation_id = ? AND profile_id = ?",
+                (now, plan["conversation_id"], self.profile_id),
+            )
+            connection.commit()
+        assistant = {
+            "message_id": plan["assistant_message_id"],
+            "role": "assistant",
+            "content": answer,
+            "citations": plan["citations"],
+            "created_at": now,
+        }
+        return {
+            "conversation": {**dict(conversation), "updated_at": now},
+            "assistant": assistant,
+        }
 
     def _owned_conversation(self, connection: sqlite3.Connection, conversation_id: str) -> sqlite3.Row:
         if not conversation_id:
@@ -467,6 +781,32 @@ class AIStore:
         if len(collection_id) > 200:
             raise ValueError("collection_id is invalid")
         return occurrence_id, collection_id
+
+    @staticmethod
+    def _message_context(context: object) -> dict[str, Any]:
+        if context in (None, ""):
+            return {}
+        if not isinstance(context, dict):
+            raise ValueError("context must be an object")
+        scope = display_text(context.get("scope") or "catalog").lower()
+        if scope not in {"question", "collection", "directory", "catalog"}:
+            raise ValueError("context scope is invalid")
+        payload: dict[str, Any] = {"scope": scope}
+        occurrence = context.get("occurrence_id")
+        if occurrence not in (None, ""):
+            try:
+                occurrence_id = int(occurrence)
+            except (TypeError, ValueError) as error:
+                raise ValueError("occurrence_id is invalid") from error
+            if occurrence_id <= 0:
+                raise ValueError("occurrence_id is invalid")
+            payload["occurrence_id"] = occurrence_id
+        collection_id = display_text(context.get("collection_id"))
+        if len(collection_id) > 200:
+            raise ValueError("collection_id is invalid")
+        if collection_id:
+            payload["collection_id"] = collection_id
+        return payload
 
     def _build_context(self, prompt: str, context: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         scope = display_text(context.get("scope") or "catalog").lower()
