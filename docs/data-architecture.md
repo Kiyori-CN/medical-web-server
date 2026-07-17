@@ -87,6 +87,8 @@ erDiagram
 - 历年真题按年份从新到旧；
 - 未命中显式规则的条目稳定排在已知条目之后。
 
+单 collection 的刷题目录使用同一模块中的稳定排序契约：`type` 为默认医学题型顺序，`sequential` / `position_desc` 为原题号正序/倒序，`year_desc` / `year_asc` 为题目年份新到旧/旧到新，`random` 在每次创建会话时使用系统随机源重新洗牌。题目年份先解析原题编号开头的 `19xx/20xx`，再回退到 `source_files.year`；未知年份在两个方向中都排在最后。排序只改变浏览和会话遍历顺序，不改变 `collection_questions.position` 原题号；随机结果创建后同样冻结为本次会话顺序。
+
 禁止把操作系统、SQLite 或普通字符串排序直接暴露为题库顺序。
 
 `/api/library/tree` 从 catalog 内存目录缓存生成指定父路径下的只读嵌套子树，目录与文件的每一层仍调用同一医学排序规则。前端分类导航的考试与题库类型使用固定宽度、自动换行的多行标签，每组可独立展开或收起且手机端不使用横向滑动；只有用户展开某个学科时才请求对应子树，避免一次传输全部 2,127 个文件。异步切换标签或展开目录时保留原内容直至新数据就绪，并恢复用户当前滚动位置，不能因临时加载占位导致页面跳回顶部。树节点继续保留完整相对路径、collection ID、题数和文件扩展名。题库顶层路径固定使用“专硕考研、学硕考研、执业医师、三基考试”，不附加括号内的考试说明。
@@ -163,7 +165,7 @@ catalog 不写入用户状态。用户状态通过 `user_id` 隔离；收藏和�
 
 前端将错题、收藏、笔记、评论和点赞视为同一组个人学习页面，但五个入口只在题库顶部呈现，二级页不再重复五项导航。题库返回目标写入二级页 hash；从个人内容进入原题时再把完整列表 hash 写入会话地址，使刷新后的显式返回仍按“原题 → 列表 → 题库”恢复。评论、笔记和点赞 feed 使用 `limit + offset` 分批读取；任何收藏、错题、笔记、评论或赞同增删都会使前端今日统计缓存失效。
 
-`collection_question_progress` 以 `(profile_id, collection_id, occurrence_id)` 唯一定位题号目录状态。提交答案时同步更新该投影；点击题库重置只删除当前账号在当前 collection 的投影行。`practice_sessions` 和 `practice_session_questions` 仍保留为历史试卷，`question_progress`、`study_items` 和 `question_comments` 均不随文件重置删除。同一道规范题出现在其他文件时也不会被连带重置。
+`collection_question_progress` 以 `(profile_id, collection_id, occurrence_id)` 唯一定位题号目录状态。提交答案时同步更新该投影；点击题库重置只删除当前账号在当前 collection 的投影行。创建会话时，已选目录排序写入 `practice_sessions.filters_json.order_mode`，最终 occurrence 顺序则以 `practice_session_questions.position` 冻结；`collection_position` 始终保留原题号。恢复、前后导航、滑动和题号抽屉不得再次重排冻结明细。`practice_sessions` 和 `practice_session_questions` 仍保留为历史试卷，`question_progress`、`study_items` 和 `question_comments` 均不随文件重置删除。同一道规范题出现在其他文件时也不会被连带重置。
 
 练习记录不新增重复表。`practice_sessions.archived_at` 通过兼容迁移新增，空值表示正常展示，时间值表示当前账号已归档；归档不改变 `status`、`completed_at`、答案或任何进度投影，可通过幂等 API 恢复。`PracticeStore.session_history()` 直接聚合当前 `profile_id` 的 `practice_sessions` 与 `practice_session_questions`，默认排除归档，以 `active/complete/archived + limit + offset` 返回摘要、四类状态统计和 `has_more`；同秒活动使用插入顺序稳定排序。进行中的 `test` 会话在归档前后都只暴露总题数、已答数和进度，成绩字段为空；归档活动会话拒绝提交和交卷，collection 续答入口忽略归档记录。前端历史 hash 保存当前筛选，恢复会话后仍能返回同一历史列表。永久删除只接受当前 `profile_id` 且 `archived_at IS NOT NULL` 的会话；单删按 session 精确执行，批量清空还要求 `DELETE_ARCHIVED` 固定确认，`practice_session_questions` 由外键级联删除，`question_progress`、`collection_question_progress`、`study_items` 和 `question_notes` 均保留。
 
@@ -198,7 +200,7 @@ AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` �
 
 测试模式处于 active 时，即使全部题目已经提交，API 也只能返回用户答案和已答状态，不返回 `is_correct`、正确答案、考点、解析和正确/错误计数；答完最后一题不会自动完成会话，只有显式交卷后才解锁整卷结果。背题模式拒绝任何答案写入，通过完成按钮结束会话。
 
-上一题、下一题、题号跳转和手机左右滑动共用同一前端导航规则。未提交时允许离开当前题并保留本地草稿，但不得提前写入答题记录或改变题号目录的已答状态；题号目录使用中性虚线状态区分待交卷草稿。`POST /api/practice/sessions/<id>/finish` 可携带唯一 position 的 `answers` 数组，服务端在一个 `BEGIN IMMEDIATE` 事务中逐题校验并复用单题提交的错题、规范题进度与 collection 进度写入，随后完成会话；任一项无效时全部回滚，空白题保持未答。
+上一题、下一题、题号跳转和手机左右滑动共用冻结后的 session position；按钮文字和题卡标题继续显示原 `collection_position`，并另示当前 session position。未提交时允许离开当前题并保留本地草稿，但不得提前写入答题记录或改变题号目录的已答状态；题号目录使用中性虚线状态区分待交卷草稿。`POST /api/practice/sessions/<id>/finish` 可携带唯一 position 的 `answers` 数组，服务端在一个 `BEGIN IMMEDIATE` 事务中逐题校验并复用单题提交的错题、规范题进度与 collection 进度写入，随后完成会话；任一项无效时全部回滚，空白题保持未答。
 
 ## 真实数据验收基线
 
@@ -212,7 +214,7 @@ AI 状态补充实体：`ai_conversations` 以 `(conversation_id, profile_id)` �
 - SQLite integrity：`ok`；
 - foreign key errors：0。
 
-还必须抽查 `专硕考研/历年真题/2026/2026.xlsx`：165 题、A1/A2/A3-A4/B/X 题型目录、指定题号起始、原 occurrence 判分和四种模式。
+还必须抽查 `专硕考研/历年真题/2026/2026.xlsx`：165 题、A1/A2/A3-A4/B/X 题型目录、题号正倒序、年份新旧排序、两次新建随机会话重新洗牌、指定原题号起始、冻结顺序恢复/导航、原 occurrence 判分和四种模式；混合年份文件还要验证未知年份始终在末尾。
 
 ## 用户反馈数据
 

@@ -10,6 +10,7 @@ from typing import Any
 from .auth import profile_privacy_preferences, public_avatar_url
 from .catalog import Catalog
 from .normalize import display_text, normalize_answer
+from .ordering import normalize_practice_order_mode, sort_practice_items
 
 
 APP_SCHEMA_REVISION = 6
@@ -418,6 +419,7 @@ class PracticeStore:
         mode: str = "practice",
         order_mode: str = "sequential",
         start_position: int = 1,
+        start_exact: bool = False,
         saved_kind: str = "",
     ) -> dict[str, Any]:
         filters = filters or {}
@@ -425,6 +427,9 @@ class PracticeStore:
         mode = display_text(mode) or "practice"
         if mode not in {"practice", "speed", "test", "memorize"}:
             raise ValueError("mode must be practice, speed, test, or memorize")
+        order_mode = normalize_practice_order_mode(order_mode)
+        if not isinstance(start_exact, bool):
+            raise ValueError("start_exact must be a boolean")
         saved_kind = display_text(saved_kind).lower()
         if saved_kind not in {"", "favorite", "wrong"}:
             raise ValueError("saved_kind must be favorite or wrong")
@@ -434,6 +439,8 @@ class PracticeStore:
                 collection_id=collection_id,
                 count=count,
                 start_position=start_position,
+                start_exact=start_exact,
+                order_mode=order_mode,
                 canonical_type=filters.get("question_type", ""),
             )
         elif collection_id:
@@ -441,6 +448,7 @@ class PracticeStore:
                 collection_id=collection_id,
                 count=count,
                 start_position=start_position,
+                start_exact=start_exact,
                 order_mode=order_mode,
                 canonical_type=filters.get("question_type", ""),
             )
@@ -468,6 +476,7 @@ class PracticeStore:
             **filters,
             "order_mode": order_mode,
             "start_position": max(1, int(start_position)),
+            "start_exact": start_exact,
         }
         session_id = f"sess_{secrets.token_hex(16)}"
         connection = self.connect()
@@ -2650,6 +2659,8 @@ class PracticeStore:
         collection_id: str = "",
         count: int | None = None,
         start_position: int = 1,
+        start_exact: bool = False,
+        order_mode: str = "sequential",
         canonical_type: str = "",
     ) -> list[dict[str, Any]]:
         limit = 5000 if count in (None, 0, "") else max(1, min(int(count), 5000))
@@ -2679,7 +2690,10 @@ class PracticeStore:
         selected: list[dict[str, Any]] = []
         if collection_id:
             for item in self.catalog.collection_outline(collection_id):
-                if item["collection_position"] < max(1, int(start_position)):
+                if (
+                    not start_exact
+                    and item["collection_position"] < max(1, int(start_position))
+                ):
                     continue
                 saved = by_occurrence.get(item["occurrence_id"])
                 if not saved:
@@ -2687,15 +2701,32 @@ class PracticeStore:
                 if canonical_type and item["question_type"] != canonical_type:
                     continue
                 selected.append(
-                    {
-                        "question_id": item["question_id"],
-                        "occurrence_id": item["occurrence_id"],
-                        "collection_position": item["collection_position"],
-                    }
+                    item
                 )
-                if len(selected) >= limit:
-                    break
-            return selected
+            if order_mode == "random":
+                secrets.SystemRandom().shuffle(selected)
+            else:
+                selected = sort_practice_items(selected, order_mode)
+            if start_exact:
+                matching_index = next(
+                    (
+                        index
+                        for index, item in enumerate(selected)
+                        if item["collection_position"] == max(1, int(start_position))
+                    ),
+                    None,
+                )
+                if matching_index is None:
+                    return []
+                selected = selected[matching_index:]
+            return [
+                {
+                    "question_id": item["question_id"],
+                    "occurrence_id": item["occurrence_id"],
+                    "collection_position": item["collection_position"],
+                }
+                for item in selected[:limit]
+            ]
         for row in rows:
             selected.append(
                 {

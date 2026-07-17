@@ -65,6 +65,7 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
             mode=data.get("mode", "practice"),
             order_mode=data.get("order_mode", "sequential"),
             start_position=data.get("start_position", 1),
+            start_exact=data.get("start_exact", False),
             saved_kind=_saved_kind(data.get("saved_kind", "")),
         )
         return jsonify(session), 201

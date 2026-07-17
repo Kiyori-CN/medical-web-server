@@ -22,6 +22,7 @@ const state = {
   libraryRenderToken: 0,
   outline: null,
   outlineMode: "practice",
+  outlineOrderMode: "type",
   session: null,
   sessionIndex: 0,
   sessionReturnTarget: null,
@@ -786,14 +787,16 @@ function renderOutline() {
   const collection = payload.collection;
   const outlineItems = payload.items || [];
   const hasItems = outlineItems.length > 0;
-  const groups = groupOutlineItems(outlineItems);
+  const orderMode = normalizeOutlineOrderMode(state.outlineOrderMode, "type");
+  const orderedItems = orderPracticeItems(outlineItems, orderMode);
+  const groups = groupOutlineItems(orderedItems, orderMode, { preserveOrder: true, randomPreview: true });
   const groupMarkup = groups.map(([label, items]) => `
     <section class="outline-group">
-      <h3 class="outline-group-title"><span class="type-dot ${typeClass(label)}"></span><span>${escapeHtml(label)}</span><span>${items.length} 题</span></h3>
+      <h3 class="outline-group-title"><span class="type-dot ${outlineGroupDotClass(orderMode, label)}"></span><span>${escapeHtml(label)}</span><span>${items.length} 题</span></h3>
       ${kind === "library" ? `<div class="number-grid">${items.map((item) => `
-        <button class="number-button ${escapeAttr(item.status || "")}" type="button" title="${escapeAttr(item.source_code || `第 ${item.collection_position} 题`)} · ${escapeAttr(label)}" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${item.collection_position}">${item.collection_position}</button>`).join("")}</div>` : `<div class="saved-outline-list">${items.map((item) => `
+        <button class="number-button ${escapeAttr(item.status || "")}" type="button" title="${escapeAttr(outlineItemTitle(item, label))}" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${item.collection_position}" data-start-exact="true">${item.collection_position}</button>`).join("")}</div>` : `<div class="saved-outline-list">${items.map((item) => `
         <div class="saved-outline-item">
-          <button class="saved-outline-open" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${item.collection_position}"><span>${item.collection_position}</span><strong>${escapeHtml(item.source_code || `第 ${item.collection_position} 题`)}</strong></button>
+          <button class="saved-outline-open" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${item.collection_position}" data-start-exact="true"><span>${item.collection_position}</span><strong>${escapeHtml(item.source_code || `第 ${item.collection_position} 题`)}</strong></button>
           <button class="button button-danger button-small saved-outline-remove" type="button" data-action="remove-saved-outline" data-kind="${kind}" data-key="${escapeAttr(item.saved?.item_key || "")}">${kind === "wrong" ? "删除错题" : "取消收藏"}</button>
         </div>`).join("")}</div>`}
     </section>`).join("");
@@ -802,7 +805,7 @@ function renderOutline() {
     <div class="breadcrumbs"><button type="button" data-action="close-outline" data-kind="${kind}">‹ 返回当前目录</button></div>
     <div class="page-header">
       <div class="page-title"><h1>${escapeHtml(fileTitle(collection.relative_path))}</h1><p class="section-copy">${escapeHtml(displaySourcePath(collection.relative_path))} · ${formatNumber((payload.items || []).length)} 题</p></div>
-      ${hasItems ? `<div class="header-actions"><button class="button button-primary" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="${outlineItems[0].collection_position}">${modeMeta(state.outlineMode).cta}</button></div>` : ""}
+      ${hasItems ? `<div class="header-actions"><button class="button button-primary" type="button" data-action="start-session" data-kind="${kind}" data-id="${escapeAttr(collection.collection_id)}" data-position="1">${modeMeta(state.outlineMode).cta}</button></div>` : ""}
     </div>
     ${hasItems ? `<div class="card outline-card">
       <div class="outline-toolbar">
@@ -812,6 +815,7 @@ function renderOutline() {
           </div>
           <button class="button button-secondary button-small outline-reset" type="button" data-action="reset-collection-progress" data-id="${escapeAttr(collection.collection_id)}">重置</button>
         </div>
+        ${renderOutlineOrderControls(orderMode)}
         <p class="mode-description">${modeMeta(state.outlineMode).description}</p>
         <span class="outline-summary">已答 ${summary.answered || 0} · 正确 ${summary.correct || 0} · 错误 ${summary.wrong || 0} · 未答 ${Math.max(0, (summary.total || payload.items.length) - (summary.answered || 0))}</span>
       </div>
@@ -859,14 +863,136 @@ async function resetCollectionProgress(button) {
   }
 }
 
-function groupOutlineItems(items) {
+function normalizeOutlineOrderMode(value, fallback = "sequential") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["sequential", "position_desc", "type", "year_desc", "year_asc", "random"].includes(normalized)
+    ? normalized
+    : fallback;
+}
+
+function outlineOrderMeta(orderMode) {
+  const normalized = normalizeOutlineOrderMode(orderMode, "sequential");
+  const modes = {
+    sequential: { key: "position", direction: "asc", directionLabel: "1 → N", sessionLabel: "题号正序" },
+    position_desc: { key: "position", direction: "desc", directionLabel: "N → 1", sessionLabel: "题号倒序" },
+    type: { key: "type", direction: "fixed", directionLabel: "标准顺序", sessionLabel: "题型排序" },
+    year_desc: { key: "year", direction: "desc", directionLabel: "新 → 旧", sessionLabel: "年份新到旧" },
+    year_asc: { key: "year", direction: "asc", directionLabel: "旧 → 新", sessionLabel: "年份旧到新" },
+    random: { key: "random", direction: "fixed", directionLabel: "每次打乱", sessionLabel: "随机顺序" },
+  };
+  return modes[normalized];
+}
+
+function itemCollectionPosition(item) {
+  const source = item?.question?.sources?.[0] || item?.sources?.[0] || {};
+  return Number(item?.collection_position ?? source.collection_position ?? item?.position) || 0;
+}
+
+function itemOccurrenceId(item) {
+  return Number(item?.occurrence_id ?? item?.question?.occurrence_id) || 0;
+}
+
+function itemTypeLabel(item) {
+  const question = item?.question || item || {};
+  return question.type_label || question.raw_type || question.question_type || "其他题型";
+}
+
+function itemTypeOrder(item) {
+  const question = item?.question || item || {};
+  const value = Number(question.type_order);
+  return Number.isFinite(value) ? value : 90;
+}
+
+function itemQuestionYear(item) {
+  const question = item?.question || item || {};
+  const source = question.sources?.[0] || {};
+  const value = question.question_year ?? source.year;
+  const year = Number(value);
+  return Number.isInteger(year) && year >= 1900 && year <= 2099 ? year : null;
+}
+
+function orderPracticeItems(items, orderMode) {
+  const mode = normalizeOutlineOrderMode(orderMode, "sequential");
+  if (mode === "random") return [...items];
+  return [...items].sort((left, right) => {
+    const leftPosition = itemCollectionPosition(left);
+    const rightPosition = itemCollectionPosition(right);
+    if (mode === "position_desc") {
+      return rightPosition - leftPosition || itemOccurrenceId(left) - itemOccurrenceId(right);
+    }
+    if (mode === "type") {
+      return itemTypeOrder(left) - itemTypeOrder(right)
+        || leftPosition - rightPosition
+        || itemOccurrenceId(left) - itemOccurrenceId(right);
+    }
+    if (["year_desc", "year_asc"].includes(mode)) {
+      const leftYear = itemQuestionYear(left);
+      const rightYear = itemQuestionYear(right);
+      if (leftYear == null && rightYear != null) return 1;
+      if (leftYear != null && rightYear == null) return -1;
+      if (leftYear != null && rightYear != null && leftYear !== rightYear) {
+        return mode === "year_desc" ? rightYear - leftYear : leftYear - rightYear;
+      }
+    }
+    return leftPosition - rightPosition || itemOccurrenceId(left) - itemOccurrenceId(right);
+  });
+}
+
+function groupOutlineItems(items, orderMode = "type", { preserveOrder = false, randomPreview = false } = {}) {
+  const mode = normalizeOutlineOrderMode(orderMode, "type");
+  const ordered = preserveOrder ? [...items] : orderPracticeItems(items, mode);
   const groups = new Map();
-  items.forEach((item) => {
-    const label = item.type_label || item.raw_type || item.question_type || "其他题型";
+  ordered.forEach((item) => {
+    const label = mode === "type"
+      ? itemTypeLabel(item)
+      : ["year_desc", "year_asc"].includes(mode)
+        ? (itemQuestionYear(item) ? `${itemQuestionYear(item)} 年` : "年份未知")
+        : mode === "random"
+          ? (randomPreview ? "开始时随机打乱" : "本次随机顺序")
+          : outlineOrderMeta(mode).sessionLabel;
     if (!groups.has(label)) groups.set(label, []);
     groups.get(label).push(item);
   });
   return [...groups.entries()];
+}
+
+function outlineGroupDotClass(orderMode, label) {
+  const key = outlineOrderMeta(orderMode).key;
+  if (key === "type") return typeClass(label);
+  if (key === "year") return "type-year";
+  if (key === "position") return "type-position";
+  return "type-random";
+}
+
+function outlineItemTitle(item, groupLabel) {
+  const question = item?.question || item || {};
+  const details = [question.source_code || `第 ${itemCollectionPosition(item)} 题`];
+  const year = itemQuestionYear(item);
+  if (year) details.push(`${year} 年`);
+  if (groupLabel && groupLabel !== "全部题目") details.push(groupLabel);
+  return details.join(" · ");
+}
+
+function renderOutlineOrderControls(orderMode) {
+  const meta = outlineOrderMeta(orderMode);
+  const directionDisabled = meta.direction === "fixed";
+  const helper = meta.key === "random"
+    ? "每次开始重新打乱，本次会话内顺序固定"
+    : "刷题导航与题号抽屉沿用此顺序";
+  const directionLabel = meta.key === "type"
+    ? "题型使用标准医学顺序"
+    : meta.key === "random"
+      ? "每次开始都会重新打乱"
+      : `切换${meta.key === "year" ? "年份" : "题号"}排序方向`;
+  return `<div class="outline-order-row">
+    <div class="outline-order-copy"><strong>目录排序</strong><small>${helper}</small></div>
+    <div class="outline-order-controls">
+      <div class="segmented outline-order-segmented" role="group" aria-label="题号目录排序">
+        ${[["position", "题号"], ["type", "题型"], ["year", "年份"], ["random", "随机"]].map(([key, label]) => `<button class="${meta.key === key ? "active" : ""}" type="button" data-action="outline-order-key" data-order-key="${key}" aria-pressed="${meta.key === key}">${label}</button>`).join("")}
+      </div>
+      <button class="button button-secondary button-small outline-order-direction" type="button" data-action="outline-order-direction" ${directionDisabled ? "disabled" : ""} aria-label="${directionLabel}">${meta.directionLabel}</button>
+    </div>
+  </div>`;
 }
 
 function typeClass(label) {
@@ -1172,14 +1298,25 @@ function renderSolutionSection(kind, label, content, textRenderer = escapeHtml) 
   </section>`;
 }
 
-async function startSession({ collectionId, position = 1, kind = "library", mode = state.outlineMode, path = "", returnHash = "" }) {
+async function startSession({
+  collectionId,
+  position = 1,
+  startExact = false,
+  kind = "library",
+  mode = state.outlineMode,
+  orderMode = "sequential",
+  path = "",
+  returnHash = "",
+}) {
   const returnPath = path
     || state.libraryPath[kind]
     || collectionParentPath(state.outline?.payload?.collection?.relative_path);
+  const normalizedOrderMode = normalizeOutlineOrderMode(orderMode, "sequential");
   const body = {
     collection_id: collectionId,
-    start_position: Number(position) || 1,
-    order_mode: "sequential",
+    start_position: startExact ? Number(position) || 1 : 1,
+    start_exact: Boolean(startExact),
+    order_mode: normalizedOrderMode,
     mode,
   };
   if (kind === "favorites") body.saved_kind = "favorite";
@@ -1259,6 +1396,9 @@ function renderPractice() {
   const isReadOnly = isComplete || isArchived;
   const mode = session.mode || "practice";
   const meta = modeMeta(mode);
+  const orderMode = normalizeOutlineOrderMode(session.filters?.order_mode, "sequential");
+  const orderLabel = outlineOrderMeta(orderMode).sessionLabel;
+  const originalPosition = itemCollectionPosition(item) || item.position;
   const reveal = session.solution_visible || (Boolean(submitted) && mode !== "test");
   const draft = state.drafts[item.position] || "";
   const source = (question.sources || [])[0] || {};
@@ -1318,7 +1458,7 @@ function renderPractice() {
     </div>
     <div class="practice-layout">
       <article class="card practice-question ${state.navigationDirection ? `slide-${state.navigationDirection}` : ""}" data-mode="${mode}">
-        <div class="practice-progress"><strong>第 ${item.position} 题 / 共 ${session.items.length} 题</strong><span>${escapeHtml(question.type_label || question.raw_type || question.question_type)}${question.source_code ? ` · ${escapeHtml(question.source_code)}` : ""}</span></div>
+        <div class="practice-progress"><strong>第 ${originalPosition} 题 <small>· 当前 ${index + 1}/${session.items.length}</small></strong><span><b class="practice-order-label">${escapeHtml(orderLabel)}</b> · ${escapeHtml(question.type_label || question.raw_type || question.question_type)}${question.source_code ? ` · ${escapeHtml(question.source_code)}` : ""}</span></div>
         ${resultPanel}
         <div class="question-meta">
           <span class="badge">${escapeHtml(question.type_label || question.raw_type || question.question_type)}</span>
@@ -1349,7 +1489,7 @@ function renderPractice() {
       <button id="practice-outline-backdrop" class="practice-outline-backdrop" type="button" data-action="close-practice-outline" aria-label="关闭题号目录"></button>
       <aside id="practice-outline" class="card practice-outline">
         <div class="practice-outline-grabber" aria-hidden="true"></div>
-        <div class="practice-outline-head"><strong>题号目录</strong><span>${outlineStats}</span><button class="practice-outline-close" type="button" data-action="close-practice-outline" aria-label="关闭题号目录">×</button></div>
+        <div class="practice-outline-head"><div><strong>题号目录</strong><small>${escapeHtml(orderLabel)}</small></div><span>${outlineStats}</span><button class="practice-outline-close" type="button" data-action="close-practice-outline" aria-label="关闭题号目录">×</button></div>
         <div class="practice-outline-body">${renderSessionOutline(session, index)}</div>
       </aside>
     </div>`;
@@ -1418,20 +1558,19 @@ function renderReviewOptions(options, answer) {
 }
 
 function renderSessionOutline(session, currentIndex) {
-  const groups = new Map();
-  session.items.forEach((item, index) => {
-    const label = item.question.type_label || item.question.raw_type || item.question.question_type;
-    if (!groups.has(label)) groups.set(label, []);
-    groups.get(label).push({ item, index });
-  });
-  return [...groups.entries()].map(([label, entries]) => `
-    <section class="outline-group"><h3 class="outline-group-title"><span class="type-dot ${typeClass(label)}"></span><span>${escapeHtml(label)}</span></h3>
-      <div class="number-grid">${entries.map(({ item, index }) => {
-        const result = item.submission?.is_correct;
+  const orderMode = normalizeOutlineOrderMode(session.filters?.order_mode, "sequential");
+  const indexedItems = session.items.map((item, index) => ({ ...item, sessionIndex: index }));
+  const groups = groupOutlineItems(indexedItems, orderMode, { preserveOrder: true });
+  return groups.map(([label, entries]) => `
+    <section class="outline-group"><h3 class="outline-group-title"><span class="type-dot ${outlineGroupDotClass(orderMode, label)}"></span><span>${escapeHtml(label)}</span><span>${entries.length} 题</span></h3>
+      <div class="number-grid">${entries.map((sessionItem) => {
+        const sessionIndex = sessionItem.sessionIndex;
+        const result = sessionItem.submission?.is_correct;
         const hiddenResult = session.mode === "test" && session.status !== "complete";
-        const drafted = !item.submission && Boolean(String(state.drafts[item.position] || "").trim());
-        const status = hiddenResult && item.submission ? "answered" : result === true ? "correct" : result === false ? "wrong" : item.submission ? "ungraded" : drafted ? "drafted" : "";
-        return `<button class="number-button ${status} ${index === currentIndex ? "current" : ""}" type="button" data-action="session-jump" data-index="${index}">${item.position}</button>`;
+        const drafted = !sessionItem.submission && Boolean(String(state.drafts[sessionItem.position] || "").trim());
+        const status = hiddenResult && sessionItem.submission ? "answered" : result === true ? "correct" : result === false ? "wrong" : sessionItem.submission ? "ungraded" : drafted ? "drafted" : "";
+        const originalPosition = itemCollectionPosition(sessionItem) || sessionItem.position;
+        return `<button class="number-button ${status} ${sessionIndex === currentIndex ? "current" : ""}" type="button" title="${escapeAttr(outlineItemTitle(sessionItem, label))}" data-action="session-jump" data-index="${sessionIndex}">${originalPosition}</button>`;
       }).join("")}</div>
      </section>`).join("");
 }
@@ -3850,12 +3989,47 @@ async function handleClick(event) {
     renderOutline();
     return;
   }
+  if (action === "outline-order-key") {
+    const key = target.dataset.orderKey;
+    state.outlineOrderMode = key === "position"
+      ? "sequential"
+      : key === "year" ? "year_desc" : key === "random" ? "random" : "type";
+    savePreferences();
+    renderOutline();
+    return;
+  }
+  if (action === "outline-order-direction") {
+    const mode = normalizeOutlineOrderMode(state.outlineOrderMode, "type");
+    if (mode === "sequential") state.outlineOrderMode = "position_desc";
+    else if (mode === "position_desc") state.outlineOrderMode = "sequential";
+    else if (mode === "year_desc") state.outlineOrderMode = "year_asc";
+    else if (mode === "year_asc") state.outlineOrderMode = "year_desc";
+    else return;
+    savePreferences();
+    renderOutline();
+    return;
+  }
   if (action === "reset-collection-progress") return resetCollectionProgress(target);
   if (action === "start-session") {
-    return startSession({ collectionId: target.dataset.id, position: target.dataset.position, kind: target.dataset.kind, mode: state.outlineMode });
+    return startSession({
+      collectionId: target.dataset.id,
+      position: target.dataset.position,
+      startExact: target.dataset.startExact === "true",
+      kind: target.dataset.kind,
+      mode: state.outlineMode,
+      orderMode: state.outlineOrderMode,
+    });
   }
   if (action === "practice-source") {
-    return startSession({ collectionId: target.dataset.id, path: target.dataset.path, position: target.dataset.position, kind: "library", mode: "practice" });
+    return startSession({
+      collectionId: target.dataset.id,
+      path: target.dataset.path,
+      position: target.dataset.position,
+      startExact: true,
+      kind: "library",
+      mode: "practice",
+      orderMode: "sequential",
+    });
   }
   if (action === "search-mode") {
     state.searchMode = target.dataset.mode;
@@ -4775,6 +4949,8 @@ async function openPersonalSource(target) {
   await startSession({
     collectionId,
     position,
+    startExact: true,
+    orderMode: "sequential",
     path: collectionParentPath(target.dataset.path || ""),
     kind: "library",
     mode: "practice",
@@ -5041,6 +5217,7 @@ function savePreferences() {
       searchSolutionVisibility: state.searchSolutionVisibility,
       searchSettingsExpanded: state.searchSettingsExpanded,
       libraryViewMode: state.libraryViewMode,
+      outlineOrderMode: state.outlineOrderMode,
       theme: state.theme,
     }));
   } catch (_) {
@@ -5053,6 +5230,9 @@ try {
   if (preferences.searchMode) state.searchMode = preferences.searchMode;
   if (["light", "dark"].includes(preferences.theme)) state.theme = preferences.theme;
   if (["folders", "guided"].includes(preferences.libraryViewMode)) state.libraryViewMode = preferences.libraryViewMode;
+  if (["sequential", "position_desc", "type", "year_desc", "year_asc", "random"].includes(preferences.outlineOrderMode)) {
+    state.outlineOrderMode = preferences.outlineOrderMode;
+  }
   if (Array.isArray(preferences.searchQuestionTypes)) {
     state.searchQuestionTypes = [...new Set(preferences.searchQuestionTypes.map((value) => String(value || "").trim()).filter(Boolean))];
   } else if (typeof preferences.searchQuestionType === "string" && preferences.searchQuestionType) {

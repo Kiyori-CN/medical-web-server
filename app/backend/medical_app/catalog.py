@@ -10,7 +10,14 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 from .normalize import display_text, extract_source_code, key_text
-from .ordering import question_type_label, sort_library_entries
+from .ordering import (
+    normalize_practice_order_mode,
+    question_type_label,
+    question_type_order,
+    question_year,
+    sort_library_entries,
+    sort_practice_items,
+)
 
 
 _SEGMENT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+|[^\W_]+", re.UNICODE)
@@ -349,6 +356,12 @@ class Catalog:
                         "type_label": question_type_label(
                             row["raw_type"], row["question_type"]
                         ),
+                        "type_order": question_type_order(
+                            row["raw_type"], row["question_type"]
+                        ),
+                        "question_year": question_year(
+                            row["source_code"], row["year"]
+                        ),
                         "source_code": row["source_code"],
                         "stem": row["stem"],
                         "options": [
@@ -607,11 +620,12 @@ class Catalog:
                 """
                 SELECT cq.occurrence_id, cq.position AS collection_position,
                         q.question_id, q.canonical_type AS question_type,
-                        qv.raw_type, qv.source_code, qv.stem
+                        qv.raw_type, qv.source_code, qv.stem, sf.year
                 FROM collection_questions cq
                 JOIN question_occurrences qo ON qo.occurrence_id = cq.occurrence_id
                 JOIN questions q ON q.question_id = cq.question_id
                 JOIN question_versions qv ON qv.version_id = qo.version_id
+                JOIN source_files sf ON sf.source_file_id = qo.source_file_id
                 WHERE cq.collection_id = ?
                 ORDER BY cq.position, cq.occurrence_id
                 """,
@@ -621,6 +635,10 @@ class Catalog:
             {
                 **dict(row),
                 "type_label": question_type_label(row["raw_type"], row["question_type"]),
+                "type_order": question_type_order(
+                    row["raw_type"], row["question_type"]
+                ),
+                "question_year": question_year(row["source_code"], row["year"]),
             }
             for row in rows
         ]
@@ -631,6 +649,7 @@ class Catalog:
         collection_id: str,
         count: int | None = None,
         start_position: int = 1,
+        start_exact: bool = False,
         order_mode: str = "sequential",
         canonical_type: str = "",
     ) -> list[dict[str, Any]]:
@@ -638,29 +657,66 @@ class Catalog:
         if not collection_id:
             raise ValueError("collection_id is required")
         start_position = max(1, int(start_position))
-        order_mode = display_text(order_mode) or "sequential"
-        if order_mode not in {"sequential", "random"}:
-            raise ValueError("order_mode must be sequential or random")
+        if not isinstance(start_exact, bool):
+            raise ValueError("start_exact must be a boolean")
+        order_mode = normalize_practice_order_mode(order_mode)
         limit = 5000 if count in (None, 0, "") else max(1, min(int(count), 5000))
-        type_clause = " AND q.canonical_type = ?" if display_text(canonical_type) else ""
-        params: list[Any] = [collection_id, start_position]
-        if type_clause:
-            params.append(display_text(canonical_type))
-        params.append(limit)
-        ordering = "random()" if order_mode == "random" else "cq.position, cq.occurrence_id"
-        with self.connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT cq.occurrence_id, cq.position AS collection_position, cq.question_id
-                FROM collection_questions cq
-                JOIN questions q ON q.question_id = cq.question_id
-                WHERE cq.collection_id = ? AND cq.position >= ? {type_clause}
-                ORDER BY {ordering}
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-        return [dict(row) for row in rows]
+        items = [
+            item
+            for item in self.collection_outline(collection_id)
+            if not display_text(canonical_type)
+            or item["question_type"] == display_text(canonical_type)
+        ]
+        if not start_exact:
+            items = [
+                item
+                for item in items
+                if item["collection_position"] >= start_position
+            ]
+        if order_mode == "random":
+            with self.connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT cq.occurrence_id
+                    FROM collection_questions cq
+                    JOIN questions q ON q.question_id = cq.question_id
+                    WHERE cq.collection_id = ?
+                      AND (? = '' OR q.canonical_type = ?)
+                    ORDER BY random()
+                    """,
+                    (
+                        collection_id,
+                        display_text(canonical_type),
+                        display_text(canonical_type),
+                    ),
+                ).fetchall()
+            randomized_positions = {
+                row["occurrence_id"]: position for position, row in enumerate(rows)
+            }
+            items.sort(key=lambda item: randomized_positions[item["occurrence_id"]])
+        else:
+            items = sort_practice_items(items, order_mode)
+        start_index = 0
+        if start_exact:
+            matching_index = next(
+                (
+                    index
+                    for index, item in enumerate(items)
+                    if item["collection_position"] == start_position
+                ),
+                None,
+            )
+            if matching_index is None:
+                return []
+            start_index = matching_index
+        return [
+            {
+                "occurrence_id": item["occurrence_id"],
+                "collection_position": item["collection_position"],
+                "question_id": item["question_id"],
+            }
+            for item in items[start_index : start_index + limit]
+        ]
 
     def get_ranked_questions(
         self,

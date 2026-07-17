@@ -123,6 +123,16 @@ def test_practice_blueprint_requires_login_and_csrf(
     assert updated_goal.status_code == 200
     assert updated_goal.get_json()["daily_duration_target_minutes"] == 60
     assert client.post("/api/practice/sessions", json={"count": 1}).status_code == 403
+    assert client.post(
+        "/api/practice/sessions",
+        headers=headers,
+        json={"count": 1, "start_exact": "yes"},
+    ).status_code == 400
+    assert client.post(
+        "/api/practice/sessions",
+        headers=headers,
+        json={"count": 1, "order_mode": "unsupported"},
+    ).status_code == 400
 
     created = client.post(
         "/api/practice/sessions",
@@ -516,6 +526,62 @@ def test_collection_order_memorize_mode_and_early_finish(
     assert completed_memorize["status"] == "complete"
     assert completed_memorize["summary"]["answered"] == 0
     assert completed_memorize["solution_visible"] is True
+
+
+def test_collection_session_order_is_frozen_by_position_type_or_year(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, store = _services(sample_source_tree, tmp_path)
+    collection = _file_collection(catalog, "第一章.xlsx")
+    outline = store.collection_outline(collection["collection_id"])["items"]
+    assert [item["question_year"] for item in outline] == [2020, None, 2007, 2007]
+    assert outline[0]["type_order"] < outline[1]["type_order"]
+
+    expected = {
+        "sequential": [1, 2, 3, 4],
+        "position_desc": [4, 3, 2, 1],
+        "type": [1, 3, 4, 2],
+        "year_desc": [1, 3, 4, 2],
+        "year_asc": [3, 4, 1, 2],
+    }
+    for order_mode, positions in expected.items():
+        session = store.create_session(
+            collection_id=collection["collection_id"],
+            count=None,
+            order_mode=order_mode,
+        )
+        assert [item["collection_position"] for item in session["items"]] == positions
+        assert session["filters"]["order_mode"] == order_mode
+        assert session["items"][0]["question"]["question_year"] is not None or order_mode == "sequential"
+
+    random_session = store.create_session(
+        collection_id=collection["collection_id"],
+        count=None,
+        order_mode="random",
+    )
+    assert sorted(
+        item["collection_position"] for item in random_session["items"]
+    ) == [1, 2, 3, 4]
+    assert random_session["filters"]["order_mode"] == "random"
+
+    exact = store.create_session(
+        collection_id=collection["collection_id"],
+        count=None,
+        order_mode="position_desc",
+        start_position=3,
+        start_exact=True,
+    )
+    assert [item["collection_position"] for item in exact["items"]] == [3, 2, 1]
+    assert exact["filters"]["start_exact"] is True
+
+    with pytest.raises(ValueError, match="order_mode"):
+        store.create_session(
+            collection_id=collection["collection_id"], order_mode="unsupported"
+        )
+    with pytest.raises(ValueError, match="start_exact"):
+        store.create_session(
+            collection_id=collection["collection_id"], start_exact="yes"
+        )
 
 
 def test_full_finish_submits_pending_practice_answers_atomically(

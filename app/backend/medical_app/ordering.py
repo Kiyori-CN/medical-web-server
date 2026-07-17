@@ -100,6 +100,41 @@ _PAREN_ORDINAL_RE = re.compile(r"^[（(]([零〇一二两三四五六七八九�
 _YEAR_RE = re.compile(r"^(19\d{2}|20\d{2})(?:\D|$)")
 _NUMBER_RE = re.compile(r"\d+")
 
+PRACTICE_ORDER_MODES = (
+    "sequential",
+    "position_desc",
+    "type",
+    "year_desc",
+    "year_asc",
+    "random",
+)
+
+_QUESTION_TYPE_ORDER = {
+    "A1": 0,
+    "A2": 1,
+    "A3": 2,
+    "A3/A4": 2,
+    "A4": 3,
+    "B": 4,
+    "B1": 4,
+    "X": 5,
+    "单选": 10,
+    "单选题": 10,
+    "多选": 11,
+    "多选题": 11,
+    "判断": 12,
+    "判断题": 12,
+    "填空": 20,
+    "填空题": 20,
+    "名词解释": 21,
+    "简答": 22,
+    "简答题": 22,
+    "论述": 23,
+    "论述题": 23,
+    "知识点": 24,
+    "未知题型": 99,
+}
+
 
 def chinese_number(value: str) -> int | None:
     value = unicodedata.normalize("NFKC", str(value or "")).strip()
@@ -200,6 +235,95 @@ def question_type_label(raw_type: str, canonical_type: str) -> str:
     }
     compact = raw.replace(" ", "").upper().replace("型题", "")
     return aliases.get(compact, raw or canonical)
+
+
+def normalize_practice_order_mode(value: object) -> str:
+    mode = str(value or "").strip().lower() or "sequential"
+    if mode not in PRACTICE_ORDER_MODES:
+        supported = ", ".join(PRACTICE_ORDER_MODES)
+        raise ValueError(f"order_mode must be one of: {supported}")
+    return mode
+
+
+def question_year(source_code: object, fallback_year: object = None) -> int | None:
+    normalized = unicodedata.normalize("NFKC", str(source_code or "")).strip()
+    match = _YEAR_RE.match(normalized)
+    if match:
+        return int(match.group(1))
+    try:
+        fallback = int(fallback_year)
+    except (TypeError, ValueError):
+        return None
+    return fallback if 1900 <= fallback <= 2099 else None
+
+
+def question_type_order(raw_type: object, canonical_type: object) -> int:
+    label = question_type_label(str(raw_type or ""), str(canonical_type or ""))
+    compact = unicodedata.normalize("NFKC", label).replace(" ", "").upper()
+    compact_without_suffix = compact.removesuffix("型题")
+    if compact_without_suffix in _QUESTION_TYPE_ORDER:
+        return _QUESTION_TYPE_ORDER[compact_without_suffix]
+    if compact in _QUESTION_TYPE_ORDER:
+        return _QUESTION_TYPE_ORDER[compact]
+    canonical = unicodedata.normalize("NFKC", str(canonical_type or "")).replace(" ", "")
+    return _QUESTION_TYPE_ORDER.get(canonical, 90)
+
+
+def sort_practice_items(
+    items: list[dict[str, Any]], order_mode: object
+) -> list[dict[str, Any]]:
+    mode = normalize_practice_order_mode(order_mode)
+    if mode == "random":
+        raise ValueError("random practice order must be shuffled by the caller")
+
+    def position(item: dict[str, Any]) -> int:
+        try:
+            return int(item.get("collection_position") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def occurrence(item: dict[str, Any]) -> int:
+        try:
+            return int(item.get("occurrence_id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if mode == "position_desc":
+        return sorted(items, key=lambda item: (-position(item), occurrence(item)))
+    if mode == "type":
+        def type_order(item: dict[str, Any]) -> int:
+            try:
+                value = item.get("type_order")
+                return int(value) if value is not None else 90
+            except (TypeError, ValueError):
+                return 90
+
+        return sorted(
+            items,
+            key=lambda item: (
+                type_order(item),
+                position(item),
+                occurrence(item),
+            ),
+        )
+    if mode in {"year_desc", "year_asc"}:
+        descending = mode == "year_desc"
+
+        def year_key(item: dict[str, Any]) -> tuple[int, int, int, int]:
+            year = item.get("question_year")
+            try:
+                normalized_year = int(year) if year is not None else None
+            except (TypeError, ValueError):
+                normalized_year = None
+            return (
+                normalized_year is None,
+                -normalized_year if descending and normalized_year is not None else normalized_year or 0,
+                position(item),
+                occurrence(item),
+            )
+
+        return sorted(items, key=year_key)
+    return sorted(items, key=lambda item: (position(item), occurrence(item)))
 
 
 def _compact(value: str) -> str:
