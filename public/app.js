@@ -30,6 +30,7 @@ const state = {
   studyReturnHash: "#library",
   profileReturnHash: "#profile",
   drafts: {},
+  practiceSubmission: null,
   timerHandle: null,
   selectionTimer: null,
   gestureStart: null,
@@ -1189,6 +1190,7 @@ async function startSession({ collectionId, position = 1, kind = "library", mode
     state.session = session;
     state.sessionIndex = 0;
     state.drafts = {};
+    state.practiceSubmission = null;
     state.sessionReturnTarget = {
       kind: normalizedReturnHash ? "personal" : kind,
       collectionId,
@@ -1214,6 +1216,7 @@ async function loadSession(sessionId, { returnHash = "" } = {}) {
       state.session.items.findIndex((item) => !item.submission)
     );
     state.drafts = {};
+    state.practiceSubmission = null;
     const restoredReturnHash = normalizeStudyReturnHash(returnHash);
     if (restoredReturnHash) {
       state.sessionReturnTarget = {
@@ -1265,10 +1268,21 @@ function renderPractice() {
   const summary = session.summary || {};
   const canPrev = index > 0;
   const isLast = index === session.items.length - 1;
-  const showSubmit = mode === "practice" && !submitted && !isReadOnly;
-  const finishButton = ["practice", "test"].includes(mode)
-    ? `<button class="button button-danger button-small" type="button" data-action="finish-session" ${isReadOnly ? "disabled" : ""}>${isArchived ? "已归档" : isComplete ? "已交卷" : "交卷"}</button>`
-    : "";
+  const manualSubmit = questionRequiresManualSubmit(question);
+  const showSubmit = !submitted && !isReadOnly && (
+    mode === "practice" || (manualSubmit && ["speed", "test"].includes(mode))
+  );
+  const submitLabel = mode === "test"
+    ? "保存并下一题"
+    : mode === "speed" ? "提交并查看解析" : "提交答案";
+  const finishLabel = isArchived
+    ? "已归档"
+    : isComplete
+      ? (["practice", "test"].includes(mode) ? "已交卷" : "已完成")
+      : mode === "practice" || mode === "test"
+        ? "交卷"
+        : mode === "speed" ? "结束快刷" : "完成背题";
+  const finishButton = `<button class="button button-danger button-small" type="button" data-action="finish-session" ${isReadOnly ? "disabled" : ""}>${finishLabel}</button>`;
   const returnKind = state.sessionReturnTarget?.kind === "personal"
     ? studyReturnLabel(state.sessionReturnTarget.hash)
     : session.saved_kind === "favorite"
@@ -1288,9 +1302,13 @@ function renderPractice() {
         <span><small>未作答</small><strong>${Math.max(0, (summary.total || 0) - (summary.answered || 0))}</strong></span>
       </section>`
     : "";
-  const outlineStats = mode === "test" && !isComplete
+  const pendingDrafts = sessionDraftAnswers(session).length;
+  const outlineStatsBase = mode === "test" && !isComplete
     ? `${summary.answered || 0} 已答 · ${Math.max(0, (summary.total || 0) - (summary.answered || 0))} 未答`
     : `${summary.correct || 0} 对 · ${summary.wrong || 0} 错 · ${Math.max(0, (summary.total || 0) - (summary.answered || 0))} 未答`;
+  const outlineStats = pendingDrafts
+    ? `${outlineStatsBase} · ${pendingDrafts} 待交卷`
+    : outlineStatsBase;
   $("#page-practice").innerHTML = `
     <div class="practice-top practice-top-immersive ${finishButton ? "has-finish" : ""}">
       <button class="button button-secondary" type="button" data-action="leave-session" aria-label="返回${returnKind}">‹ <span>返回${returnKind}</span></button>
@@ -1322,7 +1340,7 @@ function renderPractice() {
         <div class="practice-footer" data-action-count="${4 + Number(showSubmit) + Number(session.saved_kind === "wrong")}">
           <button class="button button-secondary practice-footer-button practice-footer-prev" type="button" data-action="session-prev" aria-label="上一题" ${canPrev ? "" : "disabled"}><span class="practice-footer-icon" aria-hidden="true">←</span><span class="practice-footer-label">上一题</span></button>
           <button class="button button-secondary practice-footer-button mobile-outline-trigger" type="button" data-action="toggle-outline" aria-controls="practice-outline" aria-expanded="false"><span class="practice-footer-label">题号</span></button>
-          ${showSubmit ? `<button class="button button-primary practice-footer-button practice-footer-main practice-footer-submit" type="button" data-action="submit-answer" ${draft ? "" : "disabled"}><span class="practice-footer-label">提交答案</span></button>` : ""}
+          ${showSubmit ? `<button class="button button-primary practice-footer-button practice-footer-main practice-footer-submit" type="button" data-action="submit-answer" data-auto-advance="${["speed", "test"].includes(mode)}" ${draft ? "" : "disabled"}><span class="practice-footer-label">${submitLabel}</span></button>` : ""}
           <button class="button button-secondary practice-footer-button practice-footer-favorite favorite-button" type="button" data-action="toggle-favorite" aria-label="收藏本题" data-occurrence="${occurrenceId || ""}" data-question="${escapeAttr(question.question_id)}" data-favorited="false" aria-pressed="false"><span class="practice-footer-icon favorite-icon" aria-hidden="true">☆</span><span class="practice-footer-label favorite-label">收藏</span></button>
           ${session.saved_kind === "wrong" ? `<button class="button button-danger practice-footer-button practice-remove-button" type="button" data-action="remove-current-wrong" data-key="occurrence:${occurrenceId || ""}"><span class="practice-footer-label">删除错题</span></button>` : ""}
           <button class="button ${showSubmit || isLast ? "button-secondary" : "button-primary"} practice-footer-button practice-footer-next" type="button" data-action="session-next" aria-label="下一题"><span class="practice-footer-label">下一题</span><span class="practice-footer-icon" aria-hidden="true">→</span></button>
@@ -1376,6 +1394,20 @@ function renderAnswerArea(item, draft, reveal, isReadOnly) {
   return `<div class="subjective-answer"><label class="field"><span>作答内容</span><textarea id="subjective-draft" data-action="subjective-draft" placeholder="输入你的答案" ${(submitted || isReadOnly) ? "disabled" : ""}>${escapeHtml(submitted?.answer || draft)}</textarea></label></div>`;
 }
 
+function questionRequiresManualSubmit(question) {
+  return !(question?.options || []).length && question?.question_type !== "判断题";
+}
+
+function sessionDraftAnswers(session = state.session) {
+  if (!session || session.mode === "memorize") return [];
+  const elapsedMs = sessionElapsedMs();
+  return (session.items || []).flatMap((item) => {
+    if (item.submission) return [];
+    const answer = String(state.drafts[item.position] || "").trim();
+    return answer ? [{ position: item.position, answer, elapsed_ms: elapsedMs }] : [];
+  });
+}
+
 function renderReviewOptions(options, answer) {
   if (!options.length) return "";
   const correct = new Set(String(answer || "").split(""));
@@ -1397,7 +1429,8 @@ function renderSessionOutline(session, currentIndex) {
       <div class="number-grid">${entries.map(({ item, index }) => {
         const result = item.submission?.is_correct;
         const hiddenResult = session.mode === "test" && session.status !== "complete";
-        const status = hiddenResult && item.submission ? "answered" : result === true ? "correct" : result === false ? "wrong" : item.submission ? "ungraded" : "";
+        const drafted = !item.submission && Boolean(String(state.drafts[item.position] || "").trim());
+        const status = hiddenResult && item.submission ? "answered" : result === true ? "correct" : result === false ? "wrong" : item.submission ? "ungraded" : drafted ? "drafted" : "";
         return `<button class="number-button ${status} ${index === currentIndex ? "current" : ""}" type="button" data-action="session-jump" data-index="${index}">${item.position}</button>`;
       }).join("")}</div>
      </section>`).join("");
@@ -1649,63 +1682,107 @@ async function replyToComment(commentId, occurrenceId) {
 }
 
 async function submitCurrentAnswer({ autoAdvance = false } = {}) {
+  if (state.practiceSubmission) return state.practiceSubmission;
   const session = state.session;
   const index = state.sessionIndex;
   const item = session.items[index];
   const answer = state.drafts[item.position] || "";
   if (!answer) return;
-  try {
-    const result = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}/answers`, {
-      method: "POST",
-      body: { position: item.position, answer, elapsed_ms: sessionElapsedMs() },
-    });
-    invalidateStudySummary();
-    state.session = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}`);
-    state.sessionIndex = Math.min(index, state.session.items.length - 1);
-    const canAdvance = autoAdvance && index < state.session.items.length - 1 && state.session.status !== "complete";
-    if (canAdvance && session.mode === "test") {
-      state.sessionIndex = index + 1;
-      renderPractice();
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } else if (canAdvance && session.mode === "speed" && result.is_correct === true) {
-      renderPractice();
-      state.selectionTimer = window.setTimeout(() => {
-        state.selectionTimer = null;
-        const currentItem = state.session?.items?.[index];
-        if (
-          state.session?.session_id === session.session_id &&
-          state.sessionIndex === index &&
-          currentItem?.submission?.is_correct === true
-        ) {
-          state.navigationDirection = "forward";
-          state.sessionIndex = index + 1;
-          renderPractice();
-          window.scrollTo({ top: 0, behavior: "smooth" });
-        }
-      }, 360);
-    } else {
-      renderPractice();
+  const submission = (async () => {
+    try {
+      const result = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}/answers`, {
+        method: "POST",
+        body: { position: item.position, answer, elapsed_ms: sessionElapsedMs() },
+      });
+      invalidateStudySummary();
+      state.session = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}`);
+      delete state.drafts[item.position];
+      state.sessionIndex = Math.min(index, state.session.items.length - 1);
+      if (state.session.status === "complete") stopTimer();
+      const canAdvance = autoAdvance && index < state.session.items.length - 1 && state.session.status !== "complete";
+      if (canAdvance && session.mode === "test") {
+        state.sessionIndex = index + 1;
+        renderPractice();
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      } else if (canAdvance && session.mode === "speed" && result.is_correct === true) {
+        renderPractice();
+        state.selectionTimer = window.setTimeout(() => {
+          state.selectionTimer = null;
+          const currentItem = state.session?.items?.[index];
+          if (
+            state.session?.session_id === session.session_id &&
+            state.sessionIndex === index &&
+            currentItem?.submission?.is_correct === true
+          ) {
+            state.navigationDirection = "forward";
+            state.sessionIndex = index + 1;
+            renderPractice();
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }
+        }, 360);
+      } else {
+        renderPractice();
+      }
+    } catch (error) {
+      showToast(error.message, "error");
     }
-  } catch (error) {
-    showToast(error.message, "error");
+  })();
+  state.practiceSubmission = submission;
+  try {
+    return await submission;
+  } finally {
+    if (state.practiceSubmission === submission) state.practiceSubmission = null;
   }
 }
 
-async function finishCurrentSession() {
-  const session = state.session;
-  const unanswered = Math.max(0, session.summary.total - session.summary.answered);
+async function finishCurrentSession(button) {
+  const previewSession = state.session;
+  if (!previewSession || previewSession.status !== "active" || previewSession.archived_at) return;
+  const mode = previewSession.mode || "practice";
+  const previewDrafts = sessionDraftAnswers(previewSession);
+  const blankCount = Math.max(
+    0,
+    Number(previewSession.summary.total || 0)
+      - Number(previewSession.summary.answered || 0)
+      - previewDrafts.length
+  );
+  const details = [];
+  if (previewDrafts.length) details.push(`将同时提交 ${previewDrafts.length} 道已选择但尚未单独提交的答案`);
+  if (blankCount) details.push(`另有 ${blankCount} 道题会保留为未作答`);
+  const title = mode === "memorize" ? "确认完成背题" : mode === "speed" ? "确认结束快刷" : "确认交卷";
+  const message = mode === "memorize"
+    ? "完成后会保存本次背题记录，并可从练习记录再次查看。"
+    : `${details.length ? `${details.join("，")}。` : "所有题目均已作答。"}提交后进入整卷复盘。`;
   const confirmed = await confirmModal(
-    "确认交卷",
-    unanswered ? `还有 ${unanswered} 道题未作答。交卷后仍会保留这些题为未答，并进入整卷复盘。` : "所有题目均已作答，确认提交本次练习？",
-    "确认交卷"
+    title,
+    message,
+    mode === "memorize" ? "完成背题" : mode === "speed" ? "结束快刷" : "确认交卷"
   );
   if (!confirmed) return;
-  try {
-    state.session = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}/finish`, { method: "POST", body: {} });
+  clearSelectionTimer();
+  if (state.practiceSubmission) await state.practiceSubmission;
+  const session = state.session;
+  if (!session || session.session_id !== previewSession.session_id) return;
+  if (session.status !== "active") {
+    stopTimer();
     renderPractice();
-    showToast("交卷完成，可以逐题复盘答案与解析");
+    return;
+  }
+  const answers = sessionDraftAnswers(session);
+  setButtonBusy(button, true, mode === "memorize" ? "完成中" : "交卷中");
+  try {
+    state.session = await api(`/practice/sessions/${encodeURIComponent(session.session_id)}/finish`, {
+      method: "POST",
+      body: { answers },
+    });
+    state.drafts = {};
+    invalidateStudySummary();
+    stopTimer();
+    renderPractice();
+    showToast(mode === "memorize" ? "背题记录已完成" : "交卷完成，可以逐题复盘答案与解析");
   } catch (error) {
     showToast(error.message, "error");
+    setButtonBusy(button, false);
   }
 }
 
@@ -1907,7 +1984,10 @@ async function deletePracticeHistorySession(button) {
       method: "DELETE",
       body: {},
     });
-    if (state.session?.session_id === sessionId) state.session = null;
+    if (state.session?.session_id === sessionId) {
+      state.session = null;
+      state.practiceSubmission = null;
+    }
     showToast("练习记录已永久删除");
     await renderPracticeHistoryPage("archived");
   } catch (error) {
@@ -3197,6 +3277,7 @@ async function saveProfilePassword(form) {
     });
     state.user = null;
     state.session = null;
+    state.practiceSubmission = null;
     state.comments = {};
     state.notes = {};
     state.myComments = null;
@@ -3790,6 +3871,7 @@ async function handleClick(event) {
   if (action === "toggle-search-settings") return toggleSearchSettings();
   if (action === "leave-session") {
     clearSelectionTimer();
+    if (state.practiceSubmission) await state.practiceSubmission;
     setPracticeOutline(false);
     const kind = state.session?.saved_kind === "favorite" ? "favorites" : state.session?.saved_kind === "wrong" ? "wrong" : "library";
     const collectionId = state.session?.collection_id || "";
@@ -3800,6 +3882,7 @@ async function handleClick(event) {
   if (action === "session-prev") return moveSession(-1);
   if (action === "session-next") return moveSession(1);
   if (action === "session-jump") {
+    if (state.practiceSubmission) return;
     state.sessionIndex = Number(target.dataset.index);
     setPracticeOutline(false);
     renderPractice();
@@ -3811,8 +3894,8 @@ async function handleClick(event) {
   }
   if (action === "close-practice-outline") return setPracticeOutline(false);
   if (action === "select-option") return selectAnswerOption(target.dataset.label);
-  if (action === "submit-answer") return submitCurrentAnswer();
-  if (action === "finish-session") return finishCurrentSession();
+  if (action === "submit-answer") return submitCurrentAnswer({ autoAdvance: target.dataset.autoAdvance === "true" });
+  if (action === "finish-session") return finishCurrentSession(target);
   if (action === "toggle-favorite") return toggleFavorite(target);
   if (action === "remove-current-wrong") return removeCurrentWrong(target.dataset.key);
   if (action === "remove-saved-outline") return removeSavedOutlineItem(target.dataset.kind, target.dataset.key);
@@ -3992,6 +4075,7 @@ async function logout() {
   stopNotificationPolling();
   resetPreferenceSaveRuntime();
   state.session = null;
+  state.practiceSubmission = null;
   state.comments = {};
   state.notes = {};
   state.myComments = null;
@@ -4041,6 +4125,7 @@ async function runSearch(query) {
 }
 
 function selectAnswerOption(label) {
+  if (state.practiceSubmission) return;
   const item = state.session.items[state.sessionIndex];
   const mode = state.session.mode || "practice";
   if (mode === "speed" && item.submission) {
@@ -4071,7 +4156,7 @@ function selectAnswerOption(label) {
 }
 
 function moveSession(delta) {
-  if (state.ai.drawerOpen) return;
+  if (state.ai.drawerOpen || state.practiceSubmission) return;
   const next = state.sessionIndex + delta;
   if (next < 0) {
     showToast("已经是第一题");
@@ -4314,6 +4399,7 @@ async function resetUserPassword(userId, username) {
     if (userId === state.user.user_id) {
       state.user = null;
       state.session = null;
+      state.practiceSubmission = null;
       showAuth("login");
       showToast("密码已修改，请使用新密码重新登录");
       return;

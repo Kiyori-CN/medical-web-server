@@ -2288,124 +2288,196 @@ class PracticeStore:
         elapsed_ms: int | None = None,
     ) -> dict[str, Any]:
         session_id = display_text(session_id)
-        position = int(position)
-        submitted_answer = display_text(answer)
-        if not submitted_answer:
-            raise ValueError("answer must not be empty")
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """
-                SELECT ps.status, ps.mode, ps.collection_id, ps.archived_at,
-                       psq.question_id, psq.occurrence_id, psq.answered_at
-                FROM practice_sessions ps
-                JOIN practice_session_questions psq ON psq.session_id = ps.session_id
-                WHERE ps.session_id = ? AND ps.profile_id = ? AND psq.position = ?
-                """,
-                (session_id, self.profile_id, position),
-            ).fetchone()
-            if row is None:
-                raise PracticeNotFound("Practice question not found")
-            if row["archived_at"]:
-                raise PracticeConflict("归档练习需先恢复")
-            if row["answered_at"]:
-                raise PracticeConflict("This question has already been answered")
-            if row["status"] != "active":
-                raise PracticeConflict("Practice session is not active")
-
-            if row["occurrence_id"] is not None:
-                occurrence_questions = self.catalog.get_occurrence_questions(
-                    [row["occurrence_id"]], include_solution=True
-                )
-                question = occurrence_questions[0] if occurrence_questions else None
-            else:
-                question = self.catalog.get_question(row["question_id"], include_solution=True)
-            if question is None:
-                raise PracticeNotFound("Catalog question not found")
-            question_type = question["question_type"]
-            normalized_submitted = normalize_answer(submitted_answer, question_type)
-            normalized_correct = normalize_answer(question.get("answer", ""), question_type)
-            if question_type in {"单选题", "多选题"}:
-                valid_labels = {option["label"] for option in question.get("options", [])}
-                if (
-                    not normalized_submitted
-                    or any(label not in valid_labels for label in normalized_submitted)
-                    or (question_type == "单选题" and len(normalized_submitted) != 1)
-                ):
-                    raise ValueError("answer contains an invalid option label")
-            gradable = question_type not in {
-                "简答题",
-                "名词解释",
-                "论述题",
-                "知识点",
-                "未知题型",
-            } and bool(normalized_correct)
-            is_correct = normalized_submitted == normalized_correct if gradable else None
-            answered_at = _utc_now()
-            elapsed_value = None if elapsed_ms is None else max(0, int(elapsed_ms))
-
-            update_cursor = connection.execute(
-                """
-                UPDATE practice_session_questions
-                SET submitted_answer = ?, normalized_submitted_answer = ?,
-                    is_correct = ?, answered_at = ?, elapsed_ms = ?
-                WHERE session_id = ? AND position = ? AND answered_at IS NULL
-                """,
-                (
-                    submitted_answer,
-                    normalized_submitted,
-                    None if is_correct is None else int(is_correct),
-                    answered_at,
-                    elapsed_value,
-                    session_id,
-                    position,
-                ),
+            response = self._submit_answer_in_connection(
+                connection,
+                session_id,
+                position=position,
+                answer=answer,
+                elapsed_ms=elapsed_ms,
+                auto_complete=True,
             )
-            if is_correct is False:
-                source = (question.get("sources") or [{}])[0]
-                occurrence_id = row["occurrence_id"] or source.get("occurrence_id")
-                item_key = (
-                    f"occurrence:{occurrence_id}"
-                    if occurrence_id is not None
-                    else f"question:{row['question_id']}"
-                )
-                connection.execute(
-                    """
-                    INSERT INTO study_items(
-                        profile_id, kind, item_key, occurrence_id, question_id,
-                        collection_id, relative_path, wrong_count, created_at, updated_at
-                    ) VALUES (?, 'wrong', ?, ?, ?, ?, ?, 1, ?, ?)
-                    ON CONFLICT(profile_id, kind, item_key) DO UPDATE SET
-                        wrong_count = study_items.wrong_count + 1,
-                        updated_at = excluded.updated_at,
-                        collection_id = excluded.collection_id,
-                        relative_path = excluded.relative_path
-                    """,
-                    (
-                        self.profile_id,
-                        item_key,
-                        occurrence_id,
-                        row["question_id"],
-                        source.get("collection_id") or "",
-                        source.get("relative_path") or "",
-                        answered_at,
-                        answered_at,
-                    ),
-                )
-            if update_cursor.rowcount != 1:
-                raise PracticeConflict("This question has already been answered")
-            correct_increment = int(is_correct is True)
-            wrong_increment = int(is_correct is False)
-            ungraded_increment = int(is_correct is None)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return response
+
+    def _submit_answer_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        *,
+        position: object,
+        answer: object,
+        elapsed_ms: object = None,
+        auto_complete: bool,
+    ) -> dict[str, Any]:
+        if isinstance(position, bool):
+            raise ValueError("position must be an integer")
+        try:
+            position_value = int(position)
+        except (TypeError, ValueError) as error:
+            raise ValueError("position must be an integer") from error
+        if position_value <= 0:
+            raise ValueError("position must be positive")
+        submitted_answer = display_text(answer)
+        if not submitted_answer:
+            raise ValueError("answer must not be empty")
+        row = connection.execute(
+            """
+            SELECT ps.status, ps.mode, ps.collection_id, ps.archived_at,
+                   psq.question_id, psq.occurrence_id, psq.answered_at
+            FROM practice_sessions ps
+            JOIN practice_session_questions psq ON psq.session_id = ps.session_id
+            WHERE ps.session_id = ? AND ps.profile_id = ? AND psq.position = ?
+            """,
+            (session_id, self.profile_id, position_value),
+        ).fetchone()
+        if row is None:
+            raise PracticeNotFound("Practice question not found")
+        if row["archived_at"]:
+            raise PracticeConflict("归档练习需先恢复")
+        if row["mode"] == "memorize":
+            raise PracticeConflict("背题模式不接受作答")
+        if row["answered_at"]:
+            raise PracticeConflict("This question has already been answered")
+        if row["status"] != "active":
+            raise PracticeConflict("Practice session is not active")
+
+        if row["occurrence_id"] is not None:
+            occurrence_questions = self.catalog.get_occurrence_questions(
+                [row["occurrence_id"]], include_solution=True
+            )
+            question = occurrence_questions[0] if occurrence_questions else None
+        else:
+            question = self.catalog.get_question(row["question_id"], include_solution=True)
+        if question is None:
+            raise PracticeNotFound("Catalog question not found")
+        question_type = question["question_type"]
+        normalized_submitted = normalize_answer(submitted_answer, question_type)
+        normalized_correct = normalize_answer(question.get("answer", ""), question_type)
+        if question_type in {"单选题", "多选题"}:
+            valid_labels = {option["label"] for option in question.get("options", [])}
+            if (
+                not normalized_submitted
+                or any(label not in valid_labels for label in normalized_submitted)
+                or (question_type == "单选题" and len(normalized_submitted) != 1)
+            ):
+                raise ValueError("answer contains an invalid option label")
+        gradable = question_type not in {
+            "简答题",
+            "名词解释",
+            "论述题",
+            "知识点",
+            "未知题型",
+        } and bool(normalized_correct)
+        is_correct = normalized_submitted == normalized_correct if gradable else None
+        answered_at = _utc_now()
+        try:
+            elapsed_value = None if elapsed_ms is None else max(0, int(elapsed_ms))
+        except (TypeError, ValueError) as error:
+            raise ValueError("elapsed_ms must be an integer") from error
+
+        update_cursor = connection.execute(
+            """
+            UPDATE practice_session_questions
+            SET submitted_answer = ?, normalized_submitted_answer = ?,
+                is_correct = ?, answered_at = ?, elapsed_ms = ?
+            WHERE session_id = ? AND position = ? AND answered_at IS NULL
+            """,
+            (
+                submitted_answer,
+                normalized_submitted,
+                None if is_correct is None else int(is_correct),
+                answered_at,
+                elapsed_value,
+                session_id,
+                position_value,
+            ),
+        )
+        if update_cursor.rowcount != 1:
+            raise PracticeConflict("This question has already been answered")
+        if is_correct is False:
+            source = (question.get("sources") or [{}])[0]
+            occurrence_id = row["occurrence_id"] or source.get("occurrence_id")
+            item_key = (
+                f"occurrence:{occurrence_id}"
+                if occurrence_id is not None
+                else f"question:{row['question_id']}"
+            )
             connection.execute(
                 """
-                INSERT INTO question_progress(
-                    profile_id, question_id, attempts, correct_count,
-                    wrong_count, ungraded_count, streak, last_answer,
-                    last_result, last_seen_at
-                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(profile_id, question_id) DO UPDATE SET
+                INSERT INTO study_items(
+                    profile_id, kind, item_key, occurrence_id, question_id,
+                    collection_id, relative_path, wrong_count, created_at, updated_at
+                ) VALUES (?, 'wrong', ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(profile_id, kind, item_key) DO UPDATE SET
+                    wrong_count = study_items.wrong_count + 1,
+                    updated_at = excluded.updated_at,
+                    collection_id = excluded.collection_id,
+                    relative_path = excluded.relative_path
+                """,
+                (
+                    self.profile_id,
+                    item_key,
+                    occurrence_id,
+                    row["question_id"],
+                    source.get("collection_id") or "",
+                    source.get("relative_path") or "",
+                    answered_at,
+                    answered_at,
+                ),
+            )
+        correct_increment = int(is_correct is True)
+        wrong_increment = int(is_correct is False)
+        ungraded_increment = int(is_correct is None)
+        connection.execute(
+            """
+            INSERT INTO question_progress(
+                profile_id, question_id, attempts, correct_count,
+                wrong_count, ungraded_count, streak, last_answer,
+                last_result, last_seen_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(profile_id, question_id) DO UPDATE SET
+                attempts = attempts + 1,
+                correct_count = correct_count + excluded.correct_count,
+                wrong_count = wrong_count + excluded.wrong_count,
+                ungraded_count = ungraded_count + excluded.ungraded_count,
+                streak = CASE
+                    WHEN excluded.last_result = 1 THEN streak + 1
+                    WHEN excluded.last_result = 0 THEN 0
+                    ELSE streak
+                END,
+                last_answer = excluded.last_answer,
+                last_result = excluded.last_result,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                self.profile_id,
+                row["question_id"],
+                correct_increment,
+                wrong_increment,
+                ungraded_increment,
+                correct_increment,
+                submitted_answer,
+                None if is_correct is None else int(is_correct),
+                answered_at,
+            ),
+        )
+        if row["collection_id"] and row["occurrence_id"] is not None:
+            connection.execute(
+                """
+                INSERT INTO collection_question_progress(
+                    profile_id, collection_id, occurrence_id, attempts,
+                    correct_count, wrong_count, ungraded_count, streak,
+                    last_answer, last_result, last_seen_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id, collection_id, occurrence_id) DO UPDATE SET
                     attempts = attempts + 1,
                     correct_count = correct_count + excluded.correct_count,
                     wrong_count = wrong_count + excluded.wrong_count,
@@ -2421,7 +2493,8 @@ class PracticeStore:
                 """,
                 (
                     self.profile_id,
-                    row["question_id"],
+                    row["collection_id"],
+                    row["occurrence_id"],
                     correct_increment,
                     wrong_increment,
                     ungraded_increment,
@@ -2431,71 +2504,34 @@ class PracticeStore:
                     answered_at,
                 ),
             )
-            if row["collection_id"] and row["occurrence_id"] is not None:
-                connection.execute(
-                    """
-                    INSERT INTO collection_question_progress(
-                        profile_id, collection_id, occurrence_id, attempts,
-                        correct_count, wrong_count, ungraded_count, streak,
-                        last_answer, last_result, last_seen_at
-                    ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(profile_id, collection_id, occurrence_id) DO UPDATE SET
-                        attempts = attempts + 1,
-                        correct_count = correct_count + excluded.correct_count,
-                        wrong_count = wrong_count + excluded.wrong_count,
-                        ungraded_count = ungraded_count + excluded.ungraded_count,
-                        streak = CASE
-                            WHEN excluded.last_result = 1 THEN streak + 1
-                            WHEN excluded.last_result = 0 THEN 0
-                            ELSE streak
-                        END,
-                        last_answer = excluded.last_answer,
-                        last_result = excluded.last_result,
-                        last_seen_at = excluded.last_seen_at
-                    """,
-                    (
-                        self.profile_id,
-                        row["collection_id"],
-                        row["occurrence_id"],
-                        correct_increment,
-                        wrong_increment,
-                        ungraded_increment,
-                        correct_increment,
-                        submitted_answer,
-                        None if is_correct is None else int(is_correct),
-                        answered_at,
-                    ),
-                )
-            remaining = connection.execute(
+        remaining = connection.execute(
+            """
+            SELECT COUNT(*) FROM practice_session_questions
+            WHERE session_id = ? AND answered_at IS NULL
+            """,
+            (session_id,),
+        ).fetchone()[0]
+        completed_now = remaining == 0 and auto_complete and row["mode"] in {
+            "practice",
+            "speed",
+        }
+        if completed_now:
+            connection.execute(
                 """
-                SELECT COUNT(*) FROM practice_session_questions
-                WHERE session_id = ? AND answered_at IS NULL
+                UPDATE practice_sessions
+                SET status = 'complete', completed_at = ?,
+                    duration_ms = MAX(0, CAST(
+                        (julianday(?) - julianday(created_at)) * 86400000 AS INTEGER
+                    ))
+                WHERE session_id = ?
                 """,
-                (session_id,),
-            ).fetchone()[0]
-            if remaining == 0:
-                connection.execute(
-                    """
-                    UPDATE practice_sessions
-                    SET status = 'complete', completed_at = ?,
-                        duration_ms = MAX(0, CAST(
-                            (julianday(?) - julianday(created_at)) * 86400000 AS INTEGER
-                        ))
-                    WHERE session_id = ?
-                    """,
-                    (answered_at, answered_at, session_id),
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+                (answered_at, answered_at, session_id),
+            )
 
-        result_visible = row["mode"] != "test" or remaining == 0
+        result_visible = row["mode"] != "test" or completed_now
         response = {
             "session_id": session_id,
-            "position": position,
+            "position": position_value,
             "question_id": question["question_id"],
             "occurrence_id": row["occurrence_id"],
             "submitted_answer": submitted_answer,
@@ -2512,40 +2548,97 @@ class PracticeStore:
             )
         return response
 
-    def finish_session(self, session_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _finish_answers(answers: object) -> list[dict[str, Any]]:
+        if answers in (None, ""):
+            return []
+        if not isinstance(answers, list):
+            raise ValueError("answers must be an array")
+        if len(answers) > 5000:
+            raise ValueError("too many answers")
+        normalized: list[dict[str, Any]] = []
+        positions: set[int] = set()
+        for item in answers:
+            if not isinstance(item, dict):
+                raise ValueError("each answer must be an object")
+            raw_position = item.get("position")
+            if isinstance(raw_position, bool):
+                raise ValueError("position must be an integer")
+            try:
+                position = int(raw_position)
+            except (TypeError, ValueError) as error:
+                raise ValueError("position must be an integer") from error
+            if position <= 0:
+                raise ValueError("position must be positive")
+            if position in positions:
+                raise ValueError("answer positions must be unique")
+            answer = display_text(item.get("answer"))
+            if not answer:
+                raise ValueError("answer must not be empty")
+            elapsed_ms = item.get("elapsed_ms")
+            if elapsed_ms is not None:
+                try:
+                    elapsed_ms = max(0, int(elapsed_ms))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("elapsed_ms must be an integer") from error
+            positions.add(position)
+            normalized.append(
+                {"position": position, "answer": answer, "elapsed_ms": elapsed_ms}
+            )
+        return normalized
+
+    def finish_session(
+        self, session_id: str, *, answers: object = None
+    ) -> dict[str, Any]:
         session_id = display_text(session_id)
+        pending_answers = self._finish_answers(answers)
         now = datetime.now(UTC)
         connection = self.connect()
         try:
-            with connection:
-                row = connection.execute(
-                    """
-                    SELECT created_at, status, archived_at
-                    FROM practice_sessions
-                    WHERE session_id = ? AND profile_id = ?
-                    """,
-                    (session_id, self.profile_id),
-                ).fetchone()
-                if row is None:
-                    raise PracticeNotFound("Practice session not found")
-                if row["archived_at"]:
-                    raise PracticeConflict("归档练习需先恢复")
-                if row["status"] == "active":
-                    created_at = datetime.fromisoformat(row["created_at"])
-                    duration_ms = max(0, int((now - created_at).total_seconds() * 1000))
-                    connection.execute(
-                        """
-                        UPDATE practice_sessions
-                        SET status = 'complete', completed_at = ?, duration_ms = ?
-                        WHERE session_id = ? AND profile_id = ?
-                        """,
-                        (
-                            now.replace(microsecond=0).isoformat(),
-                            duration_ms,
-                            session_id,
-                            self.profile_id,
-                        ),
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT created_at, status, mode, archived_at
+                FROM practice_sessions
+                WHERE session_id = ? AND profile_id = ?
+                """,
+                (session_id, self.profile_id),
+            ).fetchone()
+            if row is None:
+                raise PracticeNotFound("Practice session not found")
+            if row["archived_at"]:
+                raise PracticeConflict("归档练习需先恢复")
+            if row["status"] == "active":
+                if row["mode"] == "memorize" and pending_answers:
+                    raise PracticeConflict("背题模式不接受作答")
+                for item in pending_answers:
+                    self._submit_answer_in_connection(
+                        connection,
+                        session_id,
+                        position=item["position"],
+                        answer=item["answer"],
+                        elapsed_ms=item["elapsed_ms"],
+                        auto_complete=False,
                     )
+                created_at = datetime.fromisoformat(row["created_at"])
+                duration_ms = max(0, int((now - created_at).total_seconds() * 1000))
+                connection.execute(
+                    """
+                    UPDATE practice_sessions
+                    SET status = 'complete', completed_at = ?, duration_ms = ?
+                    WHERE session_id = ? AND profile_id = ? AND status = 'active'
+                    """,
+                    (
+                        now.replace(microsecond=0).isoformat(),
+                        duration_ms,
+                        session_id,
+                        self.profile_id,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         return self.get_session(session_id)

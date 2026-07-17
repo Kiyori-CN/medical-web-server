@@ -104,7 +104,10 @@ def create_practice_blueprint(catalog_path, app_database_path) -> Blueprint:
     @login_required
     @csrf_required
     def finish_session(session_id: str):
-        return jsonify(store().finish_session(session_id))
+        data = _json_object()
+        return jsonify(
+            store().finish_session(session_id, answers=data.get("answers"))
+        )
 
     @blueprint.get("/study/<kind>/library")
     @login_required

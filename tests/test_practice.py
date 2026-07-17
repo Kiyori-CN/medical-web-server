@@ -192,6 +192,74 @@ def test_practice_blueprint_requires_login_and_csrf(
     assert cleared.get_json()["sessions_deleted"] == 1
 
 
+def test_finish_endpoint_submits_pending_answers_with_one_csrf_write(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, store = _services(sample_source_tree, tmp_path)
+    collection = _file_collection(catalog, "第一章.xlsx")
+    app = Flask(__name__)
+
+    @app.before_request
+    def authenticate():
+        g.current_user = {"user_id": "usr_test", "role": "user"}
+
+    app.register_blueprint(
+        create_practice_blueprint(catalog.database_path, store.database_path)
+    )
+    client = app.test_client()
+    client.set_cookie("medical_csrf", "csrf-test")
+    headers = {"X-CSRF-Token": "csrf-test"}
+    created = client.post(
+        "/api/practice/sessions",
+        headers=headers,
+        json={
+            "collection_id": collection["collection_id"],
+            "count": 2,
+            "mode": "practice",
+        },
+    ).get_json()
+    finish_url = f"/api/practice/sessions/{created['session_id']}/finish"
+
+    assert client.post(
+        finish_url,
+        json={"answers": [{"position": 1, "answer": "A"}]},
+    ).status_code == 403
+    assert client.post(
+        finish_url, headers=headers, json={"answers": {"position": 1, "answer": "A"}}
+    ).status_code == 400
+    duplicate = client.post(
+        finish_url,
+        headers=headers,
+        json={
+            "answers": [
+                {"position": 1, "answer": "A"},
+                {"position": 1, "answer": "B"},
+            ]
+        },
+    )
+    assert duplicate.status_code == 400
+    assert store.get_session(created["session_id"])["summary"]["answered"] == 0
+
+    finished = client.post(
+        finish_url,
+        headers=headers,
+        json={
+            "answers": [
+                {"position": 1, "answer": "A", "elapsed_ms": 1200},
+                {"position": 2, "answer": "神经-体液调节", "elapsed_ms": 1500},
+            ]
+        },
+    )
+    assert finished.status_code == 200
+    payload = finished.get_json()
+    assert payload["status"] == "complete"
+    assert payload["summary"]["answered"] == 2
+    assert [item["submission"]["answer"] for item in payload["items"]] == [
+        "A",
+        "神经-体液调节",
+    ]
+
+
 def test_study_goals_use_shanghai_day_boundary_and_track_streak(
     sample_source_tree: Path, tmp_path: Path
 ):
@@ -441,6 +509,64 @@ def test_collection_order_memorize_mode_and_early_finish(
     assert finished["duration_ms"] >= 0
     assert all("answer" in item["question"] for item in finished["items"])
 
+    store.set_session_archived(memorize["session_id"], False)
+    with pytest.raises(PracticeConflict, match="背题模式"):
+        store.submit_answer(memorize["session_id"], position=1, answer="A")
+    completed_memorize = store.finish_session(memorize["session_id"])
+    assert completed_memorize["status"] == "complete"
+    assert completed_memorize["summary"]["answered"] == 0
+    assert completed_memorize["solution_visible"] is True
+
+
+def test_full_finish_submits_pending_practice_answers_atomically(
+    sample_source_tree: Path, tmp_path: Path
+):
+    catalog, store = _services(sample_source_tree, tmp_path)
+    collection = _file_collection(catalog, "第一章.xlsx")
+    practice = store.create_session(
+        collection_id=collection["collection_id"], count=None, mode="practice"
+    )
+    store.submit_answer(practice["session_id"], position=1, answer="A")
+
+    finished = store.finish_session(
+        practice["session_id"],
+        answers=[
+            {"position": 2, "answer": "神经-体液调节", "elapsed_ms": 1500},
+            {"position": 3, "answer": "B", "elapsed_ms": 1800},
+        ],
+    )
+    assert finished["status"] == "complete"
+    assert finished["summary"]["answered"] == 3
+    assert finished["summary"]["total"] == 4
+    assert finished["items"][1]["submission"]["answer"] == "神经-体液调节"
+    assert finished["items"][2]["submission"]["answer"] == "B"
+    assert finished["items"][3]["submission"] is None
+    assert store.health()["attempts"] == 3
+
+    atomic = store.create_session(
+        collection_id=collection["collection_id"], count=None, mode="practice"
+    )
+    with pytest.raises(PracticeNotFound):
+        store.finish_session(
+            atomic["session_id"],
+            answers=[
+                {"position": 1, "answer": "A"},
+                {"position": 99, "answer": "A"},
+            ],
+        )
+    unchanged = store.get_session(atomic["session_id"])
+    assert unchanged["status"] == "active"
+    assert unchanged["summary"]["answered"] == 0
+    assert store.health()["attempts"] == 3
+    with pytest.raises(ValueError, match="unique"):
+        store.finish_session(
+            atomic["session_id"],
+            answers=[
+                {"position": 1, "answer": "A"},
+                {"position": 1, "answer": "B"},
+            ],
+        )
+
 
 def test_speed_and_test_modes_have_distinct_feedback_contract(
     sample_source_tree: Path, tmp_path: Path
@@ -462,14 +588,32 @@ def test_speed_and_test_modes_have_distinct_feedback_contract(
     assert "answer" not in test["items"][0]["question"]
     test_result = store.submit_answer(test["session_id"], position=1, answer="A")
     assert "is_correct" not in test_result
+    final_test_answer = store.submit_answer(
+        test["session_id"], position=2, answer="神经-体液调节"
+    )
+    assert "is_correct" not in final_test_answer
     active = store.get_session(test["session_id"])
+    assert active["status"] == "active"
+    assert active["summary"]["answered"] == 2
     assert active["summary"]["correct"] is None
     assert active["items"][0]["submission"]["answer"] == "A"
     assert active["items"][0]["submission"]["correct_answer"] == ""
+    assert active["items"][1]["submission"]["correct_answer"] == ""
 
     finished = store.finish_session(test["session_id"])
-    assert finished["summary"]["correct"] == 1
+    assert finished["summary"]["answered"] == 2
+    assert finished["summary"]["correct"] == 2
     assert finished["items"][0]["question"]["answer"] == "A"
+
+    speed_early = store.create_session(
+        collection_id=collection["collection_id"], count=2, mode="speed"
+    )
+    speed_finished = store.finish_session(
+        speed_early["session_id"], answers=[{"position": 1, "answer": "A"}]
+    )
+    assert speed_finished["status"] == "complete"
+    assert speed_finished["summary"]["answered"] == 1
+    assert speed_finished["summary"]["total"] == 2
 
 
 def test_favorites_and_wrong_items_are_account_scoped_and_path_preserving(

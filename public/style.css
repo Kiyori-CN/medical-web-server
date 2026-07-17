@@ -382,6 +382,7 @@ input::placeholder, textarea::placeholder { color: #a7adba; }
 .number-button.wrong { border-color: #f0c4c8; color: var(--danger); background: var(--danger-soft); }
 .number-button.ungraded { border-color: #edd39e; color: var(--warning); background: var(--warning-soft); }
 .number-button.answered { border-color: #cbd1db; color: #616875; background: #f0f2f5; }
+.number-button.drafted { border-color: #b7bdc8; border-style: dashed; color: #5f6672; background: #eceff3; }
 .number-button.current { border-color: var(--brand); color: #fff; background: var(--brand); box-shadow: 0 5px 13px rgb(232 93 82 / 20%); }
 .saved-outline-list { display: grid; gap: 8px; }
 .saved-outline-item { min-width: 0; min-height: 50px; display: flex; align-items: stretch; gap: 8px; padding: 5px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
