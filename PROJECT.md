@@ -1,5 +1,12 @@
 # medical-web-server 项目事实
 
+## 可公开复查的样例入口
+
+`scripts/run_demo.py` 使用 `examples/demo_questions.json` 的六道自编操作题，在系统临时目录构建独立 catalog、账号与设置。
+它覆盖继承环境中的真实数据路径，只监听本机；应用子进程退出后再清理文件，避免 Windows SQLite 句柄阻止删除。
+不加载用户题库、模型密钥或真实学习状态。详情见[本地开发](docs/local-development.md)与[项目展示](docs/showcase.md)。
+
+
 ## 权威位置
 
 - 本地开发工作区：`D:\10_Project\medical-web-server`
